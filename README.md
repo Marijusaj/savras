@@ -52,12 +52,13 @@ cp target/release/svr ~/.local/bin/    # or anywhere on PATH
 
 ## The side panel
 
-The point is a narrow column down the left of the terminal you are already
+The point is a narrow column down the side of the terminal you are already
 working in, with your session beside it:
 
 ```sh
-svr panel              # panel on the left, a shell on the right
-svr panel -- claude    # panel on the left, Claude Code on the right
+svr panel                # panel on the right, a shell beside it
+svr panel -- claude      # panel on the right, Claude Code beside it
+svr panel --side left    # the other way round
 svr panel --width 52
 ```
 
@@ -72,7 +73,11 @@ the pseudo-terminal (ConPTY on Windows) and [`vt100`][vt100] interprets the
 output; Savras is the layout and the glue.
 
 `ctrl-g` moves the keyboard to the panel and back. Everything else goes
-straight to your work.
+straight to your work, including the mouse: Savras follows the child in and out
+of mouse reporting and mirrors it to the real terminal, so scrolling reaches
+Claude Code instead of dragging the terminal's own scrollback across both panes.
+With the panel on the left, mouse coordinates are shifted into the working
+pane's own frame.
 
 [pty]: https://crates.io/crates/portable-pty
 [vt100]: https://crates.io/crates/vt100
@@ -96,6 +101,7 @@ front of you. `--dry-run` prints the tmux commands instead of running them.
 ```
 svr                    open the panel on its own
 svr panel              open the panel as a column beside your work
+svr panel --side left  put it on the left instead of the right
 svr panel --tmux       ... using tmux, so the session survives a crash
 svr --once             print the current sessions as plain text and exit
 svr --jobs-dir <path>  read jobs from somewhere other than ~/.claude/jobs
@@ -128,7 +134,7 @@ footer goes, to keep sessions visible.
 ## Development
 
 ```sh
-cargo test        # 43 tests: parsing, grouping, navigation,
+cargo test        # 52 tests: parsing, grouping, navigation,
                   # argument handling, tmux layout, and render buffers
 cargo build --release
 ```

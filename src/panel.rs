@@ -12,6 +12,8 @@ use std::process::Command;
 
 use anyhow::{bail, Context as _, Result};
 
+use crate::host::Side;
+
 /// The tmux session Savras creates when you are not already in one.
 const SESSION: &str = "savras";
 
@@ -42,6 +44,7 @@ pub struct Context {
     pub inside_tmux: bool,
     pub session_exists: bool,
     pub width: u16,
+    pub side: Side,
     pub size: (u16, u16),
     pub svr: String,
     pub cwd: String,
@@ -65,11 +68,16 @@ pub fn plan(ctx: &Context) -> Plan {
     // Already in tmux: add the column to the window in front of the user and
     // hand focus straight back, so the panel appears beside their work.
     if ctx.inside_tmux {
+        // `-b` puts the new pane before the current one, i.e. on the left.
+        let direction = match ctx.side {
+            Side::Left => "-hb",
+            Side::Right => "-h",
+        };
         return Plan {
             steps: vec![
                 vec![
                     "split-window".into(),
-                    "-hb".into(),
+                    direction.into(),
                     "-l".into(),
                     width,
                     "-c".into(),
@@ -94,6 +102,17 @@ pub fn plan(ctx: &Context) -> Plan {
     // Build the session detached, then attach. The panel is pane 0 (left) so
     // the layout is deterministic; the working pane is 1 and gets the focus.
     let (cols, rows) = ctx.size;
+    // Pane 0 is the leftmost pane, so which program starts the session depends
+    // on which side the panel is on.
+    let (first, second) = match ctx.side {
+        Side::Left => (ctx.svr.clone(), command_or_shell(ctx)),
+        Side::Right => (command_or_shell(ctx), ctx.svr.clone()),
+    };
+    let panel_pane = match ctx.side {
+        Side::Left => 0,
+        Side::Right => 1,
+    };
+    let work_pane = 1 - panel_pane;
     Plan {
         steps: vec![
             vec![
@@ -113,7 +132,7 @@ pub fn plan(ctx: &Context) -> Plan {
                 rows.to_string(),
                 "-c".into(),
                 ctx.cwd.clone(),
-                ctx.svr.clone(),
+                first,
             ],
             {
                 let mut split = vec![
@@ -124,30 +143,40 @@ pub fn plan(ctx: &Context) -> Plan {
                     "-c".into(),
                     ctx.cwd.clone(),
                 ];
-                if !ctx.command.is_empty() {
-                    split.push(shell_join(&ctx.command));
+                if !second.is_empty() {
+                    split.push(second);
                 }
                 split
             },
             vec![
                 "resize-pane".into(),
                 "-t".into(),
-                format!("{SESSION}:main.0"),
+                format!("{SESSION}:main.{panel_pane}"),
                 "-x".into(),
                 width,
             ],
             vec![
                 "select-pane".into(),
                 "-t".into(),
-                format!("{SESSION}:main.1"),
+                format!("{SESSION}:main.{work_pane}"),
             ],
         ],
         exec: Some(vec!["attach-session".into(), "-t".into(), SESSION.into()]),
     }
 }
 
+/// The working pane runs the given command, or nothing at all, which leaves
+/// tmux to start the user's shell.
+fn command_or_shell(ctx: &Context) -> String {
+    if ctx.command.is_empty() {
+        String::new()
+    } else {
+        shell_join(&ctx.command)
+    }
+}
+
 /// Build the layout and hand the terminal over to tmux.
-pub fn run(width: u16, command: Vec<String>, dry_run: bool) -> Result<()> {
+pub fn run(width: u16, side: Side, command: Vec<String>, dry_run: bool) -> Result<()> {
     if !dry_run && which_tmux().is_none() {
         bail!("{}", TMUX_MISSING);
     }
@@ -156,6 +185,7 @@ pub fn run(width: u16, command: Vec<String>, dry_run: bool) -> Result<()> {
         inside_tmux: std::env::var_os("TMUX").is_some(),
         session_exists: session_exists(),
         width,
+        side,
         size: crossterm::terminal::size().unwrap_or((160, 45)),
         svr: shell_quote(&current_exe()?),
         cwd: std::env::current_dir()
@@ -284,6 +314,7 @@ mod tests {
             inside_tmux: false,
             session_exists: false,
             width: 44,
+            side: Side::Left,
             size: (180, 45),
             svr: "/usr/local/bin/svr".into(),
             cwd: "/home/me/code".into(),
@@ -313,6 +344,39 @@ mod tests {
         // The user lands in the working pane, not the panel.
         assert!(text.contains("select-pane -t savras:main.1"));
         assert_eq!(p.exec.unwrap(), vec!["attach-session", "-t", "savras"]);
+    }
+
+    #[test]
+    fn on_the_right_the_panel_becomes_pane_one_and_the_work_pane_pane_zero() {
+        let mut c = ctx();
+        c.side = Side::Right;
+        c.command = vec!["claude".into()];
+        let steps = plan(&c).steps;
+
+        // Pane 0 is the leftmost, so with the panel on the right it is the work.
+        assert!(steps[0].join(" ").ends_with("claude"), "{:?}", steps[0]);
+        assert!(
+            steps[1].join(" ").ends_with("/usr/local/bin/svr"),
+            "{:?}",
+            steps[1]
+        );
+        assert!(steps[2].join(" ").contains("savras:main.1 -x 44"));
+        assert!(steps[3].join(" ").contains("savras:main.0"));
+    }
+
+    #[test]
+    fn inside_tmux_the_new_pane_goes_to_the_asked_for_side() {
+        let mut c = ctx();
+        c.inside_tmux = true;
+        c.side = Side::Right;
+        assert!(plan(&c).steps[0]
+            .join(" ")
+            .contains("split-window -h -l 44"));
+
+        c.side = Side::Left;
+        assert!(plan(&c).steps[0]
+            .join(" ")
+            .contains("split-window -hb -l 44"));
     }
 
     #[test]

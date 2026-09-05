@@ -26,6 +26,7 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 
 use app::App;
+use host::Side;
 use watch::Watch;
 
 const USAGE: &str = "\
@@ -39,6 +40,7 @@ commands:
                       with your work beside it (uses tmux)
 
 options:
+  --side <left|right> which side the panel sits on (panel only, default right)
   --width <cols>      width of the panel column (panel only, default 44)
   --tmux              build the panel with tmux instead of hosting it directly
   --dry-run           print the tmux layout instead of building it (panel only)
@@ -50,6 +52,7 @@ options:
 examples:
   svr panel                    panel on the left, a shell on the right
   svr panel -- claude          panel on the left, Claude Code on the right
+  svr panel --side left        panel on the left instead
   svr panel --width 52
 
 keys:
@@ -76,6 +79,7 @@ enum Mode {
         command: Vec<String>,
         dry_run: bool,
         tmux: bool,
+        side: Side,
     },
 }
 
@@ -100,12 +104,13 @@ fn main() -> Result<()> {
         command,
         dry_run,
         tmux,
+        side,
     } = options.mode
     {
         if tmux || dry_run {
-            return panel::run(width, command, dry_run);
+            return panel::run(width, side, command, dry_run);
         }
-        return host::run(width, command, jobs_dir(options.jobs_dir)?);
+        return host::run(width, side, command, jobs_dir(options.jobs_dir)?);
     }
 
     let jobs_dir = jobs_dir(options.jobs_dir)?;
@@ -137,6 +142,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
     let mut is_panel = false;
     let mut dry_run = false;
     let mut tmux = false;
+    let mut side = Side::Right;
 
     let mut args = args.into_iter().peekable();
     if args.peek().map(String::as_str) == Some("panel") {
@@ -163,6 +169,14 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
             "--once" => options.mode = Mode::Once,
             "--dry-run" => dry_run = true,
             "--tmux" => tmux = true,
+            "--side" => {
+                let raw = args.next().context("--side needs left or right")?;
+                side = match raw.as_str() {
+                    "left" => Side::Left,
+                    "right" => Side::Right,
+                    other => anyhow::bail!("--side must be left or right, not {other}"),
+                };
+            }
             "--width" => {
                 let raw = args.next().context("--width needs a number")?;
                 width = raw
@@ -186,6 +200,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
             command,
             dry_run,
             tmux,
+            side,
         };
     } else if !command.is_empty() {
         anyhow::bail!("a command after `--` only makes sense with `svr panel`");
@@ -360,6 +375,19 @@ mod tests {
             Mode::Panel { tmux, .. } => assert!(tmux),
             _ => panic!("expected panel mode"),
         }
+    }
+
+    #[test]
+    fn the_panel_sits_on_the_right_unless_asked_otherwise() {
+        match parse_ok(&["panel"]).mode {
+            Mode::Panel { side, .. } => assert_eq!(side, Side::Right),
+            _ => panic!("expected panel mode"),
+        }
+        match parse_ok(&["panel", "--side", "left"]).mode {
+            Mode::Panel { side, .. } => assert_eq!(side, Side::Left),
+            _ => panic!("expected panel mode"),
+        }
+        assert!(parse(vec!["panel".into(), "--side".into(), "up".into()]).is_err());
     }
 
     #[test]

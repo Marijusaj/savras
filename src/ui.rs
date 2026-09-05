@@ -132,6 +132,7 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ))),
+            Row::Spacer => ListItem::new(Line::from("")),
             Row::Job(i) => ListItem::new(job_line(&app.snapshot.jobs[*i], name_width, area.width)),
         })
         .collect();
@@ -143,14 +144,21 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
 fn job_line(job: &Job, name_width: u16, total_width: u16) -> Line<'static> {
     let age = age(job.updated_at, Utc::now());
     let color = badge_color(job);
+    // Claude Code shows the pull request a session produced; it is often the
+    // one thing you want from a finished job.
+    let link = job
+        .links
+        .first()
+        .map(|l| format!(" #{} ", l.id))
+        .unwrap_or_default();
 
     let mut spans = vec![
         Span::styled(
             "✳ ",
             Style::default().fg(match job.status {
-                Status::NeedsInput => Color::Yellow,
-                Status::Working => color,
-                Status::Done => Color::Green,
+                Status::NeedsInput => Color::Indexed(179),
+                Status::Working => Color::Indexed(117),
+                Status::Done => Color::Indexed(114),
             }),
         ),
         Span::styled(
@@ -159,8 +167,8 @@ fn job_line(job: &Job, name_width: u16, total_width: u16) -> Line<'static> {
         ),
     ];
 
-    // Columns already spent: bullet + name + gap + age.
-    let fixed = 2 + name_width + 2 + 4;
+    // Columns already spent: bullet + name + gap + link + age.
+    let fixed = 2 + name_width + 2 + link.chars().count() as u16 + 4;
     let room = (total_width.saturating_sub(fixed)) as usize;
     if room >= MIN_SUMMARY {
         spans.push(Span::raw("  "));
@@ -170,10 +178,15 @@ fn job_line(job: &Job, name_width: u16, total_width: u16) -> Line<'static> {
         ));
     }
 
-    // Right-align the age against the pane edge.
+    // Right-align the link and age against the pane edge.
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let pad_to = (total_width as usize).saturating_sub(used + age.chars().count());
-    spans.push(Span::raw(" ".repeat(pad_to)));
+    let tail = link.chars().count() + age.chars().count();
+    spans.push(Span::raw(
+        " ".repeat((total_width as usize).saturating_sub(used + tail)),
+    ));
+    if !link.is_empty() {
+        spans.push(Span::styled(link, Style::default().fg(Color::Indexed(141))));
+    }
     spans.push(Span::styled(age, Style::default().fg(Color::DarkGray)));
 
     Line::from(spans)
@@ -238,30 +251,25 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
     frame.render_widget(Paragraph::new(Line::from(text)), area);
 }
 
-/// Claude Code stores a colour name per job; fall back to a stable colour
-/// derived from the name so unnamed or new-coloured jobs still read distinctly.
+/// Claude Code stores a colour name per job. These are the names it uses, and
+/// the 256-colour approximations that match how its own panel looks.
+///
+/// A name Savras does not recognise falls back to a neutral, never to a colour
+/// from the palette: a wrong colour reads as meaning something, and a job
+/// silently shown as "red" is worse than one shown as plain.
 fn badge_color(job: &Job) -> Color {
-    const PALETTE: [Color; 6] = [
-        Color::Cyan,
-        Color::Magenta,
-        Color::Green,
-        Color::Yellow,
-        Color::Blue,
-        Color::Red,
-    ];
     match job.color.as_deref() {
-        Some("cyan") => Color::Cyan,
-        Some("magenta") => Color::Magenta,
-        Some("green") => Color::Green,
-        Some("yellow") => Color::Yellow,
-        Some("blue") => Color::Blue,
-        Some("red") => Color::Red,
-        Some("white") => Color::White,
-        Some("gray") | Some("grey") => Color::Gray,
-        _ => {
-            let sum: usize = job.name.bytes().map(|b| b as usize).sum();
-            PALETTE[sum % PALETTE.len()]
-        }
+        Some("cyan") => Color::Indexed(117),
+        Some("blue") => Color::Indexed(111),
+        Some("green") => Color::Indexed(114),
+        Some("yellow") => Color::Indexed(179),
+        Some("orange") => Color::Indexed(215),
+        Some("red") => Color::Indexed(203),
+        Some("pink") => Color::Indexed(211),
+        Some("purple") | Some("magenta") => Color::Indexed(141),
+        Some("white") => Color::Indexed(252),
+        Some("gray") | Some("grey") => Color::Indexed(245),
+        _ => Color::Indexed(250),
     }
 }
 

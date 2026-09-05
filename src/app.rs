@@ -11,6 +11,8 @@ use crate::job::{self, Job, Snapshot, Status};
 pub enum Row {
     Heading(Status),
     Job(usize),
+    /// A blank line between groups. Drawn, never selected.
+    Spacer,
 }
 
 pub struct App {
@@ -70,6 +72,9 @@ impl App {
             if group.is_empty() {
                 continue;
             }
+            if !self.rows.is_empty() {
+                self.rows.push(Row::Spacer);
+            }
             self.rows.push(Row::Heading(status));
             self.rows.extend(group.into_iter().map(Row::Job));
         }
@@ -84,15 +89,15 @@ impl App {
             .and_then(|short| {
                 self.rows.iter().position(|r| match r {
                     Row::Job(i) => self.snapshot.jobs[*i].short == short,
-                    Row::Heading(_) => false,
+                    _ => false,
                 })
             })
             .or_else(|| previous.filter(|i| *i < self.rows.len()))
             .or_else(|| self.first_job_row());
 
         self.list_state.select(target);
-        // The fallback may have landed on a heading.
-        if matches!(self.current_row(), Some(Row::Heading(_))) {
+        // The fallback may have landed on a heading or a blank line.
+        if !matches!(self.current_row(), Some(Row::Job(_))) {
             self.step(1);
         }
     }
@@ -141,7 +146,7 @@ impl App {
         }
         if to_end {
             self.list_state.select(Some(self.rows.len() - 1));
-            if matches!(self.current_row(), Some(Row::Heading(_))) {
+            if !matches!(self.current_row(), Some(Row::Job(_))) {
                 self.step(-1);
             }
         } else {
@@ -173,7 +178,7 @@ mod tests {
             .iter()
             .filter_map(|r| match r {
                 Row::Job(i) => Some(app.snapshot.jobs[*i].name.clone()),
-                Row::Heading(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -182,11 +187,13 @@ mod tests {
     fn rows_interleave_headings_with_their_group() {
         let f = fixture();
         let app = App::new(f.0.clone());
-        // 3 headings + 3 jobs, each heading immediately before its group.
-        assert_eq!(app.rows.len(), 6);
+        // 3 headings + 3 jobs + a blank line between groups.
+        assert_eq!(app.rows.len(), 8);
         assert!(matches!(app.rows[0], Row::Heading(Status::NeedsInput)));
-        assert!(matches!(app.rows[2], Row::Heading(Status::Working)));
-        assert!(matches!(app.rows[4], Row::Heading(Status::Done)));
+        assert!(matches!(app.rows[2], Row::Spacer));
+        assert!(matches!(app.rows[3], Row::Heading(Status::Working)));
+        assert!(matches!(app.rows[5], Row::Spacer));
+        assert!(matches!(app.rows[6], Row::Heading(Status::Done)));
         assert_eq!(names_in_order(&app), ["ASK", "RUN", "FIN"]);
     }
 
