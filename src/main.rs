@@ -4,6 +4,7 @@
 //! so it cannot disturb the sessions it reports on.
 
 mod app;
+mod focus;
 mod host;
 mod job;
 mod panel;

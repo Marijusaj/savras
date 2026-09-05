@@ -12,6 +12,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -22,6 +23,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
 use crate::app::App;
+use crate::focus;
 use crate::ping::Ping;
 use crate::ui::{self, Hint};
 use crate::watch::Watch;
@@ -80,6 +82,9 @@ enum Action {
 /// panel is dropping one of these and spawning the next.
 struct Work {
     parser: Arc<Mutex<vt100::Parser>>,
+    /// Whether the program in the pane asked for focus reporting itself. vt100
+    /// does not track mode 1004, so the read thread watches for it.
+    wants_focus: Arc<AtomicBool>,
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     output: Receiver<()>,
@@ -116,13 +121,16 @@ impl Work {
 
         let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 2000)));
         let writer = pty.master.take_writer().context("writing to the pty")?;
+        let wants_focus = Arc::new(AtomicBool::new(false));
         let output = read_thread(
             pty.master.try_clone_reader().context("reading the pty")?,
             Arc::clone(&parser),
+            Arc::clone(&wants_focus),
         );
 
         Ok(Work {
             parser,
+            wants_focus,
             master: pty.master,
             writer,
             output,
@@ -203,9 +211,13 @@ pub fn run(
     };
 
     let mut terminal = crate::setup_terminal()?;
+    // Ask the terminal to say when it gains and loses focus, so the panel can
+    // tell "you are looking at that session" from "you are in another app".
+    let _ = std::io::stdout().write_all(focus::ENABLE.as_bytes());
     let result = event_loop(&mut terminal, session);
-    // Leave the terminal's mouse handling as we found it.
+    // Leave the terminal's mouse and focus handling as we found it.
     let _ = std::io::stdout().write_all(MOUSE_OFF.as_bytes());
+    let _ = std::io::stdout().write_all(focus::DISABLE.as_bytes());
     crate::restore_terminal(&mut terminal)?;
     result
 }
@@ -253,6 +265,11 @@ fn event_loop(
     );
     let mut dead = false;
     let mut exit_code = 0;
+    // Whether the terminal *window* has you — distinct from `focus` above,
+    // which is only about which pane the keyboard is typing into. Unknown
+    // counts as away: missing a question because we assumed you were watching
+    // is worse than one ping you did not need.
+    let mut window_focused = false;
 
     loop {
         // Follow the child in and out of mouse mode. Its request to enable
@@ -289,8 +306,20 @@ fn event_loop(
 
         match session.input.recv_timeout(TICK) {
             Ok(bytes) => {
+                if let Some(gained) = focus::event(&bytes) {
+                    window_focused = gained;
+                }
                 let bytes = shift_mouse(&bytes, work_offset(session.width, session.side));
-                let action = if dead && focus == Focus::Work {
+                // A program that never asked for focus reporting would print
+                // these as stray characters, so they go no further.
+                let bytes = if session.work.wants_focus.load(Ordering::Relaxed) {
+                    bytes
+                } else {
+                    focus::strip(&bytes)
+                };
+                let action = if bytes.is_empty() {
+                    Action::Nothing // nothing but a focus event
+                } else if dead && focus == Focus::Work {
                     dead_pane_key(&bytes, &mut app)
                 } else {
                     route(&bytes, focus, &mut app, &mut session.work)?
@@ -331,8 +360,13 @@ fn event_loop(
 
         if watch.changed() || last_refresh.elapsed() >= REFRESH {
             app.refresh();
+            // The session in the pane is only "in front of you" while the
+            // terminal has focus; in another application it is as invisible
+            // as any other, and must ping like one.
             let open = session.open.clone();
-            session.ping.poll(&app.snapshot, open.as_deref());
+            session
+                .ping
+                .poll(&app.snapshot, watching(window_focused, open.as_deref()));
             last_refresh = Instant::now();
             dirty = true;
         }
@@ -341,6 +375,16 @@ fn event_loop(
             dirty = true;
         }
     }
+}
+
+/// Which session you are actually watching, and so need no ping about.
+///
+/// A session open in the pane is only in front of you while the terminal has
+/// your attention. In another application it is as invisible as any other
+/// session, and staying quiet about it is how you miss the question you most
+/// needed to see.
+fn watching(focused: bool, open: Option<&str>) -> Option<&str> {
+    open.filter(|_| focused)
 }
 
 /// Replace the working pane with the selected session. The program that was
@@ -687,14 +731,17 @@ fn default_shell() -> String {
 fn read_thread(
     mut reader: Box<dyn Read + Send>,
     parser: Arc<Mutex<vt100::Parser>>,
+    wants_focus: Arc<AtomicBool>,
 ) -> Receiver<()> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut buf = [0u8; 8192];
+        let mut watcher = focus::Watcher::default();
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => return,
                 Ok(n) => {
+                    wants_focus.store(watcher.feed(&buf[..n]), Ordering::Relaxed);
                     parser.lock().unwrap().process(&buf[..n]);
                     if tx.send(()).is_err() {
                         return;
@@ -731,6 +778,19 @@ fn stdin_thread() -> Receiver<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::testing::Fixture;
+
+    #[test]
+    fn an_open_session_is_only_spared_a_ping_while_you_are_there() {
+        // Looking at it: it is asking you in person, on the other half of the
+        // screen, and a notification would be noise.
+        assert_eq!(watching(true, Some("aaa")), Some("aaa"));
+        // In another application: that pane is as invisible as any other
+        // session, and this is precisely the question you must not miss.
+        assert_eq!(watching(false, Some("aaa")), None);
+        // Focus is unknown until the terminal says otherwise, and unknown
+        // counts as away.
+        assert_eq!(watching(false, None), None);
+    }
 
     #[test]
     fn the_working_pane_gets_what_is_left_after_the_panel_and_divider() {

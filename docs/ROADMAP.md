@@ -40,9 +40,15 @@ written straight to the terminal, and a sound (`afplay`, `canberra-gtk-play`,
 `[console]::beep`, with the terminal bell underneath). It fires on the
 *transition*, so the first look is silent and a question already on screen is
 never re-announced; a burst of sessions is one ping that counts them, and a
-20-second quiet period follows. The session showing in the working pane never
-pings. `--ping done` includes finished sessions, `--ping off` and `--no-sound`
-turn the halves off separately.
+20-second quiet period follows. `--ping done` includes finished sessions,
+`--ping off` and `--no-sound` turn the halves off separately.
+
+The session in the working pane is spared a ping only while the terminal has
+focus. Sparing it unconditionally was the first cut and it was wrong: with the
+window behind a browser, the session you had open is exactly the one you would
+never see ask. Savras enables focus reporting (DEC mode 1004), forwards the
+events to the child only when the child asked for them itself — the rule the
+mouse already follows — and treats unknown focus as away.
 
 Two decisions worth keeping: **OSC 9 only, not OSC 9 and OSC 777** — WezTerm and
 Ghostty understand both, so sending both notifies twice, and a missing

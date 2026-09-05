@@ -107,8 +107,15 @@ comes from your terminal, not from the binary.
 It fires on the *transition*, not on a poll tick. Savras opening beside four
 sessions that already need you is silent; a question already on screen is never
 re-announced. A burst of sessions asking at once is one ping that counts them,
-and twenty quiet seconds follow. The session showing in the working pane never
-pings — it is asking you in person, on the other half of the screen.
+and twenty quiet seconds follow.
+
+The session showing in the working pane is spared a ping — but only while the
+terminal has focus, because only then is it asking you in person. Switch to
+your browser and that pane is as invisible as any other session, so it pings
+like one. Savras knows the difference by asking the terminal to report focus
+(DEC mode 1004); until the terminal says otherwise it assumes you are away,
+since a ping you did not need is a smaller failure than the question you never
+saw.
 
 ```sh
 svr --ping done       ping when a session finishes, too
@@ -173,9 +180,9 @@ Next up is **M3 · Repos** — group and sort the panel by repository. Then
 ## Development
 
 ```sh
-cargo test        # 76 tests: parsing, grouping, navigation, ping
-                  # transitions, argument handling, tmux layout,
-                  # and render buffers
+cargo test        # 84 tests: parsing, grouping, navigation, ping
+                  # transitions, focus reporting, argument handling,
+                  # tmux layout, and render buffers
 cargo build --release
 ```
 

@@ -74,12 +74,15 @@ impl Ping {
 
     /// Note a new snapshot, and say what — if anything — deserves a ping.
     ///
-    /// `open` is the session showing in the working pane; it never pings,
-    /// because you are looking straight at it.
+    /// `watching` is the session you are actually looking at: showing in the
+    /// working pane *and* the terminal has focus. That one never pings,
+    /// because it is asking you in person. A session merely open in a pane
+    /// behind another application is not being watched, and pings like any
+    /// other — see `focus`.
     pub fn observe(
         &mut self,
         snapshot: &Snapshot,
-        open: Option<&str>,
+        watching: Option<&str>,
         now: Instant,
     ) -> Option<Notice> {
         let mut fired = Vec::new();
@@ -94,7 +97,7 @@ impl Ping {
             if before == Some(job.status) {
                 continue;
             }
-            if Some(job.short.as_str()) == open || Some(job.session_id.as_str()) == open {
+            if Some(job.short.as_str()) == watching || Some(job.session_id.as_str()) == watching {
                 continue;
             }
             if self.worth_saying(job.status) {
@@ -155,8 +158,8 @@ impl Ping {
     }
 
     /// The whole point, in one call: look, and make noise if there is reason to.
-    pub fn poll(&mut self, snapshot: &Snapshot, open: Option<&str>) {
-        if let Some(notice) = self.observe(snapshot, open, Instant::now()) {
+    pub fn poll(&mut self, snapshot: &Snapshot, watching: Option<&str>) {
+        if let Some(notice) = self.observe(snapshot, watching, Instant::now()) {
             notice.announce(self.sound);
         }
     }
@@ -358,7 +361,8 @@ mod tests {
 
     #[test]
     fn the_session_you_are_looking_at_never_pings() {
-        // It is on the other half of your screen, asking you in person.
+        // It is on the other half of your screen, asking you in person. Only
+        // while you are actually there, though — see `watching` in host.rs.
         let f = Fixture::new("ping-open").job("aaa", WORKING);
         let mut ping = Ping::new(When::Needs, false);
         let now = Instant::now();
