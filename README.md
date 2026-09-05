@@ -61,22 +61,42 @@ svr panel -- claude    # panel on the left, Claude Code on the right
 svr panel --width 52
 ```
 
-Most terminals — macOS Terminal.app among them — cannot split a window at all,
-so the layout is built with tmux. The tmux is meant to be invisible: no status
-bar, no prefix keys to learn, just a divider. Savras writes its own tmux config
-and only applies it to the server it starts, so an existing tmux setup is left
-alone. Run `svr panel` from inside tmux and it adds the column to the window in
-front of you instead of starting a session.
+No tmux, no configuration, nothing else to install. Savras hosts the working
+pane itself: it opens a pseudo-terminal, runs your command in it, and draws its
+screen beside the panel. Keystrokes are forwarded to the child as raw bytes
+rather than decoded and re-encoded, so arrow keys, Ctrl chords, paste and
+full-screen TUIs behave exactly as they would in a normal terminal.
 
-`svr panel --dry-run` prints the tmux commands instead of running them.
+Savras does not implement a terminal emulator. [`portable-pty`][pty] provides
+the pseudo-terminal (ConPTY on Windows) and [`vt100`][vt100] interprets the
+output; Savras is the layout and the glue.
 
-Closing the panel with `q` closes that pane; `svr panel` puts it back.
+`ctrl-g` moves the keyboard to the panel and back. Everything else goes
+straight to your work.
+
+[pty]: https://crates.io/crates/portable-pty
+[vt100]: https://crates.io/crates/vt100
+
+### tmux, if you want it
+
+```sh
+svr panel --tmux
+```
+
+Hosting the pane means the session dies with Savras. `--tmux` builds the same
+layout in tmux instead, so the session survives a crash or a dropped SSH
+connection, and you can detach and reattach. The tmux is kept invisible: no
+status bar, no prefix keys to learn, just a divider. Savras writes its own tmux
+config and applies it only to the server it starts, so an existing tmux setup is
+left alone. Run it from inside tmux and it adds the column to the window in
+front of you. `--dry-run` prints the tmux commands instead of running them.
 
 ## Usage
 
 ```
 svr                    open the panel on its own
 svr panel              open the panel as a column beside your work
+svr panel --tmux       ... using tmux, so the session survives a crash
 svr --once             print the current sessions as plain text and exit
 svr --jobs-dir <path>  read jobs from somewhere other than ~/.claude/jobs
 ```
@@ -98,7 +118,7 @@ footer goes, to keep sessions visible.
 ## Roadmap
 
 - **M0 — the panel.** ✔
-- **M0.5 — the side panel.** ✔ `svr panel`, via tmux.
+- **M0.5 — the side panel.** ✔ `svr panel`, hosted directly or via tmux.
 - **M1** — ping on attention (OSC 9 desktop notification), `enter` to resume via
   tmux, `d` to kill a session.
 - **M2** — a background poller for GitHub/GitLab: PR state, checks, reviews.
@@ -108,7 +128,7 @@ footer goes, to keep sessions visible.
 ## Development
 
 ```sh
-cargo test        # 39 tests: parsing, grouping, navigation,
+cargo test        # 43 tests: parsing, grouping, navigation,
                   # argument handling, tmux layout, and render buffers
 cargo build --release
 ```

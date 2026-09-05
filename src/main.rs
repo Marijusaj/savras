@@ -4,15 +4,16 @@
 //! so it cannot disturb the sessions it reports on.
 
 mod app;
+mod host;
 mod job;
 mod panel;
 #[cfg(test)]
 mod testing;
 mod ui;
+mod watch;
 
 use std::io::{self, Stdout};
 use std::path::PathBuf;
-use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -22,10 +23,10 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use notify::{RecursiveMode, Watcher};
 use ratatui::prelude::*;
 
 use app::App;
+use watch::Watch;
 
 const USAGE: &str = "\
 savras — see every Claude Code session you have running
@@ -39,6 +40,7 @@ commands:
 
 options:
   --width <cols>      width of the panel column (panel only, default 44)
+  --tmux              build the panel with tmux instead of hosting it directly
   --dry-run           print the tmux layout instead of building it (panel only)
   --once              print the current sessions as plain text and exit
   --jobs-dir <path>   read jobs from somewhere other than ~/.claude/jobs
@@ -73,6 +75,7 @@ enum Mode {
         width: u16,
         command: Vec<String>,
         dry_run: bool,
+        tmux: bool,
     },
 }
 
@@ -96,19 +99,27 @@ fn main() -> Result<()> {
         width,
         command,
         dry_run,
+        tmux,
     } = options.mode
     {
-        return panel::run(width, command, dry_run);
+        if tmux || dry_run {
+            return panel::run(width, command, dry_run);
+        }
+        return host::run(width, command, jobs_dir(options.jobs_dir)?);
     }
 
-    let jobs_dir = match options.jobs_dir {
-        Some(dir) => dir,
-        None => job::default_jobs_dir()?,
-    };
+    let jobs_dir = jobs_dir(options.jobs_dir)?;
 
     match options.mode {
         Mode::Once => print_once(&jobs_dir),
         _ => run_tui(jobs_dir),
+    }
+}
+
+fn jobs_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    match explicit {
+        Some(dir) => Ok(dir),
+        None => job::default_jobs_dir(),
     }
 }
 
@@ -125,6 +136,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
     let mut command = Vec::new();
     let mut is_panel = false;
     let mut dry_run = false;
+    let mut tmux = false;
 
     let mut args = args.into_iter().peekable();
     if args.peek().map(String::as_str) == Some("panel") {
@@ -150,6 +162,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
             }
             "--once" => options.mode = Mode::Once,
             "--dry-run" => dry_run = true,
+            "--tmux" => tmux = true,
             "--width" => {
                 let raw = args.next().context("--width needs a number")?;
                 width = raw
@@ -172,6 +185,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
             width,
             command,
             dry_run,
+            tmux,
         };
     } else if !command.is_empty() {
         anyhow::bail!("a command after `--` only makes sense with `svr panel`");
@@ -224,10 +238,8 @@ fn run_tui(jobs_dir: PathBuf) -> Result<()> {
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, jobs_dir: PathBuf) -> Result<()> {
     let mut app = App::new(jobs_dir.clone());
 
-    // Keep the watcher alive for the whole loop; dropping it stops events.
-    let (tx, rx) = mpsc::channel();
-    let watcher = start_watcher(&jobs_dir, tx);
-    app.watching = watcher.is_some();
+    let watch = Watch::start(&jobs_dir);
+    app.watching = watch.live;
 
     let mut dirty_since: Option<Instant> = None;
     let mut last_load = Instant::now();
@@ -243,7 +255,7 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, jobs_dir: PathB
             }
         }
 
-        if drain(&rx) {
+        if watch.changed() {
             dirty_since.get_or_insert_with(Instant::now);
         }
 
@@ -272,44 +284,6 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Watch the jobs directory. Returns `None` if watching is unavailable, in
-/// which case the caller falls back to polling.
-fn start_watcher(
-    jobs_dir: &std::path::Path,
-    tx: mpsc::Sender<()>,
-) -> Option<notify::RecommendedWatcher> {
-    // Watching a directory that does not exist fails; watch the parent so the
-    // panel comes alive the moment Claude Code creates it.
-    let target = if jobs_dir.exists() {
-        jobs_dir.to_path_buf()
-    } else {
-        jobs_dir.parent()?.to_path_buf()
-    };
-    if !target.exists() {
-        return None;
-    }
-
-    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
-        if res.is_ok() {
-            let _ = tx.send(());
-        }
-    })
-    .ok()?;
-    watcher.watch(&target, RecursiveMode::Recursive).ok()?;
-    Some(watcher)
-}
-
-/// Collapse a burst of events into a single "something changed".
-fn drain(rx: &Receiver<()>) -> bool {
-    let mut any = false;
-    loop {
-        match rx.try_recv() {
-            Ok(()) => any = true,
-            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => return any,
-        }
-    }
-}
-
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -326,7 +300,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
@@ -370,6 +344,20 @@ mod tests {
                 assert_eq!(width, panel::DEFAULT_WIDTH);
                 assert_eq!(command, ["claude", "--once", "--width", "9"]);
             }
+            _ => panic!("expected panel mode"),
+        }
+    }
+
+    #[test]
+    fn the_panel_hosts_the_pane_itself_unless_tmux_is_asked_for() {
+        // The default needs no tmux installed; --tmux opts into it for the
+        // detach and reattach that hosting cannot give.
+        match parse_ok(&["panel"]).mode {
+            Mode::Panel { tmux, .. } => assert!(!tmux),
+            _ => panic!("expected panel mode"),
+        }
+        match parse_ok(&["panel", "--tmux"]).mode {
+            Mode::Panel { tmux, .. } => assert!(tmux),
             _ => panic!("expected panel mode"),
         }
     }

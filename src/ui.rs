@@ -20,7 +20,12 @@ const WRAPS: u16 = 60;
 const SHORT: u16 = 16;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
-    let area = frame.area();
+    draw_in(frame, frame.area(), app, true);
+}
+
+/// Draw the panel into `area`. `focused` is false when the panel is a column
+/// beside a working pane that currently has the keyboard.
+pub fn draw_in(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
     let show_detail = area.height >= SHORT && app.selected_job().is_some();
 
     let chunks = Layout::vertical([
@@ -36,7 +41,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if show_detail {
         draw_detail(frame, chunks[2], app);
     }
-    draw_footer(frame, chunks[3], app);
+    draw_footer(frame, chunks[3], app, focused);
 }
 
 /// The detail footer needs an extra line in narrow panes, where the resume
@@ -217,17 +222,18 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, app: &App) {
-    let text = if let Some(err) = &app.error {
-        Span::styled(
+fn draw_footer(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
+    let text = match (&app.error, focused) {
+        (Some(err), _) => Span::styled(
             truncate(err, area.width as usize),
             Style::default().fg(Color::Red),
-        )
-    } else {
-        Span::styled(
+        ),
+        (None, true) => Span::styled(
             "↑↓ move · r refresh · q quit",
             Style::default().fg(Color::DarkGray),
-        )
+        ),
+        // The panel is a column beside a pane that has the keyboard.
+        (None, false) => Span::styled("ctrl-g to focus", Style::default().fg(Color::DarkGray)),
     };
     frame.render_widget(Paragraph::new(Line::from(text)), area);
 }
