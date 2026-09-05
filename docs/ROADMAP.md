@@ -21,7 +21,12 @@ for the detach and reattach that hosting cannot give.
 
 ### M1.5 · Open
 `ctrl-g` focuses the panel, `enter` opens the selected session in the working
-pane — `claude --resume`, in that session's own repository.
+pane — `claude --resume`, in that session's own repository. A session that
+exits leaves its last screen on display rather than closing Savras.
+
+### M1.6 · Default
+`svr` on its own is the side panel; `svr solo` is the panel with nothing beside
+it.
 
 ---
 

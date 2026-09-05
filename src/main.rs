@@ -32,32 +32,38 @@ use watch::Watch;
 const USAGE: &str = "\
 savras — see every Claude Code session you have running
 
-usage: svr [options]
-       svr panel [--width <cols>] [-- <command>...]
+usage: svr [options] [-- <command>...]
+       svr solo [options]
+
+By default Savras opens the panel as a column beside your work, and runs your
+shell — or the command after `--` — in the pane next to it.
 
 commands:
-  panel               open the panel as a column on the left of this terminal,
-                      with your work beside it (uses tmux)
+  (none)              the side panel, with your shell beside it
+  solo                just the panel, with no working pane, for its own tab
 
 options:
-  --side <left|right> which side the panel sits on (panel only, default right)
-  --width <cols>      width of the panel column (panel only, default 44)
-  --tmux              build the panel with tmux instead of hosting it directly
-  --dry-run           print the tmux layout instead of building it (panel only)
+  --side <left|right> which side the panel sits on (default right)
+  --width <cols>      width of the panel column (default 44)
+  --tmux              build the layout with tmux instead of hosting it directly
+  --dry-run           print the tmux layout instead of building it
   --once              print the current sessions as plain text and exit
   --jobs-dir <path>   read jobs from somewhere other than ~/.claude/jobs
   -h, --help          show this help
   -V, --version       show the version
 
 examples:
-  svr panel                    panel on the left, a shell on the right
-  svr panel -- claude          panel on the left, Claude Code on the right
-  svr panel --side left        panel on the left instead
-  svr panel --width 52
+  svr                          panel on the right, a shell beside it
+  svr -- claude                panel on the right, Claude Code beside it
+  svr --side left --width 52
+  svr solo                     the panel on its own
+  svr --once                   plain text, for scripts and status lines
 
 keys:
-  ↑/↓, k/j   move        g/G  first/last
-  r          refresh     q    quit
+  ctrl-g     move the keyboard between your work and the panel
+  ↑/↓, k/j   move        enter  open the selected session
+  g/G        first/last  esc    back to your work
+  r          refresh     q      quit
 ";
 
 /// How often to redraw. Ages tick in seconds, so this needs to be sub-second,
@@ -139,15 +145,24 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
     };
     let mut width = panel::DEFAULT_WIDTH;
     let mut command = Vec::new();
-    let mut is_panel = false;
+    // The side panel is the point of the tool, so it is what you get by
+    // default; `solo` is the older behaviour of a panel with nothing beside it.
+    let mut is_panel = true;
     let mut dry_run = false;
     let mut tmux = false;
     let mut side = Side::Right;
 
     let mut args = args.into_iter().peekable();
-    if args.peek().map(String::as_str) == Some("panel") {
-        args.next();
-        is_panel = true;
+    match args.peek().map(String::as_str) {
+        // `panel` is still accepted; it is what this used to be called.
+        Some("panel") => {
+            args.next();
+        }
+        Some("solo") => {
+            args.next();
+            is_panel = false;
+        }
+        _ => {}
     }
 
     while let Some(arg) = args.next() {
@@ -166,7 +181,10 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
                 command.extend(args.by_ref());
                 break;
             }
-            "--once" => options.mode = Mode::Once,
+            "--once" => {
+                options.mode = Mode::Once;
+                is_panel = false;
+            }
             "--dry-run" => dry_run = true,
             "--tmux" => tmux = true,
             "--side" => {
@@ -203,7 +221,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
             side,
         };
     } else if !command.is_empty() {
-        anyhow::bail!("a command after `--` only makes sense with `svr panel`");
+        anyhow::bail!("a command after `--` needs a working pane to run in, which `svr solo` and `--once` do not have");
     }
     Ok(Some(options))
 }
@@ -333,13 +351,31 @@ mod tests {
     }
 
     #[test]
-    fn no_arguments_opens_the_panel_in_this_terminal() {
-        assert!(matches!(parse_ok(&[]).mode, Mode::Tui));
+    fn no_arguments_opens_the_side_panel_beside_your_work() {
+        assert!(matches!(parse_ok(&[]).mode, Mode::Panel { .. }));
+        // `panel` is what this used to be called, and still works.
+        assert!(matches!(parse_ok(&["panel"]).mode, Mode::Panel { .. }));
+    }
+
+    #[test]
+    fn solo_is_the_panel_with_nothing_beside_it() {
+        assert!(matches!(parse_ok(&["solo"]).mode, Mode::Tui));
+    }
+
+    #[test]
+    fn a_command_needs_a_pane_to_run_in() {
+        assert!(parse(vec!["solo".into(), "--".into(), "claude".into()]).is_err());
+        assert!(parse(vec!["--once".into(), "--".into(), "claude".into()]).is_err());
+        // But the default mode has a pane, so this is fine.
+        assert!(matches!(
+            parse_ok(&["--", "claude"]).mode,
+            Mode::Panel { .. }
+        ));
     }
 
     #[test]
     fn panel_takes_a_width_and_a_command() {
-        let options = parse_ok(&["panel", "--width", "52", "--", "claude", "--resume", "x"]);
+        let options = parse_ok(&["--width", "52", "--", "claude", "--resume", "x"]);
         match options.mode {
             Mode::Panel { width, command, .. } => {
                 assert_eq!(width, 52);
@@ -353,7 +389,7 @@ mod tests {
     fn options_after_the_separator_belong_to_the_command_not_to_us() {
         // `--once` here is Claude Code's flag, not ours; parsing it would send
         // the user somewhere they did not ask to go.
-        let options = parse_ok(&["panel", "--", "claude", "--once", "--width", "9"]);
+        let options = parse_ok(&["--", "claude", "--once", "--width", "9"]);
         match options.mode {
             Mode::Panel { width, command, .. } => {
                 assert_eq!(width, panel::DEFAULT_WIDTH);
@@ -394,12 +430,6 @@ mod tests {
     fn a_width_too_small_to_read_is_rejected() {
         assert!(parse(vec!["panel".into(), "--width".into(), "3".into()]).is_err());
         assert!(parse(vec!["panel".into(), "--width".into(), "wide".into()]).is_err());
-    }
-
-    #[test]
-    fn a_command_without_panel_is_a_mistake_worth_naming() {
-        let err = parse(vec!["--".into(), "claude".into()]).unwrap_err();
-        assert!(err.to_string().contains("svr panel"), "{err}");
     }
 
     #[test]

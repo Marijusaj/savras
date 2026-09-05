@@ -56,10 +56,11 @@ The point is a narrow column down the side of the terminal you are already
 working in, with your session beside it:
 
 ```sh
-svr panel                # panel on the right, a shell beside it
-svr panel -- claude      # panel on the right, Claude Code beside it
-svr panel --side left    # the other way round
-svr panel --width 52
+svr                # panel on the right, a shell beside it
+svr -- claude      # panel on the right, Claude Code beside it
+svr --side left    # the other way round
+svr --width 52
+svr solo           # just the panel, no working pane, for its own tab
 ```
 
 No tmux, no configuration, nothing else to install. Savras hosts the working
@@ -74,7 +75,11 @@ output; Savras is the layout and the glue.
 
 `ctrl-g` moves the keyboard to the panel and back; with the panel focused,
 `enter` opens the selected session in the working pane — `claude --resume`, in
-that session's own repository — and `esc` hands the keyboard back. Everything else goes
+that session's own repository — and `esc` hands the keyboard back.
+
+If an opened session exits — resuming one that is already open elsewhere will do
+that — its last screen stays on display so you can read why, with `enter` to try
+again and `q` to quit. Only leaving the shell you *started* with closes Savras. Everything else goes
 straight to your work, including the mouse: Savras follows the child in and out
 of mouse reporting and mirrors it to the real terminal, so scrolling reaches
 Claude Code instead of dragging the terminal's own scrollback across both panes.
@@ -87,7 +92,7 @@ pane's own frame.
 ### tmux, if you want it
 
 ```sh
-svr panel --tmux
+svr --tmux
 ```
 
 Hosting the pane means the session dies with Savras. `--tmux` builds the same
@@ -101,10 +106,11 @@ front of you. `--dry-run` prints the tmux commands instead of running them.
 ## Usage
 
 ```
-svr                    open the panel on its own
-svr panel              open the panel as a column beside your work
-svr panel --side left  put it on the left instead of the right
-svr panel --tmux       ... using tmux, so the session survives a crash
+svr                    the side panel, with your shell beside it
+svr -- claude          ... with Claude Code beside it
+svr --side left        put the panel on the left instead of the right
+svr --tmux             use tmux, so the session survives a crash
+svr solo               just the panel, with no working pane
 svr --once             print the current sessions as plain text and exit
 svr --jobs-dir <path>  read jobs from somewhere other than ~/.claude/jobs
 ```
@@ -134,7 +140,7 @@ Then **M3 · Repos** and **M4 · Vitals**. See [docs/ROADMAP.md](docs/ROADMAP.md
 ## Development
 
 ```sh
-cargo test        # 56 tests: parsing, grouping, navigation,
+cargo test        # 58 tests: parsing, grouping, navigation,
                   # argument handling, tmux layout, and render buffers
 cargo build --release
 ```

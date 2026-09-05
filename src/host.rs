@@ -53,12 +53,24 @@ enum Focus {
     Panel,
 }
 
+/// Where the program in the working pane came from. It decides what happens
+/// when that program exits: leaving the shell you started with closes Savras,
+/// but a session you opened from the panel exiting must not take the panel with
+/// it — that is how you lose both the panel and the reason it failed.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Origin {
+    Initial,
+    Opened,
+}
+
 /// What a keystroke asked for.
 enum Action {
     Nothing,
     Focus(Focus),
     /// Open the selected session in the working pane.
     Open,
+    /// Run the last opened session again, after it exited.
+    Reopen,
 }
 
 /// The program running beside the panel, and the pseudo-terminal it lives in.
@@ -71,10 +83,19 @@ struct Work {
     writer: Box<dyn Write + Send>,
     output: Receiver<()>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    origin: Origin,
+    /// Set once the child is reaped; `try_wait` must not be asked twice.
+    exited: Option<u32>,
 }
 
 impl Work {
-    fn spawn(command: &[String], cwd: Option<&Path>, cols: u16, rows: u16) -> Result<Self> {
+    fn spawn(
+        command: &[String],
+        cwd: Option<&Path>,
+        cols: u16,
+        rows: u16,
+        origin: Origin,
+    ) -> Result<Self> {
         let size = PtySize {
             rows,
             cols,
@@ -105,11 +126,20 @@ impl Work {
             writer,
             output,
             child,
+            origin,
+            exited: None,
         })
     }
 
-    fn finished(&mut self) -> bool {
-        matches!(self.child.try_wait(), Ok(Some(_)))
+    /// The child's exit code, once it has one. Remembered, because a reaped
+    /// child cannot be waited on again.
+    fn exit_code(&mut self) -> Option<u32> {
+        if self.exited.is_none() {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.exited = Some(status.exit_code());
+            }
+        }
+        self.exited
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
@@ -152,7 +182,7 @@ pub fn run(width: u16, side: Side, command: Vec<String>, jobs_dir: PathBuf) -> R
         );
     }
 
-    let work = Work::spawn(&command, None, cols_for_work, rows)?;
+    let work = Work::spawn(&command, None, cols_for_work, rows, Origin::Initial)?;
     let session = Session {
         jobs_dir,
         width,
@@ -160,6 +190,7 @@ pub fn run(width: u16, side: Side, command: Vec<String>, jobs_dir: PathBuf) -> R
         size: (cols, rows),
         input: stdin_thread(),
         work,
+        reopen: None,
     };
 
     let mut terminal = crate::setup_terminal()?;
@@ -177,6 +208,8 @@ struct Session {
     size: (u16, u16),
     input: Receiver<Vec<u8>>,
     work: Work,
+    /// The last session opened from the panel, so a dead pane can be retried.
+    reopen: Option<(Vec<String>, PathBuf)>,
 }
 
 impl Session {
@@ -203,6 +236,8 @@ fn event_loop(
         vt100::MouseProtocolMode::None,
         vt100::MouseProtocolEncoding::Default,
     );
+    let mut dead = false;
+    let mut exit_code = 0;
 
     loop {
         // Follow the child in and out of mouse mode. Its request to enable
@@ -217,28 +252,50 @@ fn event_loop(
         }
 
         if dirty || last_draw.elapsed() >= REDRAW {
-            terminal.draw(|frame| draw(frame, &mut app, &session, focus))?;
+            let banner = dead.then_some(exit_code);
+            terminal.draw(|frame| draw(frame, &mut app, &session, focus, banner))?;
             last_draw = Instant::now();
             dirty = false;
         }
 
-        // The child exiting is the signal to close the panel with it.
-        if session.work.finished() {
-            return Ok(());
+        // Leaving the shell you started with closes Savras. A session opened
+        // from the panel exiting leaves its last screen on display, so you can
+        // read why, and the panel stays where it was.
+        if let Some(code) = session.work.exit_code() {
+            if session.work.origin == Origin::Initial {
+                return Ok(());
+            }
+            if !dead {
+                dead = true;
+                dirty = true;
+                exit_code = code;
+            }
         }
 
         match session.input.recv_timeout(TICK) {
             Ok(bytes) => {
                 let bytes = shift_mouse(&bytes, work_offset(session.width, session.side));
-                match route(&bytes, focus, &mut app, &mut session.work)? {
+                let action = if dead && focus == Focus::Work {
+                    dead_pane_key(&bytes, &mut app)
+                } else {
+                    route(&bytes, focus, &mut app, &mut session.work)?
+                };
+                match action {
                     Action::Nothing => {}
                     Action::Focus(next) => focus = next,
-                    Action::Open => {
-                        if open_selected(&mut session, &app).is_ok() {
-                            focus = Focus::Work;
+                    Action::Open | Action::Reopen => {
+                        let opened = if matches!(action, Action::Reopen) {
+                            reopen(&mut session)
                         } else {
-                            app.error =
-                                Some("could not start `claude` — is it on your PATH?".into());
+                            open_selected(&mut session, &app)
+                        };
+                        match opened {
+                            Ok(true) => {
+                                focus = Focus::Work;
+                                dead = false;
+                            }
+                            Ok(false) => {}
+                            Err(e) => app.error = Some(format!("could not open: {e}")),
                         }
                     }
                 }
@@ -272,17 +329,38 @@ fn event_loop(
 /// Replace the working pane with the selected session. The program that was
 /// there is killed; the Claude Code session it was showing is not — those live
 /// in Claude Code's daemon, which is why reopening one is just a resume.
-fn open_selected(session: &mut Session, app: &App) -> Result<()> {
+fn open_selected(session: &mut Session, app: &App) -> Result<bool> {
     let Some(job) = app.selected_job() else {
-        return Ok(());
+        return Ok(false);
     };
-    let (command, cwd) = resume(job);
+    session.reopen = Some(resume(job));
+    reopen(session)
+}
+
+fn reopen(session: &mut Session) -> Result<bool> {
+    let Some((command, cwd)) = session.reopen.clone() else {
+        return Ok(false);
+    };
     let (cols, rows) = session.work_size();
 
     // Spawn before dropping the old one, so a failure leaves the pane intact.
-    let work = Work::spawn(&command, Some(&cwd), cols, rows)?;
+    let work = Work::spawn(&command, Some(&cwd), cols, rows, Origin::Opened)?;
     session.work = work;
-    Ok(())
+    Ok(true)
+}
+
+/// Keys for a pane whose program has exited. Its last screen is still on
+/// display — usually the error that explains the exit — so the keys are about
+/// what to do next, not about typing into a dead terminal.
+fn dead_pane_key(bytes: &[u8], app: &mut App) -> Action {
+    match bytes {
+        [b'\r'] | [b'\n'] => Action::Reopen,
+        [b'q'] => {
+            app.should_quit = true;
+            Action::Nothing
+        }
+        _ => Action::Nothing,
+    }
 }
 
 /// How to reopen a session: the command, and where to run it.
@@ -335,7 +413,7 @@ fn panel_key(bytes: &[u8], app: &mut App) -> Action {
     Action::Nothing
 }
 
-fn draw(frame: &mut Frame, app: &mut App, session: &Session, focus: Focus) {
+fn draw(frame: &mut Frame, app: &mut App, session: &Session, focus: Focus, dead: Option<u32>) {
     let area = frame.area();
     let panel_width = session.width.min(area.width.saturating_sub(DIVIDER + 1));
     let widths = match session.side {
@@ -370,7 +448,49 @@ fn draw(frame: &mut Frame, app: &mut App, session: &Session, focus: Focus) {
     frame.render_widget(divider, chunks[1]);
 
     let parser = session.work.parser.lock().unwrap();
-    draw_screen(frame, work_area, parser.screen(), focus == Focus::Work);
+    draw_screen(
+        frame,
+        work_area,
+        parser.screen(),
+        focus == Focus::Work && dead.is_none(),
+    );
+
+    if let Some(code) = dead {
+        draw_dead_banner(frame, work_area, code);
+    }
+}
+
+/// Say what happened, over the bottom of the dead pane, without covering the
+/// message that explains it.
+fn draw_dead_banner(frame: &mut Frame, area: Rect, code: u32) {
+    if area.height == 0 {
+        return;
+    }
+    let bar = Rect {
+        x: area.x,
+        y: area.y + area.height - 1,
+        width: area.width,
+        height: 1,
+    };
+    let text = format!(
+        " session exited ({code}) · enter to try again · ctrl-g for the panel · q to quit "
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(truncate_to(&text, bar.width as usize))).style(
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Indexed(179))
+                .add_modifier(Modifier::BOLD),
+        ),
+        bar,
+    );
+}
+
+fn truncate_to(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    s.chars().take(width).collect()
 }
 
 /// Paint the child's screen into our buffer, cell by cell.
@@ -672,6 +792,20 @@ mod tests {
     }
 
     #[test]
+    fn a_dead_pane_offers_a_way_out_instead_of_swallowing_keys() {
+        let f = Fixture::new("host-dead").job("aaa", r#"{"state":"working","name":"X"}"#);
+        let mut app = App::new(f.0.clone());
+
+        assert!(matches!(dead_pane_key(b"\r", &mut app), Action::Reopen));
+        assert!(!app.should_quit);
+        dead_pane_key(b"q", &mut app);
+        assert!(
+            app.should_quit,
+            "q must close a pane that cannot be typed into"
+        );
+    }
+
+    #[test]
     fn esc_hands_the_keyboard_back_instead_of_quitting() {
         let f = Fixture::new("host-esc").job("aaa", r#"{"state":"working","name":"X"}"#);
         let mut app = App::new(f.0.clone());
@@ -700,7 +834,13 @@ mod tests {
     #[test]
     fn a_replaced_pane_is_spawned_before_the_old_one_is_dropped() {
         // Opening a session must not leave an empty pane if the spawn fails.
-        let work = Work::spawn(&["/nonexistent/program".to_string()], None, 40, 10);
+        let work = Work::spawn(
+            &["/nonexistent/program".to_string()],
+            None,
+            40,
+            10,
+            Origin::Opened,
+        );
         assert!(
             work.is_err(),
             "a missing program should be reported, not run"
