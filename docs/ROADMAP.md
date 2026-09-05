@@ -28,6 +28,12 @@ exits leaves its last screen on display rather than closing Savras.
 `svr` on its own is the side panel; `svr solo` is the panel with nothing beside
 it.
 
+### M1.7 · Attach
+Daemon-backed sessions — which is nearly all of them — open with `claude
+attach <short-id>`, not `claude --resume`. Claude Code refuses to resume a
+session it is already running, and says so; Savras now reads `backend` and
+`daemonShort` from the job and picks the command that works.
+
 ---
 
 ## Next

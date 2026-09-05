@@ -233,7 +233,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
     }
 
     lines.push(Line::from(Span::styled(
-        job.resume_command(),
+        job.open_command_line(),
         Style::default().fg(Color::Green),
     )));
 

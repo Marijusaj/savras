@@ -365,14 +365,7 @@ fn dead_pane_key(bytes: &[u8], app: &mut App) -> Action {
 
 /// How to reopen a session: the command, and where to run it.
 fn resume(job: &crate::job::Job) -> (Vec<String>, PathBuf) {
-    (
-        vec![
-            "claude".to_string(),
-            "--resume".to_string(),
-            job.session_id.clone(),
-        ],
-        job.cwd.clone(),
-    )
+    (job.open_command(), job.cwd.clone())
 }
 
 /// Send keystrokes where they belong.
@@ -820,12 +813,13 @@ mod tests {
     fn opening_a_session_resumes_it_in_its_own_repository() {
         let f = Fixture::new("host-resume").job(
             "aaa",
-            r#"{"state":"working","name":"WO","sessionId":"abc-123","cwd":"/tmp/some-repo"}"#,
+            r#"{"state":"working","name":"WO","backend":"daemon","daemonShort":"abc12345",
+                "sessionId":"abc-123","cwd":"/tmp/some-repo"}"#,
         );
         let app = App::new(f.0.clone());
         let (command, cwd) = resume(app.selected_job().unwrap());
 
-        assert_eq!(command, ["claude", "--resume", "abc-123"]);
+        assert_eq!(command, ["claude", "attach", "abc12345"]);
         // Resuming in the wrong directory gives a session that cannot see its
         // own repository.
         assert_eq!(cwd, PathBuf::from("/tmp/some-repo"));

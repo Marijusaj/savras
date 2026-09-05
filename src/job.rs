@@ -54,12 +54,33 @@ pub struct Job {
     pub tokens: u64,
     pub updated_at: Option<DateTime<Utc>>,
     pub links: Vec<Link>,
+    /// Claude Code runs most sessions in its daemon. Those are *attached*, not
+    /// resumed — resuming one that is running is refused.
+    pub backend: Option<String>,
+    /// The short id the daemon knows the session by, which is what `claude
+    /// attach` takes.
+    pub daemon_short: Option<String>,
 }
 
 impl Job {
-    /// The command that reattaches to this session, shown for the selection.
-    pub fn resume_command(&self) -> String {
-        format!("claude --resume {}", self.session_id)
+    /// How to open this session in a terminal.
+    ///
+    /// A session running in Claude Code's daemon must be attached: asking to
+    /// resume it is refused with "is running as a background session ... run
+    /// `claude attach` to open it". Attaching is also the gentler of the two —
+    /// the session keeps running whether you attach to it or not.
+    pub fn open_command(&self) -> Vec<String> {
+        match (&self.backend, &self.daemon_short) {
+            (Some(backend), Some(short)) if backend == "daemon" => {
+                vec!["claude".into(), "attach".into(), short.clone()]
+            }
+            _ => vec!["claude".into(), "--resume".into(), self.session_id.clone()],
+        }
+    }
+
+    /// The same command, as one line for the panel to show.
+    pub fn open_command_line(&self) -> String {
+        self.open_command().join(" ")
     }
 
     /// `cwd` with the home directory folded back to `~`.
@@ -124,6 +145,8 @@ struct RawState {
     session_id: Option<String>,
     tokens: Option<u64>,
     updated_at: Option<String>,
+    backend: Option<String>,
+    daemon_short: Option<String>,
 }
 
 /// Default location of Claude Code's job directory.
@@ -231,6 +254,8 @@ fn read_one(dir: &Path, short: &str) -> Option<Job> {
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|d| d.with_timezone(&Utc)),
         links,
+        backend: raw.backend,
+        daemon_short: raw.daemon_short,
     })
 }
 
@@ -362,6 +387,40 @@ mod tests {
             r#"{"state":"working","name":"X","detail":"d","brandNewField":{"a":1}}"#,
         );
         assert_eq!(load(&f.0).unwrap().jobs[0].name, "X");
+    }
+
+    #[test]
+    fn a_daemon_session_is_attached_not_resumed() {
+        // Claude Code refuses to resume a session its daemon is running, and
+        // says so: "run `claude attach <id>` to open it".
+        let f = Fixture::new("attach").job(
+            "aaa",
+            r#"{"state":"working","name":"PLAN","backend":"daemon",
+                "daemonShort":"7baedc84","sessionId":"7baedc84-3c4c-4276-8bd6-5a781df04f48"}"#,
+        );
+        let job = &load(&f.0).unwrap().jobs[0];
+        assert_eq!(job.open_command(), ["claude", "attach", "7baedc84"]);
+        assert_eq!(job.open_command_line(), "claude attach 7baedc84");
+    }
+
+    #[test]
+    fn a_session_without_a_daemon_is_resumed() {
+        let f = Fixture::new("resume").job(
+            "aaa",
+            r#"{"state":"done","name":"OLD","sessionId":"abc-123"}"#,
+        );
+        let job = &load(&f.0).unwrap().jobs[0];
+        assert_eq!(job.open_command(), ["claude", "--resume", "abc-123"]);
+    }
+
+    #[test]
+    fn a_daemon_session_missing_its_short_id_falls_back_to_resume() {
+        let f = Fixture::new("attach-noshort").job(
+            "aaa",
+            r#"{"state":"working","name":"X","backend":"daemon","sessionId":"abc"}"#,
+        );
+        let job = &load(&f.0).unwrap().jobs[0];
+        assert_eq!(job.open_command(), ["claude", "--resume", "abc"]);
     }
 
     #[test]

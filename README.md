@@ -46,9 +46,14 @@ Not packaged yet — that is milestone M3. For now:
 
 ```sh
 git clone https://github.com/Marijusaj/savras && cd savras
-cargo build --release
-cp target/release/svr ~/.local/bin/    # or anywhere on PATH
+./scripts/install.sh            # builds, then installs to ~/.local/bin
+./scripts/install.sh /usr/local/bin
 ```
+
+Use the script rather than copying the binary yourself: replacing it in place
+while a copy is running rewrites the same inode, and macOS then kills the
+running one outright. The script renames a new file over the old, which is
+atomic.
 
 ## The side panel
 
@@ -74,8 +79,11 @@ the pseudo-terminal (ConPTY on Windows) and [`vt100`][vt100] interprets the
 output; Savras is the layout and the glue.
 
 `ctrl-g` moves the keyboard to the panel and back; with the panel focused,
-`enter` opens the selected session in the working pane — `claude --resume`, in
-that session's own repository — and `esc` hands the keyboard back.
+`enter` opens the selected session in the working pane and `esc` hands the
+keyboard back. Claude Code runs most sessions in its daemon, and those are
+*attached* (`claude attach`), not resumed — asking to resume a running session
+is refused. Savras reads which kind a session is and uses the right command;
+attaching leaves the session running either way.
 
 If an opened session exits — resuming one that is already open elsewhere will do
 that — its last screen stays on display so you can read why, with `enter` to try
@@ -140,7 +148,7 @@ Then **M3 · Repos** and **M4 · Vitals**. See [docs/ROADMAP.md](docs/ROADMAP.md
 ## Development
 
 ```sh
-cargo test        # 58 tests: parsing, grouping, navigation,
+cargo test        # 61 tests: parsing, grouping, navigation,
                   # argument handling, tmux layout, and render buffers
 cargo build --release
 ```
