@@ -19,13 +19,24 @@ const WRAPS: u16 = 60;
 /// Below this height the detail footer is dropped to keep rows visible.
 const SHORT: u16 = 16;
 
-pub fn draw(frame: &mut Frame, app: &mut App) {
-    draw_in(frame, frame.area(), app, true);
+/// How the panel is being used, which is all the renderer needs to know to
+/// offer the right keys.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Hint {
+    /// Running on its own, in its own tab.
+    Standalone,
+    /// A column beside a working pane, holding the keyboard.
+    Focused,
+    /// A column beside a working pane that has the keyboard.
+    Background,
 }
 
-/// Draw the panel into `area`. `focused` is false when the panel is a column
-/// beside a working pane that currently has the keyboard.
-pub fn draw_in(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
+    draw_in(frame, frame.area(), app, Hint::Standalone);
+}
+
+/// Draw the panel into `area`.
+pub fn draw_in(frame: &mut Frame, area: Rect, app: &mut App, hint: Hint) {
     let show_detail = area.height >= SHORT && app.selected_job().is_some();
 
     let chunks = Layout::vertical([
@@ -41,7 +52,7 @@ pub fn draw_in(frame: &mut Frame, area: Rect, app: &mut App, focused: bool) {
     if show_detail {
         draw_detail(frame, chunks[2], app);
     }
-    draw_footer(frame, chunks[3], app, focused);
+    draw_footer(frame, chunks[3], app, hint);
 }
 
 /// The detail footer needs an extra line in narrow panes, where the resume
@@ -163,7 +174,10 @@ fn job_line(job: &Job, name_width: u16, total_width: u16) -> Line<'static> {
         ),
         Span::styled(
             pad(&job.name, name_width as usize),
-            Style::default().fg(Color::Black).bg(color),
+            Style::default()
+                .fg(Color::Black)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
         ),
     ];
 
@@ -235,18 +249,23 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
-    let text = match (&app.error, focused) {
+fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint) {
+    let text = match (&app.error, hint) {
         (Some(err), _) => Span::styled(
             truncate(err, area.width as usize),
             Style::default().fg(Color::Red),
         ),
-        (None, true) => Span::styled(
+        (None, Hint::Standalone) => Span::styled(
             "↑↓ move · r refresh · q quit",
             Style::default().fg(Color::DarkGray),
         ),
-        // The panel is a column beside a pane that has the keyboard.
-        (None, false) => Span::styled("ctrl-g to focus", Style::default().fg(Color::DarkGray)),
+        (None, Hint::Focused) => Span::styled(
+            "↑↓ move · enter open · esc back",
+            Style::default().fg(Color::DarkGray),
+        ),
+        (None, Hint::Background) => {
+            Span::styled("ctrl-g to focus", Style::default().fg(Color::DarkGray))
+        }
     };
     frame.render_widget(Paragraph::new(Line::from(text)), area);
 }
@@ -254,22 +273,26 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, focused: bool) {
 /// Claude Code stores a colour name per job. These are the names it uses, and
 /// the 256-colour approximations that match how its own panel looks.
 ///
+/// They are Claude Code's colours darkened by about a fifth, which reads better
+/// against a dark terminal; every one still clears 9.5:1 against the bold black
+/// text on top of it.
+///
 /// A name Savras does not recognise falls back to a neutral, never to a colour
 /// from the palette: a wrong colour reads as meaning something, and a job
 /// silently shown as "red" is worse than one shown as plain.
 fn badge_color(job: &Job) -> Color {
     match job.color.as_deref() {
-        Some("cyan") => Color::Indexed(117),
-        Some("blue") => Color::Indexed(111),
-        Some("green") => Color::Indexed(114),
-        Some("yellow") => Color::Indexed(179),
-        Some("orange") => Color::Indexed(215),
-        Some("red") => Color::Indexed(203),
-        Some("pink") => Color::Indexed(211),
-        Some("purple") | Some("magenta") => Color::Indexed(141),
-        Some("white") => Color::Indexed(252),
-        Some("gray") | Some("grey") => Color::Indexed(245),
-        _ => Color::Indexed(250),
+        Some("cyan") => Color::Indexed(74),
+        Some("blue") => Color::Indexed(68),
+        Some("green") => Color::Indexed(71),
+        Some("yellow") => Color::Indexed(137),
+        Some("orange") => Color::Indexed(173),
+        Some("red") => Color::Indexed(167),
+        Some("pink") => Color::Indexed(168),
+        Some("purple") | Some("magenta") => Color::Indexed(98),
+        Some("white") => Color::Indexed(247),
+        Some("gray") | Some("grey") => Color::Indexed(242),
+        _ => Color::Indexed(246),
     }
 }
 

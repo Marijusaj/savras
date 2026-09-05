@@ -72,7 +72,9 @@ Savras does not implement a terminal emulator. [`portable-pty`][pty] provides
 the pseudo-terminal (ConPTY on Windows) and [`vt100`][vt100] interprets the
 output; Savras is the layout and the glue.
 
-`ctrl-g` moves the keyboard to the panel and back. Everything else goes
+`ctrl-g` moves the keyboard to the panel and back; with the panel focused,
+`enter` opens the selected session in the working pane — `claude --resume`, in
+that session's own repository — and `esc` hands the keyboard back. Everything else goes
 straight to your work, including the mouse: Savras follows the child in and out
 of mouse reporting and mirrors it to the real terminal, so scrolling reaches
 Claude Code instead of dragging the terminal's own scrollback across both panes.
@@ -123,18 +125,16 @@ footer goes, to keep sessions visible.
 
 ## Roadmap
 
-- **M0 — the panel.** ✔
-- **M0.5 — the side panel.** ✔ `svr panel`, hosted directly or via tmux.
-- **M1** — ping on attention (OSC 9 desktop notification), `enter` to resume via
-  tmux, `d` to kill a session.
-- **M2** — a background poller for GitHub/GitLab: PR state, checks, reviews.
-- **M3** — packaging: Homebrew tap, Scoop, winget, deb/rpm, install script.
-- **M4** — GitLab, deploy status, per-repo grouping.
+Shipped: the panel (M0), the column (M0.5), hosting the working pane (M1), and
+opening a session from the panel (M1.5).
+
+Next up is **M2 · Ping** — a sound and a notification when a session needs you.
+Then **M3 · Repos** and **M4 · Vitals**. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Development
 
 ```sh
-cargo test        # 52 tests: parsing, grouping, navigation,
+cargo test        # 56 tests: parsing, grouping, navigation,
                   # argument handling, tmux layout, and render buffers
 cargo build --release
 ```

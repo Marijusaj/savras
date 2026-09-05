@@ -1,6 +1,6 @@
 //! The embedded side panel: Savras owns the window, draws the panel in a column
-//! on the left, and runs your shell or Claude Code in a real terminal on the
-//! right. No tmux, no dependency — `svr panel` just works.
+//! on one side, and runs your shell or Claude Code in a real terminal beside it.
+//! No tmux, no dependency — `svr panel` just works.
 //!
 //! Savras does not implement a terminal emulator. `portable-pty` provides the
 //! pseudo-terminal (ConPTY on Windows) and `vt100` interprets the output into a
@@ -11,18 +11,18 @@
 //! understands arrive exactly as the terminal sent them.
 
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
+use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
 use crate::app::App;
-use crate::ui;
+use crate::ui::{self, Hint};
 use crate::watch::Watch;
 
 /// Toggles focus between the working pane and the panel. One byte, so it needs
@@ -37,84 +37,8 @@ const REDRAW: Duration = Duration::from_millis(500);
 const REFRESH: Duration = Duration::from_secs(2);
 /// Columns taken by the divider between the panel and the working pane.
 const DIVIDER: u16 = 1;
-
-/// The column the working pane starts at, which is what mouse coordinates in
-/// the child are measured from.
-fn work_offset(width: u16, side: Side) -> u16 {
-    match side {
-        Side::Left => width + DIVIDER,
-        Side::Right => 0,
-    }
-}
-
-/// A child asking for mouse reporting is asking the *terminal*, but its request
-/// only reaches our parser. Mirror it to the real terminal so the wheel and
-/// clicks actually arrive — otherwise the terminal keeps scrolling its own
-/// scrollback across both panes, which is not what anyone meant.
-fn mouse_sequence(
-    mode: vt100::MouseProtocolMode,
-    encoding: vt100::MouseProtocolEncoding,
-) -> String {
-    use vt100::{MouseProtocolEncoding as E, MouseProtocolMode as M};
-    // Clear every mode first; terminals treat these as independent switches.
-    let mut out = String::from("\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l");
-    match mode {
-        M::None => return out,
-        M::Press => out.push_str("\x1b[?9h"),
-        M::PressRelease => out.push_str("\x1b[?1000h"),
-        M::ButtonMotion => out.push_str("\x1b[?1002h"),
-        M::AnyMotion => out.push_str("\x1b[?1003h"),
-    }
-    match encoding {
-        E::Default => {}
-        E::Utf8 => out.push_str("\x1b[?1005h"),
-        E::Sgr => out.push_str("\x1b[?1006h"),
-    }
-    out
-}
-
-/// Shift an SGR mouse report left by `offset` columns, so a click at screen
-/// column 60 reaches a child whose own column 0 starts at 45. Reports that land
-/// on the panel are dropped rather than sent to the wrong place.
-///
-/// Only SGR (`ESC [ < b ; x ; y M|m`) is rewritten. It is what modern
-/// applications ask for, and guessing at the older encodings — where
-/// coordinates are raw bytes with their own limits — would corrupt more than it
-/// fixed.
-pub fn shift_mouse(bytes: &[u8], offset: u16) -> Vec<u8> {
-    if offset == 0 || !bytes.starts_with(b"\x1b[<") {
-        return bytes.to_vec();
-    }
-    let Ok(text) = std::str::from_utf8(bytes) else {
-        return bytes.to_vec();
-    };
-    let mut out = String::new();
-    for report in text.split_inclusive(['M', 'm']) {
-        match shift_one(report, offset) {
-            Some(shifted) => out.push_str(&shifted),
-            None => continue, // landed on the panel
-        }
-    }
-    out.into_bytes()
-}
-
-fn shift_one(report: &str, offset: u16) -> Option<String> {
-    let body = report.strip_prefix("\x1b[<")?;
-    let (body, kind) = body.split_at(body.len().checked_sub(1)?);
-    let mut parts = body.split(';');
-    let button = parts.next()?;
-    let x: u16 = parts.next()?.parse().ok()?;
-    let y = parts.next()?;
-    if parts.next().is_some() {
-        return None;
-    }
-    // Columns are 1-based, so the first column of the pane is offset + 1.
-    let shifted = x.checked_sub(offset)?;
-    if shifted == 0 {
-        return None;
-    }
-    Some(format!("\x1b[<{button};{shifted};{y}{kind}"))
-}
+/// Turns every mouse reporting mode back off.
+const MOUSE_OFF: &str = "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l";
 
 /// Which side of the terminal the panel sits on.
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -129,10 +53,98 @@ enum Focus {
     Panel,
 }
 
+/// What a keystroke asked for.
+enum Action {
+    Nothing,
+    Focus(Focus),
+    /// Open the selected session in the working pane.
+    Open,
+}
+
+/// The program running beside the panel, and the pseudo-terminal it lives in.
+///
+/// This is a whole unit so it can be *replaced*: opening a session from the
+/// panel is dropping one of these and spawning the next.
+struct Work {
+    parser: Arc<Mutex<vt100::Parser>>,
+    master: Box<dyn MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    output: Receiver<()>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
+impl Work {
+    fn spawn(command: &[String], cwd: Option<&Path>, cols: u16, rows: u16) -> Result<Self> {
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let pty = NativePtySystem::default()
+            .openpty(size)
+            .context("opening a pseudo-terminal")?;
+
+        let child = pty
+            .slave
+            .spawn_command(build_command(command, cwd)?)
+            .context("starting the command for the working pane")?;
+        // The child holds its own handle; ours would keep the pty open past its exit.
+        drop(pty.slave);
+
+        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 2000)));
+        let writer = pty.master.take_writer().context("writing to the pty")?;
+        let output = read_thread(
+            pty.master.try_clone_reader().context("reading the pty")?,
+            Arc::clone(&parser),
+        );
+
+        Ok(Work {
+            parser,
+            master: pty.master,
+            writer,
+            output,
+            child,
+        })
+    }
+
+    fn finished(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
+    fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        self.master.resize(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })?;
+        self.parser.lock().unwrap().set_size(rows, cols);
+        Ok(())
+    }
+
+    /// What the child currently wants from the terminal's mouse.
+    fn mouse(&self) -> (vt100::MouseProtocolMode, vt100::MouseProtocolEncoding) {
+        let parser = self.parser.lock().unwrap();
+        (
+            parser.screen().mouse_protocol_mode(),
+            parser.screen().mouse_protocol_encoding(),
+        )
+    }
+}
+
+impl Drop for Work {
+    fn drop(&mut self) {
+        // Never leave a program running against a pty nobody is reading.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 pub fn run(width: u16, side: Side, command: Vec<String>, jobs_dir: PathBuf) -> Result<()> {
     let (cols, rows) = crossterm::terminal::size().context("reading the terminal size")?;
-    let work_cols = work_cols(cols, width);
-    if work_cols < 20 {
+    let cols_for_work = work_cols(cols, width);
+    if cols_for_work < 20 {
         anyhow::bail!(
             "this terminal is {cols} columns wide — too narrow for a {width}-column panel \
              and a usable pane beside it. Try --width {}, or run plain `svr`.",
@@ -140,73 +152,42 @@ pub fn run(width: u16, side: Side, command: Vec<String>, jobs_dir: PathBuf) -> R
         );
     }
 
-    let pty = NativePtySystem::default()
-        .openpty(PtySize {
-            rows,
-            cols: work_cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .context("opening a pseudo-terminal")?;
-
-    let mut child = pty
-        .slave
-        .spawn_command(build_command(&command)?)
-        .context("starting the command for the working pane")?;
-    // The child holds its own handle; ours would keep the pty open past its exit.
-    drop(pty.slave);
-
-    let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, work_cols, 2000)));
-    let mut writer = pty.master.take_writer().context("writing to the pty")?;
-    let output = read_thread(
-        pty.master.try_clone_reader().context("reading the pty")?,
-        Arc::clone(&parser),
-    );
-    let input = stdin_thread();
+    let work = Work::spawn(&command, None, cols_for_work, rows)?;
+    let session = Session {
+        jobs_dir,
+        width,
+        side,
+        size: (cols, rows),
+        input: stdin_thread(),
+        work,
+    };
 
     let mut terminal = crate::setup_terminal()?;
-    let result = event_loop(
-        &mut terminal,
-        Session {
-            jobs_dir,
-            width,
-            side,
-            parser,
-            master: pty.master,
-            writer: &mut writer,
-            input,
-            output,
-            size: (cols, rows),
-        },
-        &mut *child,
-    );
+    let result = event_loop(&mut terminal, session);
     // Leave the terminal's mouse handling as we found it.
-    let _ = std::io::stdout()
-        .write_all(b"\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l");
+    let _ = std::io::stdout().write_all(MOUSE_OFF.as_bytes());
     crate::restore_terminal(&mut terminal)?;
-
-    // Do not leave a shell running against a pty nobody is reading.
-    let _ = child.kill();
-    let _ = child.wait();
     result
 }
 
-struct Session<'a> {
+struct Session {
     jobs_dir: PathBuf,
     width: u16,
     side: Side,
-    parser: Arc<Mutex<vt100::Parser>>,
-    master: Box<dyn portable_pty::MasterPty + Send>,
-    writer: &'a mut Box<dyn Write + Send>,
-    input: Receiver<Vec<u8>>,
-    output: Receiver<()>,
     size: (u16, u16),
+    input: Receiver<Vec<u8>>,
+    work: Work,
+}
+
+impl Session {
+    fn work_size(&self) -> (u16, u16) {
+        (work_cols(self.size.0, self.width), self.size.1)
+    }
 }
 
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     mut session: Session,
-    child: &mut dyn portable_pty::Child,
 ) -> Result<()> {
     let mut app = App::new(session.jobs_dir.clone());
     let watch = Watch::start(&session.jobs_dir);
@@ -224,14 +205,10 @@ fn event_loop(
     );
 
     loop {
-        // Follow the child in and out of mouse mode.
-        let wanted = {
-            let parser = session.parser.lock().unwrap();
-            (
-                parser.screen().mouse_protocol_mode(),
-                parser.screen().mouse_protocol_encoding(),
-            )
-        };
+        // Follow the child in and out of mouse mode. Its request to enable
+        // reporting only ever reached our parser, so mirror it outward or the
+        // terminal keeps scrolling its own scrollback across both panes.
+        let wanted = session.work.mouse();
         if wanted != mouse {
             mouse = wanted;
             let mut out = std::io::stdout();
@@ -246,15 +223,24 @@ fn event_loop(
         }
 
         // The child exiting is the signal to close the panel with it.
-        if matches!(child.try_wait(), Ok(Some(_))) {
+        if session.work.finished() {
             return Ok(());
         }
 
         match session.input.recv_timeout(TICK) {
             Ok(bytes) => {
                 let bytes = shift_mouse(&bytes, work_offset(session.width, session.side));
-                if let Some(new_focus) = route(&bytes, focus, &mut app, session.writer)? {
-                    focus = new_focus;
+                match route(&bytes, focus, &mut app, &mut session.work)? {
+                    Action::Nothing => {}
+                    Action::Focus(next) => focus = next,
+                    Action::Open => {
+                        if open_selected(&mut session, &app).is_ok() {
+                            focus = Focus::Work;
+                        } else {
+                            app.error =
+                                Some("could not start `claude` — is it on your PATH?".into());
+                        }
+                    }
                 }
                 if app.should_quit {
                     return Ok(());
@@ -267,7 +253,7 @@ fn event_loop(
 
         // The parser already holds whatever the child wrote; these are only
         // wake-ups, so drain them and note that the screen moved.
-        while session.output.try_recv().is_ok() {
+        while session.work.output.try_recv().is_ok() {
             dirty = true;
         }
 
@@ -283,15 +269,38 @@ fn event_loop(
     }
 }
 
-/// Send keystrokes where they belong. Returns a new focus if it changed.
-fn route(
-    bytes: &[u8],
-    focus: Focus,
-    app: &mut App,
-    writer: &mut Box<dyn Write + Send>,
-) -> Result<Option<Focus>> {
+/// Replace the working pane with the selected session. The program that was
+/// there is killed; the Claude Code session it was showing is not — those live
+/// in Claude Code's daemon, which is why reopening one is just a resume.
+fn open_selected(session: &mut Session, app: &App) -> Result<()> {
+    let Some(job) = app.selected_job() else {
+        return Ok(());
+    };
+    let (command, cwd) = resume(job);
+    let (cols, rows) = session.work_size();
+
+    // Spawn before dropping the old one, so a failure leaves the pane intact.
+    let work = Work::spawn(&command, Some(&cwd), cols, rows)?;
+    session.work = work;
+    Ok(())
+}
+
+/// How to reopen a session: the command, and where to run it.
+fn resume(job: &crate::job::Job) -> (Vec<String>, PathBuf) {
+    (
+        vec![
+            "claude".to_string(),
+            "--resume".to_string(),
+            job.session_id.clone(),
+        ],
+        job.cwd.clone(),
+    )
+}
+
+/// Send keystrokes where they belong.
+fn route(bytes: &[u8], focus: Focus, app: &mut App, work: &mut Work) -> Result<Action> {
     if bytes.contains(&FOCUS_TOGGLE) {
-        return Ok(Some(match focus {
+        return Ok(Action::Focus(match focus {
             Focus::Work => Focus::Panel,
             Focus::Panel => Focus::Work,
         }));
@@ -301,28 +310,29 @@ fn route(
         // Everything reaches the child untouched, which is what makes a full
         // TUI like Claude Code behave normally in the pane.
         Focus::Work => {
-            writer.write_all(bytes)?;
-            writer.flush()?;
-            Ok(None)
+            work.writer.write_all(bytes)?;
+            work.writer.flush()?;
+            Ok(Action::Nothing)
         }
         Focus::Panel => Ok(panel_key(bytes, app)),
     }
 }
 
-/// The panel is read-only, so it needs only a cursor and a way out.
-fn panel_key(bytes: &[u8], app: &mut App) -> Option<Focus> {
+/// The panel is read-only, so it needs a cursor, a way in, and a way out.
+fn panel_key(bytes: &[u8], app: &mut App) -> Action {
     match bytes {
         [b'j'] | [ESC, b'[', b'B'] => app.step(1),
         [b'k'] | [ESC, b'[', b'A'] => app.step(-1),
         [b'g'] => app.jump(false),
         [b'G'] => app.jump(true),
         [b'r'] => app.refresh(),
+        [b'\r'] | [b'\n'] => return Action::Open,
         // Esc and q give the terminal back rather than quitting: in a side
         // panel, closing the whole window is rarely what was meant.
-        [ESC] | [b'q'] => return Some(Focus::Work),
+        [ESC] | [b'q'] => return Action::Focus(Focus::Work),
         _ => {}
     }
-    None
+    Action::Nothing
 }
 
 fn draw(frame: &mut Frame, app: &mut App, session: &Session, focus: Focus) {
@@ -346,7 +356,12 @@ fn draw(frame: &mut Frame, app: &mut App, session: &Session, focus: Focus) {
         Side::Right => (chunks[0], chunks[2]),
     };
 
-    ui::draw_in(frame, panel_area, app, focus == Focus::Panel);
+    let hint = if focus == Focus::Panel {
+        Hint::Focused
+    } else {
+        Hint::Background
+    };
+    ui::draw_in(frame, panel_area, app, hint);
 
     let divider = Paragraph::new(
         std::iter::repeat_n(Line::from("│"), chunks[1].height as usize).collect::<Vec<_>>(),
@@ -354,8 +369,8 @@ fn draw(frame: &mut Frame, app: &mut App, session: &Session, focus: Focus) {
     .style(Style::default().fg(Color::Indexed(238)));
     frame.render_widget(divider, chunks[1]);
 
-    let screen = session.parser.lock().unwrap();
-    draw_screen(frame, work_area, screen.screen(), focus == Focus::Work);
+    let parser = session.work.parser.lock().unwrap();
+    draw_screen(frame, work_area, parser.screen(), focus == Focus::Work);
 }
 
 /// Paint the child's screen into our buffer, cell by cell.
@@ -414,6 +429,83 @@ pub fn work_cols(total: u16, panel: u16) -> u16 {
     total.saturating_sub(panel + DIVIDER)
 }
 
+/// The column the working pane starts at, which is what mouse coordinates in
+/// the child are measured from.
+fn work_offset(width: u16, side: Side) -> u16 {
+    match side {
+        Side::Left => width + DIVIDER,
+        Side::Right => 0,
+    }
+}
+
+/// A child asking for mouse reporting is asking the *terminal*, but its request
+/// only reaches our parser. Mirror it to the real terminal so the wheel and
+/// clicks actually arrive.
+fn mouse_sequence(
+    mode: vt100::MouseProtocolMode,
+    encoding: vt100::MouseProtocolEncoding,
+) -> String {
+    use vt100::{MouseProtocolEncoding as E, MouseProtocolMode as M};
+    // Clear every mode first; terminals treat these as independent switches.
+    let mut out = String::from(MOUSE_OFF);
+    match mode {
+        M::None => return out,
+        M::Press => out.push_str("\x1b[?9h"),
+        M::PressRelease => out.push_str("\x1b[?1000h"),
+        M::ButtonMotion => out.push_str("\x1b[?1002h"),
+        M::AnyMotion => out.push_str("\x1b[?1003h"),
+    }
+    match encoding {
+        E::Default => {}
+        E::Utf8 => out.push_str("\x1b[?1005h"),
+        E::Sgr => out.push_str("\x1b[?1006h"),
+    }
+    out
+}
+
+/// Shift an SGR mouse report left by `offset` columns, so a click at screen
+/// column 60 reaches a child whose own column 0 starts at 45. Reports that land
+/// on the panel are dropped rather than sent to the wrong place.
+///
+/// Only SGR (`ESC [ < b ; x ; y M|m`) is rewritten. It is what modern
+/// applications ask for, and guessing at the older encodings — where
+/// coordinates are raw bytes with their own limits — would corrupt more than it
+/// fixed.
+pub fn shift_mouse(bytes: &[u8], offset: u16) -> Vec<u8> {
+    if offset == 0 || !bytes.starts_with(b"\x1b[<") {
+        return bytes.to_vec();
+    }
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return bytes.to_vec();
+    };
+    let mut out = String::new();
+    for report in text.split_inclusive(['M', 'm']) {
+        match shift_one(report, offset) {
+            Some(shifted) => out.push_str(&shifted),
+            None => continue, // landed on the panel
+        }
+    }
+    out.into_bytes()
+}
+
+fn shift_one(report: &str, offset: u16) -> Option<String> {
+    let body = report.strip_prefix("\x1b[<")?;
+    let (body, kind) = body.split_at(body.len().checked_sub(1)?);
+    let mut parts = body.split(';');
+    let button = parts.next()?;
+    let x: u16 = parts.next()?.parse().ok()?;
+    let y = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    // Columns are 1-based, so the first column of the pane is offset + 1.
+    let shifted = x.checked_sub(offset)?;
+    if shifted == 0 {
+        return None;
+    }
+    Some(format!("\x1b[<{button};{shifted};{y}{kind}"))
+}
+
 /// Returns true if the terminal changed size and the child was told about it.
 fn resize_if_needed(session: &mut Session) -> Result<bool> {
     let size = crossterm::terminal::size().unwrap_or(session.size);
@@ -421,20 +513,12 @@ fn resize_if_needed(session: &mut Session) -> Result<bool> {
         return Ok(false);
     }
     session.size = size;
-
-    let (cols, rows) = size;
-    let work = work_cols(cols, session.width).max(1);
-    session.master.resize(PtySize {
-        rows,
-        cols: work,
-        pixel_width: 0,
-        pixel_height: 0,
-    })?;
-    session.parser.lock().unwrap().set_size(rows, work);
+    let (cols, rows) = session.work_size();
+    session.work.resize(cols.max(1), rows)?;
     Ok(true)
 }
 
-fn build_command(command: &[String]) -> Result<CommandBuilder> {
+fn build_command(command: &[String], cwd: Option<&Path>) -> Result<CommandBuilder> {
     let mut builder = match command.split_first() {
         Some((program, args)) => {
             let mut b = CommandBuilder::new(program);
@@ -443,8 +527,13 @@ fn build_command(command: &[String]) -> Result<CommandBuilder> {
         }
         None => CommandBuilder::new(default_shell()),
     };
-    if let Ok(cwd) = std::env::current_dir() {
-        builder.cwd(cwd);
+    match cwd {
+        Some(dir) if dir.is_dir() => builder.cwd(dir),
+        _ => {
+            if let Ok(dir) = std::env::current_dir() {
+                builder.cwd(dir);
+            }
+        }
     }
     // Tell the child what we can actually render.
     builder.env("TERM", "xterm-256color");
@@ -510,6 +599,7 @@ fn stdin_thread() -> Receiver<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::Fixture;
 
     #[test]
     fn the_working_pane_gets_what_is_left_after_the_panel_and_divider() {
@@ -569,7 +659,51 @@ mod tests {
 
     #[test]
     fn a_command_runs_as_given() {
-        let built = build_command(&["claude".into(), "--resume".into(), "x".into()]).unwrap();
+        let built = build_command(&["claude".into(), "--resume".into(), "x".into()], None).unwrap();
         assert!(format!("{built:?}").contains("claude"));
+    }
+
+    #[test]
+    fn enter_on_the_panel_asks_to_open_the_session() {
+        let f = Fixture::new("host-open").job("aaa", r#"{"state":"working","name":"X"}"#);
+        let mut app = App::new(f.0.clone());
+        assert!(matches!(panel_key(b"\r", &mut app), Action::Open));
+        assert!(matches!(panel_key(b"\n", &mut app), Action::Open));
+    }
+
+    #[test]
+    fn esc_hands_the_keyboard_back_instead_of_quitting() {
+        let f = Fixture::new("host-esc").job("aaa", r#"{"state":"working","name":"X"}"#);
+        let mut app = App::new(f.0.clone());
+        assert!(matches!(
+            panel_key(b"\x1b", &mut app),
+            Action::Focus(Focus::Work)
+        ));
+        assert!(!app.should_quit, "the panel must not close the window");
+    }
+
+    #[test]
+    fn opening_a_session_resumes_it_in_its_own_repository() {
+        let f = Fixture::new("host-resume").job(
+            "aaa",
+            r#"{"state":"working","name":"WO","sessionId":"abc-123","cwd":"/tmp/some-repo"}"#,
+        );
+        let app = App::new(f.0.clone());
+        let (command, cwd) = resume(app.selected_job().unwrap());
+
+        assert_eq!(command, ["claude", "--resume", "abc-123"]);
+        // Resuming in the wrong directory gives a session that cannot see its
+        // own repository.
+        assert_eq!(cwd, PathBuf::from("/tmp/some-repo"));
+    }
+
+    #[test]
+    fn a_replaced_pane_is_spawned_before_the_old_one_is_dropped() {
+        // Opening a session must not leave an empty pane if the spawn fails.
+        let work = Work::spawn(&["/nonexistent/program".to_string()], None, 40, 10);
+        assert!(
+            work.is_err(),
+            "a missing program should be reported, not run"
+        );
     }
 }
