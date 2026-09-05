@@ -97,6 +97,31 @@ pane's own frame.
 [pty]: https://crates.io/crates/portable-pty
 [vt100]: https://crates.io/crates/vt100
 
+### Ping
+
+When a session arrives in **Needs input**, Savras says so: a desktop
+notification, written to the terminal as an OSC 9 escape sequence, and a sound.
+No dependency, no permissions dialog, and it works over SSH — the notification
+comes from your terminal, not from the binary.
+
+It fires on the *transition*, not on a poll tick. Savras opening beside four
+sessions that already need you is silent; a question already on screen is never
+re-announced. A burst of sessions asking at once is one ping that counts them,
+and twenty quiet seconds follow. The session showing in the working pane never
+pings — it is asking you in person, on the other half of the screen.
+
+```sh
+svr --ping done       ping when a session finishes, too
+svr --ping off        no notification, no sound
+svr --no-sound        notify silently
+```
+
+The sound is `afplay` on macOS, `canberra-gtk-play` or `paplay` on Linux,
+`[console]::beep` on Windows, with the terminal bell underneath all of them.
+iTerm2, WezTerm, Ghostty, kitty and Windows Terminal understand OSC 9.
+Terminal.app understands no notification sequence at all, so there the sound and
+the bell are the whole story.
+
 ### tmux, if you want it
 
 ```sh
@@ -139,23 +164,26 @@ footer goes, to keep sessions visible.
 
 ## Roadmap
 
-Shipped: the panel (M0), the column (M0.5), hosting the working pane (M1), and
-opening a session from the panel (M1.5).
+Shipped: the panel (M0), the column (M0.5), hosting the working pane (M1),
+opening a session from the panel (M1.5), and the ping (M2).
 
-Next up is **M2 · Ping** — a sound and a notification when a session needs you.
-Then **M3 · Repos** and **M4 · Vitals**. See [docs/ROADMAP.md](docs/ROADMAP.md).
+Next up is **M3 · Repos** — group and sort the panel by repository. Then
+**M4 · Vitals**. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Development
 
 ```sh
-cargo test        # 61 tests: parsing, grouping, navigation,
-                  # argument handling, tmux layout, and render buffers
+cargo test        # 76 tests: parsing, grouping, navigation, ping
+                  # transitions, argument handling, tmux layout,
+                  # and render buffers
 cargo build --release
 ```
 
 The render tests draw into a real terminal buffer and assert on the resulting
 characters, so column alignment and the responsive breakpoints are covered
-rather than eyeballed.
+rather than eyeballed. The ping has an end-to-end test as well: it runs the
+built binary in a pseudo-terminal, changes a job on disk, and reads the
+notification back off the terminal stream.
 
 ## License
 

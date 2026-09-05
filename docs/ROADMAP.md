@@ -34,34 +34,27 @@ attach <short-id>`, not `claude --resume`. Claude Code refuses to resume a
 session it is already running, and says so; Savras now reads `backend` and
 `daemonShort` from the job and picks the command that works.
 
+### M2 · Ping
+A session arriving in Needs input pings: an **OSC 9** desktop notification
+written straight to the terminal, and a sound (`afplay`, `canberra-gtk-play`,
+`[console]::beep`, with the terminal bell underneath). It fires on the
+*transition*, so the first look is silent and a question already on screen is
+never re-announced; a burst of sessions is one ping that counts them, and a
+20-second quiet period follows. The session showing in the working pane never
+pings. `--ping done` includes finished sessions, `--ping off` and `--no-sound`
+turn the halves off separately.
+
+Two decisions worth keeping: **OSC 9 only, not OSC 9 and OSC 777** — WezTerm and
+Ghostty understand both, so sending both notifies twice, and a missing
+notification beats a doubled one. And Terminal.app, which understands neither,
+gets the sound and the bell; that is enough, and does not justify a signed
+helper app.
+
 ---
 
 ## Next
 
-### M2 · Ping  ← next build
-**A sound, and a notification, when a session needs you.**
-
-The trigger already exists and is exact: a job's `needs` field going from null
-to non-null, or `state` reaching `done`. Savras sees both transitions today; it
-just says nothing about them.
-
-- Fire on the *transition*, never on a poll tick, or the panel becomes a car
-  alarm.
-- Desktop notification via the **OSC 9 / OSC 777** escape sequences, which
-  iTerm2, WezTerm, Kitty, Ghostty and Windows Terminal understand. No
-  dependency, works over SSH, and sidesteps macOS refusing notifications to
-  unsigned CLI binaries.
-- Sound: `afplay` on macOS, `paplay`/`canberra-gtk-play` on Linux,
-  `[console]::beep` on Windows. Terminal bell (`\a`) as the floor.
-- Configurable: sound on/off, notify on `needs` only or on `done` too, and a
-  quiet period so a burst of finishing agents does not become a drum roll.
-- Never ping for the session you are looking at.
-
-Open question: Terminal.app supports neither OSC 9 nor OSC 777, so on the
-current setup this is sound plus bell only. Worth deciding whether that is
-enough or whether it justifies a small signed helper app.
-
-### M3 · Repos
+### M3 · Repos  ← next build
 **Group and sort the panel by repository.**
 
 Every job already carries its `cwd`, and the set of distinct `cwd`s across all
@@ -102,6 +95,8 @@ add.
 ## Later
 
 - **Kill** — end a session from the panel, with a confirmation.
+- **Notification protocols** — OSC 99 for kitty, and a signed helper if
+  Terminal.app ever needs a real banner rather than a bell.
 - **Poller** — a background process for GitHub and GitLab: PR state, checks,
   reviews, deploys. Needed properly for M4's deploy column.
 - **Packaging** — Homebrew tap, Scoop, winget, deb/rpm, install script, via

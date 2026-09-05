@@ -22,6 +22,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
 use crate::app::App;
+use crate::ping::Ping;
 use crate::ui::{self, Hint};
 use crate::watch::Watch;
 
@@ -171,7 +172,13 @@ impl Drop for Work {
     }
 }
 
-pub fn run(width: u16, side: Side, command: Vec<String>, jobs_dir: PathBuf) -> Result<()> {
+pub fn run(
+    width: u16,
+    side: Side,
+    command: Vec<String>,
+    jobs_dir: PathBuf,
+    ping: Ping,
+) -> Result<()> {
     let (cols, rows) = crossterm::terminal::size().context("reading the terminal size")?;
     let cols_for_work = work_cols(cols, width);
     if cols_for_work < 20 {
@@ -191,6 +198,8 @@ pub fn run(width: u16, side: Side, command: Vec<String>, jobs_dir: PathBuf) -> R
         input: stdin_thread(),
         work,
         reopen: None,
+        open: None,
+        ping,
     };
 
     let mut terminal = crate::setup_terminal()?;
@@ -210,6 +219,10 @@ struct Session {
     work: Work,
     /// The last session opened from the panel, so a dead pane can be retried.
     reopen: Option<(Vec<String>, PathBuf)>,
+    /// Which session the working pane is showing, so it is never pinged for:
+    /// it is asking you in person, on the other half of the screen.
+    open: Option<String>,
+    ping: Ping,
 }
 
 impl Session {
@@ -225,6 +238,8 @@ fn event_loop(
     let mut app = App::new(session.jobs_dir.clone());
     let watch = Watch::start(&session.jobs_dir);
     app.watching = watch.live;
+    // What is already on screen when Savras opens is not news.
+    session.ping.poll(&app.snapshot, None);
 
     let mut focus = Focus::Work;
     let mut last_refresh = Instant::now();
@@ -316,6 +331,8 @@ fn event_loop(
 
         if watch.changed() || last_refresh.elapsed() >= REFRESH {
             app.refresh();
+            let open = session.open.clone();
+            session.ping.poll(&app.snapshot, open.as_deref());
             last_refresh = Instant::now();
             dirty = true;
         }
@@ -333,6 +350,7 @@ fn open_selected(session: &mut Session, app: &App) -> Result<bool> {
     let Some(job) = app.selected_job() else {
         return Ok(false);
     };
+    session.open = Some(job.short.clone());
     session.reopen = Some(resume(job));
     reopen(session)
 }

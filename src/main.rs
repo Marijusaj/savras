@@ -7,6 +7,7 @@ mod app;
 mod host;
 mod job;
 mod panel;
+mod ping;
 #[cfg(test)]
 mod testing;
 mod ui;
@@ -27,6 +28,7 @@ use ratatui::prelude::*;
 
 use app::App;
 use host::Side;
+use ping::{Ping, When};
 use watch::Watch;
 
 const USAGE: &str = "\
@@ -47,6 +49,8 @@ options:
   --width <cols>      width of the panel column (default 44)
   --tmux              build the layout with tmux instead of hosting it directly
   --dry-run           print the tmux layout instead of building it
+  --ping <when>       ping on needs (default), done, or off
+  --no-sound          notify without a sound
   --once              print the current sessions as plain text and exit
   --jobs-dir <path>   read jobs from somewhere other than ~/.claude/jobs
   -h, --help          show this help
@@ -64,6 +68,10 @@ keys:
   ↑/↓, k/j   move        enter  open the selected session
   g/G        first/last  esc    back to your work
   r          refresh     q      quit
+
+A session arriving in Needs input pings: a desktop notification through the
+terminal, and a sound. `--ping done` pings for finished sessions too; the
+session showing in the working pane never pings.
 ";
 
 /// How often to redraw. Ages tick in seconds, so this needs to be sub-second,
@@ -93,6 +101,8 @@ enum Mode {
 struct Options {
     mode: Mode,
     jobs_dir: Option<PathBuf>,
+    ping: When,
+    sound: bool,
 }
 
 fn main() -> Result<()> {
@@ -116,14 +126,20 @@ fn main() -> Result<()> {
         if tmux || dry_run {
             return panel::run(width, side, command, dry_run);
         }
-        return host::run(width, side, command, jobs_dir(options.jobs_dir)?);
+        return host::run(
+            width,
+            side,
+            command,
+            jobs_dir(options.jobs_dir)?,
+            Ping::new(options.ping, options.sound),
+        );
     }
 
     let jobs_dir = jobs_dir(options.jobs_dir)?;
 
     match options.mode {
         Mode::Once => print_once(&jobs_dir),
-        _ => run_tui(jobs_dir),
+        _ => run_tui(jobs_dir, Ping::new(options.ping, options.sound)),
     }
 }
 
@@ -142,6 +158,8 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
     let mut options = Options {
         mode: Mode::Tui,
         jobs_dir: None,
+        ping: When::default(),
+        sound: true,
     };
     let mut width = panel::DEFAULT_WIDTH;
     let mut command = Vec::new();
@@ -184,6 +202,12 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
             "--once" => {
                 options.mode = Mode::Once;
                 is_panel = false;
+            }
+            "--no-sound" => options.sound = false,
+            "--ping" => {
+                let raw = args.next().context("--ping needs needs, done or off")?;
+                options.ping = When::parse(&raw)
+                    .with_context(|| format!("--ping must be needs, done or off, not {raw}"))?;
             }
             "--dry-run" => dry_run = true,
             "--tmux" => tmux = true,
@@ -261,15 +285,21 @@ fn print_once(jobs_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn run_tui(jobs_dir: PathBuf) -> Result<()> {
+fn run_tui(jobs_dir: PathBuf, ping: Ping) -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let result = event_loop(&mut terminal, jobs_dir);
+    let result = event_loop(&mut terminal, jobs_dir, ping);
     restore_terminal(&mut terminal)?;
     result
 }
 
-fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, jobs_dir: PathBuf) -> Result<()> {
+fn event_loop(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    jobs_dir: PathBuf,
+    mut ping: Ping,
+) -> Result<()> {
     let mut app = App::new(jobs_dir.clone());
+    // The panel App::new already loaded is the state of the world, not news.
+    ping.poll(&app.snapshot, None);
 
     let watch = Watch::start(&jobs_dir);
     app.watching = watch.live;
@@ -295,6 +325,9 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, jobs_dir: PathB
         let settled = dirty_since.is_some_and(|t| t.elapsed() >= DEBOUNCE);
         if settled || last_load.elapsed() >= MAX_STALE {
             app.refresh();
+            // Nothing is open beside the panel in this mode, so every session
+            // is one you are not looking at.
+            ping.poll(&app.snapshot, None);
             dirty_since = None;
             last_load = Instant::now();
         }
@@ -430,6 +463,31 @@ mod tests {
     fn a_width_too_small_to_read_is_rejected() {
         assert!(parse(vec!["panel".into(), "--width".into(), "3".into()]).is_err());
         assert!(parse(vec!["panel".into(), "--width".into(), "wide".into()]).is_err());
+    }
+
+    #[test]
+    fn pinging_is_on_for_questions_and_off_for_everything_else() {
+        // The default has to be useful without being a car alarm: a session
+        // asking you something is blocking; a session finishing is not.
+        let options = parse_ok(&[]);
+        assert_eq!(options.ping, When::Needs);
+        assert!(options.sound);
+
+        assert_eq!(parse_ok(&["--ping", "done"]).ping, When::Done);
+        assert_eq!(parse_ok(&["--ping", "off"]).ping, When::Off);
+        assert!(!parse_ok(&["--no-sound"]).sound);
+        assert!(parse(vec!["--ping".into(), "loud".into()]).is_err());
+        assert!(parse(vec!["--ping".into()]).is_err());
+    }
+
+    #[test]
+    fn ping_options_before_the_separator_are_ours_and_after_it_are_not() {
+        let options = parse_ok(&["--ping", "off", "--", "claude", "--ping", "done"]);
+        assert_eq!(options.ping, When::Off);
+        match options.mode {
+            Mode::Panel { command, .. } => assert_eq!(command, ["claude", "--ping", "done"]),
+            _ => panic!("expected panel mode"),
+        }
     }
 
     #[test]
