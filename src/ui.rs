@@ -10,9 +10,12 @@ use ratatui::{
 use crate::app::{App, Row};
 use crate::job::{age, Job, Status};
 
-/// Below this width the summary column is dropped and the panel shows just
-/// name and age — a sidebar squeezed to a strip should still be readable.
-const NARROW: u16 = 46;
+/// Keep the summary as long as this many columns are left for it. Claude
+/// Code's own panel keeps a truncated summary in a narrow pane, and a sidebar
+/// with only names tells you far less, so the summary is the last thing to go.
+const MIN_SUMMARY: usize = 8;
+/// Below this width the resume command in the footer wraps onto a second line.
+const WRAPS: u16 = 60;
 /// Below this height the detail footer is dropped to keep rows visible.
 const SHORT: u16 = 16;
 
@@ -41,7 +44,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 fn detail_height(area: Rect, show_detail: bool) -> u16 {
     if !show_detail {
         0
-    } else if area.width < NARROW {
+    } else if area.width < WRAPS {
         6
     } else {
         4
@@ -111,7 +114,8 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
         .map(|j| j.name.chars().count())
         .max()
         .unwrap_or(4)
-        .clamp(4, 12) as u16;
+        .clamp(4, 12)
+        .min((area.width / 3) as usize) as u16;
 
     let items: Vec<ListItem> = app
         .rows
@@ -127,7 +131,7 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
-    let list = List::new(items).highlight_style(Style::default().bg(Color::Rgb(48, 48, 56)));
+    let list = List::new(items).highlight_style(Style::default().bg(Color::Indexed(236)));
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
@@ -150,10 +154,10 @@ fn job_line(job: &Job, name_width: u16, total_width: u16) -> Line<'static> {
         ),
     ];
 
-    // Columns already spent: bullet + name + gaps + age.
+    // Columns already spent: bullet + name + gap + age.
     let fixed = 2 + name_width + 2 + 4;
-    if total_width > NARROW && total_width > fixed {
-        let room = (total_width - fixed) as usize;
+    let room = (total_width.saturating_sub(fixed)) as usize;
+    if room >= MIN_SUMMARY {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             truncate(&job.summary, room),
@@ -374,16 +378,37 @@ mod tests {
     }
 
     #[test]
-    fn narrow_panel_drops_the_summary_but_keeps_name_and_age() {
-        let lines = render(&three_jobs(), 34, 26);
-        let text = lines.join("\n");
-
-        assert!(text.contains("ROADMAP"), "name must survive a narrow pane");
-        assert!(
-            !text.contains("compiling the plan"),
-            "summary should be dropped below {NARROW} columns"
+    fn a_sidebar_width_pane_keeps_a_truncated_summary() {
+        // 44 columns is the default side-panel width. A column of bare names
+        // says far less than a clipped sentence, so a long summary is
+        // truncated rather than dropped — the trade Claude Code's panel makes.
+        let fixture = Fixture::new("ui-sidebar").job(
+            "aaa",
+            r#"{"state":"working","name":"ROADMAP",
+                "detail":"58 tier-A items on origin/main at ba75f62 across seven groups"}"#,
         );
-        assert!(text.contains("Needs input"));
+        let lines = render(&fixture, 44, 26);
+        let row = lines.iter().find(|l| l.contains("ROADMAP")).unwrap();
+
+        assert!(
+            row.contains("58 tier-A"),
+            "summary dropped too early: {row:?}"
+        );
+        assert!(
+            row.contains('…'),
+            "long summary should be truncated: {row:?}"
+        );
+        assert_eq!(row.chars().count(), 44, "row must not overflow: {row:?}");
+        assert!(row.ends_with('-'), "age must stay flush right: {row:?}");
+    }
+
+    #[test]
+    fn a_very_narrow_pane_finally_drops_the_summary() {
+        // Below a readable slice, the summary is worse than nothing.
+        let lines = render(&three_jobs(), 18, 26);
+        let text = lines.join("\n");
+        assert!(text.contains("ROADMAP") || text.contains("ROADM"));
+        assert!(!text.contains("compiling"));
     }
 
     #[test]

@@ -50,10 +50,33 @@ cargo build --release
 cp target/release/svr ~/.local/bin/    # or anywhere on PATH
 ```
 
+## The side panel
+
+The point is a narrow column down the left of the terminal you are already
+working in, with your session beside it:
+
+```sh
+svr panel              # panel on the left, a shell on the right
+svr panel -- claude    # panel on the left, Claude Code on the right
+svr panel --width 52
+```
+
+Most terminals — macOS Terminal.app among them — cannot split a window at all,
+so the layout is built with tmux. The tmux is meant to be invisible: no status
+bar, no prefix keys to learn, just a divider. Savras writes its own tmux config
+and only applies it to the server it starts, so an existing tmux setup is left
+alone. Run `svr panel` from inside tmux and it adds the column to the window in
+front of you instead of starting a session.
+
+`svr panel --dry-run` prints the tmux commands instead of running them.
+
+Closing the panel with `q` closes that pane; `svr panel` puts it back.
+
 ## Usage
 
 ```
-svr                    open the panel
+svr                    open the panel on its own
+svr panel              open the panel as a column beside your work
 svr --once             print the current sessions as plain text and exit
 svr --jobs-dir <path>  read jobs from somewhere other than ~/.claude/jobs
 ```
@@ -67,13 +90,15 @@ svr --jobs-dir <path>  read jobs from somewhere other than ~/.claude/jobs
 | `r` | refresh now |
 | `q` / `Esc` | quit |
 
-The panel is responsive: below 46 columns it drops the summary column and shows
-just names and ages, so it stays readable squeezed into a strip. Below 16 rows
-it drops the detail footer to keep sessions visible.
+The panel is responsive. Summaries are truncated to fit rather than dropped, so
+a 44-column sidebar still tells you what each session is doing; only when fewer
+than 8 columns are left for it does the summary go. Below 16 rows the detail
+footer goes, to keep sessions visible.
 
 ## Roadmap
 
-- **M0 — the panel.** ← you are here
+- **M0 — the panel.** ✔
+- **M0.5 — the side panel.** ✔ `svr panel`, via tmux.
 - **M1** — ping on attention (OSC 9 desktop notification), `enter` to resume via
   tmux, `d` to kill a session.
 - **M2** — a background poller for GitHub/GitLab: PR state, checks, reviews.
@@ -83,7 +108,8 @@ it drops the detail footer to keep sessions visible.
 ## Development
 
 ```sh
-cargo test        # 24 tests: parsing, grouping, navigation, and render buffers
+cargo test        # 39 tests: parsing, grouping, navigation,
+                  # argument handling, tmux layout, and render buffers
 cargo build --release
 ```
 

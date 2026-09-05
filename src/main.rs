@@ -5,6 +5,7 @@
 
 mod app;
 mod job;
+mod panel;
 #[cfg(test)]
 mod testing;
 mod ui;
@@ -30,12 +31,24 @@ const USAGE: &str = "\
 savras — see every Claude Code session you have running
 
 usage: svr [options]
+       svr panel [--width <cols>] [-- <command>...]
+
+commands:
+  panel               open the panel as a column on the left of this terminal,
+                      with your work beside it (uses tmux)
 
 options:
+  --width <cols>      width of the panel column (panel only, default 44)
+  --dry-run           print the tmux layout instead of building it (panel only)
   --once              print the current sessions as plain text and exit
   --jobs-dir <path>   read jobs from somewhere other than ~/.claude/jobs
   -h, --help          show this help
   -V, --version       show the version
+
+examples:
+  svr panel                    panel on the left, a shell on the right
+  svr panel -- claude          panel on the left, Claude Code on the right
+  svr panel --width 52
 
 keys:
   ↑/↓, k/j   move        g/G  first/last
@@ -52,8 +65,20 @@ const DEBOUNCE: Duration = Duration::from_millis(120);
 /// panel stale indefinitely.
 const MAX_STALE: Duration = Duration::from_secs(3);
 
+#[derive(Debug)]
+enum Mode {
+    Tui,
+    Once,
+    Panel {
+        width: u16,
+        command: Vec<String>,
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug)]
 struct Options {
-    once: bool,
+    mode: Mode,
     jobs_dir: Option<PathBuf>,
 }
 
@@ -67,23 +92,46 @@ fn main() -> Result<()> {
         }
     };
 
+    if let Mode::Panel {
+        width,
+        command,
+        dry_run,
+    } = options.mode
+    {
+        return panel::run(width, command, dry_run);
+    }
+
     let jobs_dir = match options.jobs_dir {
         Some(dir) => dir,
         None => job::default_jobs_dir()?,
     };
 
-    if options.once {
-        return print_once(&jobs_dir);
+    match options.mode {
+        Mode::Once => print_once(&jobs_dir),
+        _ => run_tui(jobs_dir),
     }
-    run_tui(jobs_dir)
 }
 
 fn parse_args() -> Result<Option<Options>> {
+    parse(std::env::args().skip(1).collect())
+}
+
+fn parse(args: Vec<String>) -> Result<Option<Options>> {
     let mut options = Options {
-        once: false,
+        mode: Mode::Tui,
         jobs_dir: None,
     };
-    let mut args = std::env::args().skip(1);
+    let mut width = panel::DEFAULT_WIDTH;
+    let mut command = Vec::new();
+    let mut is_panel = false;
+    let mut dry_run = false;
+
+    let mut args = args.into_iter().peekable();
+    if args.peek().map(String::as_str) == Some("panel") {
+        args.next();
+        is_panel = true;
+    }
+
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -94,13 +142,39 @@ fn parse_args() -> Result<Option<Options>> {
                 println!("savras {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
-            "--once" => options.once = true,
+            // Everything after `--` is the command for the working pane, and
+            // must not be read as an option of ours.
+            "--" => {
+                command.extend(args.by_ref());
+                break;
+            }
+            "--once" => options.mode = Mode::Once,
+            "--dry-run" => dry_run = true,
+            "--width" => {
+                let raw = args.next().context("--width needs a number")?;
+                width = raw
+                    .parse()
+                    .with_context(|| format!("--width {raw} is not a number"))?;
+                if width < 12 {
+                    anyhow::bail!("--width must be at least 12 columns");
+                }
+            }
             "--jobs-dir" => {
                 let dir = args.next().context("--jobs-dir needs a path")?;
                 options.jobs_dir = Some(PathBuf::from(dir));
             }
             other => anyhow::bail!("unknown option {other}"),
         }
+    }
+
+    if is_panel {
+        options.mode = Mode::Panel {
+            width,
+            command,
+            dry_run,
+        };
+    } else if !command.is_empty() {
+        anyhow::bail!("a command after `--` only makes sense with `svr panel`");
     }
     Ok(Some(options))
 }
@@ -257,4 +331,63 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_ok(args: &[&str]) -> Options {
+        parse(args.iter().map(|s| s.to_string()).collect())
+            .unwrap()
+            .expect("not a help/version exit")
+    }
+
+    #[test]
+    fn no_arguments_opens_the_panel_in_this_terminal() {
+        assert!(matches!(parse_ok(&[]).mode, Mode::Tui));
+    }
+
+    #[test]
+    fn panel_takes_a_width_and_a_command() {
+        let options = parse_ok(&["panel", "--width", "52", "--", "claude", "--resume", "x"]);
+        match options.mode {
+            Mode::Panel { width, command, .. } => {
+                assert_eq!(width, 52);
+                assert_eq!(command, ["claude", "--resume", "x"]);
+            }
+            _ => panic!("expected panel mode"),
+        }
+    }
+
+    #[test]
+    fn options_after_the_separator_belong_to_the_command_not_to_us() {
+        // `--once` here is Claude Code's flag, not ours; parsing it would send
+        // the user somewhere they did not ask to go.
+        let options = parse_ok(&["panel", "--", "claude", "--once", "--width", "9"]);
+        match options.mode {
+            Mode::Panel { width, command, .. } => {
+                assert_eq!(width, panel::DEFAULT_WIDTH);
+                assert_eq!(command, ["claude", "--once", "--width", "9"]);
+            }
+            _ => panic!("expected panel mode"),
+        }
+    }
+
+    #[test]
+    fn a_width_too_small_to_read_is_rejected() {
+        assert!(parse(vec!["panel".into(), "--width".into(), "3".into()]).is_err());
+        assert!(parse(vec!["panel".into(), "--width".into(), "wide".into()]).is_err());
+    }
+
+    #[test]
+    fn a_command_without_panel_is_a_mistake_worth_naming() {
+        let err = parse(vec!["--".into(), "claude".into()]).unwrap_err();
+        assert!(err.to_string().contains("svr panel"), "{err}");
+    }
+
+    #[test]
+    fn unknown_options_are_rejected_rather_than_ignored() {
+        assert!(parse(vec!["--colour".into()]).is_err());
+    }
 }
