@@ -1,0 +1,27 @@
+[package]
+name = "savras"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "A side panel that sees every Claude Code session you have running."
+license = "MIT"
+repository = "https://github.com/Marijusaj/savras"
+
+[[bin]]
+name = "svr"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
+crossterm = "0.28"
+directories = "5"
+notify = "7"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
