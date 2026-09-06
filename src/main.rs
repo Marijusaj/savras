@@ -52,6 +52,7 @@ options:
   --dry-run           print the tmux layout instead of building it
   --ping <when>       ping on needs (default), done, or off
   --no-sound          notify without a sound
+  --quiet <seconds>   silence after a ping, news held until it ends (default 20)
   --once              print the current sessions as plain text and exit
   --jobs-dir <path>   read jobs from somewhere other than ~/.claude/jobs
   -h, --help          show this help
@@ -108,6 +109,7 @@ struct Options {
     jobs_dir: Option<PathBuf>,
     ping: When,
     sound: bool,
+    quiet: Duration,
 }
 
 fn main() -> Result<()> {
@@ -136,7 +138,7 @@ fn main() -> Result<()> {
             side,
             command,
             jobs_dir(options.jobs_dir)?,
-            Ping::new(options.ping, options.sound),
+            Ping::new(options.ping, options.sound, options.quiet),
         );
     }
 
@@ -144,7 +146,10 @@ fn main() -> Result<()> {
 
     match options.mode {
         Mode::Once => print_once(&jobs_dir),
-        _ => run_tui(jobs_dir, Ping::new(options.ping, options.sound)),
+        _ => run_tui(
+            jobs_dir,
+            Ping::new(options.ping, options.sound, options.quiet),
+        ),
     }
 }
 
@@ -165,6 +170,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
         jobs_dir: None,
         ping: When::default(),
         sound: true,
+        quiet: ping::QUIET,
     };
     let mut width = panel::DEFAULT_WIDTH;
     let mut command = Vec::new();
@@ -209,6 +215,16 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
                 is_panel = false;
             }
             "--no-sound" => options.sound = false,
+            "--quiet" => {
+                let raw = args.next().context("--quiet needs a number of seconds")?;
+                let secs: f64 = raw
+                    .parse()
+                    .with_context(|| format!("--quiet must be a number of seconds, not {raw}"))?;
+                if !(0.0..=600.0).contains(&secs) {
+                    anyhow::bail!("--quiet must be between 0 and 600 seconds, not {raw}");
+                }
+                options.quiet = Duration::from_secs_f64(secs);
+            }
             "--ping" => {
                 let raw = args.next().context("--ping needs needs, done or off")?;
                 options.ping = When::parse(&raw)
@@ -484,6 +500,21 @@ mod tests {
         assert!(!parse_ok(&["--no-sound"]).sound);
         assert!(parse(vec!["--ping".into(), "loud".into()]).is_err());
         assert!(parse(vec!["--ping".into()]).is_err());
+    }
+
+    #[test]
+    fn the_quiet_period_can_be_moved_but_not_to_nonsense() {
+        assert_eq!(parse_ok(&[]).quiet, ping::QUIET);
+        assert_eq!(
+            parse_ok(&["--quiet", "1.5"]).quiet,
+            Duration::from_millis(1500)
+        );
+        // Nothing is held back at all, which is a choice someone may want.
+        assert_eq!(parse_ok(&["--quiet", "0"]).quiet, Duration::ZERO);
+        assert!(parse(vec!["--quiet".into(), "ages".into()]).is_err());
+        assert!(parse(vec!["--quiet".into(), "-1".into()]).is_err());
+        assert!(parse(vec!["--quiet".into(), "9999".into()]).is_err());
+        assert!(parse(vec!["--quiet".into()]).is_err());
     }
 
     #[test]

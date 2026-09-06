@@ -66,6 +66,29 @@ works, but macOS attributes such a notification to Script Editor, and clicking
 one launches Script Editor — a panel that opens another application when you
 answer it is worse than a bell.
 
+### M2.1 · Heard
+The ping fired only sometimes. Three ways a real question could be consumed
+without ever being said, all closed:
+
+- **The quiet period swallowed instead of queueing.** A transition landing
+  inside the twenty seconds was noted in the memory of the last snapshot and
+  then dropped, so the second session to ask got no sound and — since the panel
+  marks what pinged — no mark either, ever. News is now *held* as a list of
+  session ids and said when the window closes, re-checked against the current
+  snapshot first, so what is announced late is only what is still true.
+- **Savras samples; it is not told.** A session that answers one question and
+  asks the next between two readings never changes status. The question text is
+  now part of what is remembered, and different words are a new question.
+- **A `state.json` caught mid-rewrite parses as nothing**, and the job vanished
+  from that reading — which erased what Savras knew about it, making its return
+  a first sighting, and first sightings are silent. An unparseable file is now
+  read once more before it is believed, and a job must be missing from three
+  readings in a row before it is forgotten.
+
+`--quiet <seconds>` came out of this: the window is a real preference, and a
+short one lets the end-to-end test drive two pings in five seconds rather than
+forty.
+
 ---
 
 ## Next

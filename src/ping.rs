@@ -18,7 +18,10 @@ use crate::job::{Snapshot, Status};
 
 /// After a ping, stay silent this long. Agents finish in bursts — five in a
 /// second is normal — and a burst must be one ping, not a drum roll.
-const QUIET: Duration = Duration::from_secs(20);
+///
+/// Silence, not deafness: news arriving inside the window is held and said
+/// when it closes. `--quiet` moves it.
+pub const QUIET: Duration = Duration::from_secs(20);
 
 /// Which transitions are worth interrupting someone for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -55,23 +58,53 @@ pub struct Notice {
     pub shorts: Vec<String>,
 }
 
+/// How many consecutive snapshots a job may be missing from before we forget
+/// it.
+///
+/// Claude Code rewrites `state.json` in place, so a read can land mid-write and
+/// yield no job at all. Forgetting one on the strength of a single bad read
+/// makes its next appearance a *first* sighting — and a first sighting is
+/// exactly what this module stays quiet about.
+const GRACE: u8 = 3;
+
+/// What a job looked like the last time we saw it.
+#[derive(Debug, Clone)]
+struct Seen {
+    status: Status,
+    /// What it was saying. A session that answers one question and asks the
+    /// next between two polls never changes status, and the words are the only
+    /// evidence that the question is a new one.
+    saying: String,
+    /// Consecutive snapshots it has been missing from — see [`GRACE`].
+    missing: u8,
+}
+
 pub struct Ping {
     when: When,
     sound: bool,
-    /// The status each job was in when we last looked. A job missing from here
+    quiet: Duration,
+    /// What each job looked like when we last looked. A job missing from here
     /// has never been seen, and a job's *first* sighting never pings: Savras
     /// starting up beside eight finished sessions is not eight interruptions.
-    seen: HashMap<String, Status>,
+    seen: HashMap<String, Seen>,
+    /// Sessions whose news has been noticed but not yet said out loud, because
+    /// the quiet period was still running. Held as ids rather than as
+    /// sentences, so that what is finally announced is each session as it is
+    /// *then*: a question withdrawn while we waited is dropped, not announced
+    /// late.
+    pending: Vec<String>,
     primed: bool,
     last: Option<Instant>,
 }
 
 impl Ping {
-    pub fn new(when: When, sound: bool) -> Self {
+    pub fn new(when: When, sound: bool, quiet: Duration) -> Self {
         Self {
             when,
             sound,
+            quiet,
             seen: HashMap::new(),
+            pending: Vec::new(),
             primed: false,
             last: None,
         }
@@ -90,40 +123,59 @@ impl Ping {
         watching: Option<&str>,
         now: Instant,
     ) -> Option<Notice> {
-        let mut fired = Vec::new();
-
         for job in &snapshot.jobs {
-            let before = self.seen.insert(job.short.clone(), job.status);
+            let before = self.seen.insert(
+                job.short.clone(),
+                Seen {
+                    status: job.status,
+                    saying: job.summary.clone(),
+                    missing: 0,
+                },
+            );
             if self.when == When::Off || !self.primed {
                 continue;
             }
-            // Only a change of status is news. A job sitting in Needs input
-            // for an hour has already been announced once.
-            if before == Some(job.status) {
+            if !self.news(before.as_ref(), job) {
                 continue;
             }
-            if Some(job.short.as_str()) == watching || Some(job.session_id.as_str()) == watching {
+            if is(job, watching) {
                 continue;
             }
-            if self.worth_saying(job.status) {
-                fired.push(job);
+            if self.worth_saying(job.status) && !self.pending.contains(&job.short) {
+                self.pending.push(job.short.clone());
             }
         }
 
-        // Jobs that vanished must not linger in the map, or a short id Claude
-        // Code reuses would look like it never changed.
-        self.seen
-            .retain(|short, _| snapshot.jobs.iter().any(|j| &j.short == short));
+        self.forget_the_gone(snapshot);
 
         // The first snapshot only teaches us what is already on screen.
         if !self.primed {
             self.primed = true;
+            self.pending.clear();
             return None;
         }
+        if self.pending.is_empty() {
+            return None;
+        }
+        // Still inside the quiet period: hold the news rather than drop it.
+        // Dropping is how a second session asking five seconds after the first
+        // went unheard — and, since the panel marks what pinged, unseen too.
+        if self
+            .last
+            .is_some_and(|t| now.duration_since(t) < self.quiet)
+        {
+            return None;
+        }
+
+        // Announce each held session as it is *now*. One that has since gone
+        // back to working, been answered, or been opened in front of you is no
+        // longer news, and saying so late is worse than not saying it.
+        let fired: Vec<_> = std::mem::take(&mut self.pending)
+            .into_iter()
+            .filter_map(|short| snapshot.jobs.iter().find(|j| j.short == short))
+            .filter(|job| self.worth_saying(job.status) && !is(job, watching))
+            .collect();
         if fired.is_empty() {
-            return None;
-        }
-        if self.last.is_some_and(|t| now.duration_since(t) < QUIET) {
             return None;
         }
         self.last = Some(now);
@@ -159,6 +211,43 @@ impl Ping {
         })
     }
 
+    /// Whether this job has done something since we last looked.
+    ///
+    /// A change of status, plainly. But also a session that is *still* asking
+    /// a different question than it was: Savras samples the jobs directory, it
+    /// is not told about changes, so a round trip that begins and ends between
+    /// two samples — asked, answered, asked again — leaves the status looking
+    /// untouched. The question itself is the only thing that moved.
+    fn news(&self, before: Option<&Seen>, job: &crate::job::Job) -> bool {
+        match before {
+            None => true,
+            Some(seen) => {
+                seen.status != job.status
+                    || (job.status == Status::NeedsInput && seen.saying != job.summary)
+            }
+        }
+    }
+
+    /// Drop jobs that have stayed gone. Lingering entries would make a short
+    /// id Claude Code reuses look like it never changed; dropping them the
+    /// instant one snapshot misses them would make a half-written `state.json`
+    /// look like a session that had never existed — so it takes [`GRACE`]
+    /// snapshots in a row.
+    fn forget_the_gone(&mut self, snapshot: &Snapshot) {
+        self.seen.retain(|short, seen| {
+            if snapshot.jobs.iter().any(|j| &j.short == short) {
+                return true;
+            }
+            seen.missing += 1;
+            seen.missing < GRACE
+        });
+        // News about a session that is no longer there cannot be said, and
+        // must not sit in the queue waiting for a session that never returns.
+        // Same grace: a job we have not truly forgotten yet may still come back.
+        let seen = &self.seen;
+        self.pending.retain(|short| seen.contains_key(short));
+    }
+
     fn worth_saying(&self, status: Status) -> bool {
         match status {
             Status::NeedsInput => self.when != When::Off,
@@ -178,6 +267,12 @@ impl Ping {
             None => Vec::new(),
         }
     }
+}
+
+/// Whether this job is the one you are watching. The pane was opened with a
+/// session id, and the panel knows jobs by short id; either name identifies it.
+fn is(job: &crate::job::Job, watching: Option<&str>) -> bool {
+    Some(job.short.as_str()) == watching || Some(job.session_id.as_str()) == watching
 }
 
 impl Notice {
@@ -315,14 +410,14 @@ mod tests {
         // Savras opening beside four sessions that already need you is not
         // four interruptions; it is the state of the world.
         let f = Fixture::new("ping-first").job("aaa", ASKING);
-        let mut ping = Ping::new(When::Needs, false);
+        let mut ping = Ping::new(When::Needs, false, QUIET);
         assert_eq!(ping.observe(&snap(&f), None, Instant::now()), None);
     }
 
     #[test]
     fn a_session_starting_to_ask_pings() {
         let f = Fixture::new("ping-asks").job("aaa", WORKING);
-        let mut ping = Ping::new(When::Needs, false);
+        let mut ping = Ping::new(When::Needs, false, QUIET);
         ping.observe(&snap(&f), None, Instant::now());
 
         write(&f, "aaa", ASKING);
@@ -336,7 +431,7 @@ mod tests {
     #[test]
     fn a_session_that_keeps_asking_pings_once() {
         let f = Fixture::new("ping-once").job("aaa", WORKING);
-        let mut ping = Ping::new(When::Needs, false);
+        let mut ping = Ping::new(When::Needs, false, QUIET);
         let now = Instant::now();
         ping.observe(&snap(&f), None, now);
 
@@ -349,7 +444,7 @@ mod tests {
     #[test]
     fn asking_again_after_working_pings_again() {
         let f = Fixture::new("ping-again").job("aaa", WORKING);
-        let mut ping = Ping::new(When::Needs, false);
+        let mut ping = Ping::new(When::Needs, false, QUIET);
         let start = Instant::now();
         ping.observe(&snap(&f), None, start);
 
@@ -364,8 +459,8 @@ mod tests {
     #[test]
     fn finishing_pings_only_when_asked_for() {
         let f = Fixture::new("ping-done").job("aaa", WORKING);
-        let mut needs_only = Ping::new(When::Needs, false);
-        let mut also_done = Ping::new(When::Done, false);
+        let mut needs_only = Ping::new(When::Needs, false, QUIET);
+        let mut also_done = Ping::new(When::Done, false, QUIET);
         let now = Instant::now();
         needs_only.observe(&snap(&f), None, now);
         also_done.observe(&snap(&f), None, now);
@@ -381,7 +476,7 @@ mod tests {
     #[test]
     fn off_says_nothing_at_all() {
         let f = Fixture::new("ping-off").job("aaa", WORKING);
-        let mut ping = Ping::new(When::Off, false);
+        let mut ping = Ping::new(When::Off, false, QUIET);
         let now = Instant::now();
         ping.observe(&snap(&f), None, now);
         write(&f, "aaa", ASKING);
@@ -393,7 +488,7 @@ mod tests {
         // It is on the other half of your screen, asking you in person. Only
         // while you are actually there, though — see `watching` in host.rs.
         let f = Fixture::new("ping-open").job("aaa", WORKING);
-        let mut ping = Ping::new(When::Needs, false);
+        let mut ping = Ping::new(When::Needs, false, QUIET);
         let now = Instant::now();
         ping.observe(&snap(&f), None, now);
 
@@ -413,7 +508,7 @@ mod tests {
             .job("aaa", WORKING)
             .job("bbb", WORKING)
             .job("ccc", WORKING);
-        let mut ping = Ping::new(When::Needs, false);
+        let mut ping = Ping::new(When::Needs, false, QUIET);
         let now = Instant::now();
         ping.observe(&snap(&f), None, now);
 
@@ -435,7 +530,7 @@ mod tests {
         let f = Fixture::new("ping-quiet")
             .job("aaa", WORKING)
             .job("bbb", WORKING);
-        let mut ping = Ping::new(When::Needs, false);
+        let mut ping = Ping::new(When::Needs, false, QUIET);
         let start = Instant::now();
         ping.observe(&snap(&f), None, start);
 
@@ -452,16 +547,124 @@ mod tests {
     }
 
     #[test]
-    fn a_job_that_disappears_is_forgotten() {
+    fn a_job_that_stays_gone_is_forgotten() {
         let f = Fixture::new("ping-gone").job("aaa", ASKING);
-        let mut ping = Ping::new(When::Needs, false);
+        let mut ping = Ping::new(When::Needs, false, QUIET);
         let start = Instant::now();
         ping.observe(&snap(&f), None, start);
         assert_eq!(ping.seen.len(), 1);
 
         std::fs::remove_dir_all(f.0.join("aaa")).unwrap();
-        ping.observe(&snap(&f), None, start);
+        for _ in 0..GRACE {
+            ping.observe(&snap(&f), None, start);
+        }
         assert!(ping.seen.is_empty(), "a gone job must not be remembered");
+    }
+
+    #[test]
+    fn a_job_that_blinks_out_for_one_read_is_still_remembered() {
+        // A `state.json` caught mid-rewrite parses as nothing, and the job is
+        // absent from that one snapshot. Forgetting it there would make its
+        // return a first sighting — and first sightings are silent, so the
+        // question it is asking would never be announced at all.
+        let f = Fixture::new("ping-blink").job("aaa", ASKING);
+        let mut ping = Ping::new(When::Needs, false, QUIET);
+        let start = Instant::now();
+        ping.observe(&snap(&f), None, start);
+
+        std::fs::write(f.0.join("aaa").join("state.json"), "{\"state\":").unwrap();
+        assert!(snap(&f).jobs.is_empty(), "the torn read yields no job");
+        assert_eq!(ping.observe(&snap(&f), None, start), None);
+
+        write(&f, "aaa", ASKING);
+        assert_eq!(
+            ping.observe(&snap(&f), None, start),
+            None,
+            "it is the same question it was asking before the blink"
+        );
+    }
+
+    #[test]
+    fn news_held_through_the_quiet_period_is_said_afterwards() {
+        // The bug this replaces: a transition landing inside the quiet window
+        // was consumed and dropped, so a second session asking moments after
+        // the first got no sound and — since the panel marks what pinged — no
+        // mark either, ever.
+        let f = Fixture::new("ping-held")
+            .job("aaa", WORKING)
+            .job("bbb", WORKING);
+        let mut ping = Ping::new(When::Needs, false, QUIET);
+        let start = Instant::now();
+        ping.observe(&snap(&f), None, start);
+
+        write(&f, "aaa", ASKING);
+        assert!(ping.observe(&snap(&f), None, start).is_some());
+
+        write(&f, "bbb", ASKING);
+        assert_eq!(ping.observe(&snap(&f), None, start + QUIET / 2), None);
+        // Nothing changes on disk; the news is simply no longer being held.
+        let notice = ping.observe(&snap(&f), None, start + QUIET).unwrap();
+        assert_eq!(notice.shorts, ["bbb"]);
+    }
+
+    #[test]
+    fn news_that_stops_being_true_while_held_is_dropped() {
+        // Announcing "bbb needs you" twenty seconds after bbb went back to
+        // working is worse than staying quiet: you go and find nothing.
+        let f = Fixture::new("ping-stale")
+            .job("aaa", WORKING)
+            .job("bbb", WORKING);
+        let mut ping = Ping::new(When::Needs, false, QUIET);
+        let start = Instant::now();
+        ping.observe(&snap(&f), None, start);
+
+        write(&f, "aaa", ASKING);
+        assert!(ping.observe(&snap(&f), None, start).is_some());
+        write(&f, "bbb", ASKING);
+        ping.observe(&snap(&f), None, start + QUIET / 2);
+        write(&f, "bbb", WORKING);
+        assert_eq!(ping.observe(&snap(&f), None, start + QUIET), None);
+    }
+
+    #[test]
+    fn a_fresh_question_pings_even_when_the_status_never_moved() {
+        // Savras samples; it is not told. Answered-and-asked-again between two
+        // samples looks exactly like a session that never stopped waiting, and
+        // the only thing that moved is the question itself.
+        let f = Fixture::new("ping-requestion").job("aaa", ASKING);
+        let mut ping = Ping::new(When::Needs, false, QUIET);
+        let start = Instant::now();
+        ping.observe(&snap(&f), None, start);
+
+        write(
+            &f,
+            "aaa",
+            r#"{"state":"working","name":"RUN","needs":"answer: and now which?","sessionId":"s-1"}"#,
+        );
+        let notice = ping.observe(&snap(&f), None, start + QUIET).unwrap();
+        assert_eq!(notice.title, "RUN needs you");
+        assert_eq!(notice.body, "answer: and now which?");
+        // The same question again is still not news.
+        assert_eq!(ping.observe(&snap(&f), None, start + QUIET * 2), None);
+    }
+
+    #[test]
+    fn a_finished_session_saying_more_does_not_ping_twice() {
+        // Only a pending question is re-announced on new words; a result line
+        // that grows as the summary is written must not ping again.
+        let f = Fixture::new("ping-done-twice").job("aaa", WORKING);
+        let mut ping = Ping::new(When::Done, false, QUIET);
+        let start = Instant::now();
+        ping.observe(&snap(&f), None, start);
+
+        write(&f, "aaa", FINISHED);
+        assert!(ping.observe(&snap(&f), None, start).is_some());
+        write(
+            &f,
+            "aaa",
+            r#"{"state":"done","name":"RUN","output":{"result":"shipped, and pushed"},"sessionId":"s-1"}"#,
+        );
+        assert_eq!(ping.observe(&snap(&f), None, start + QUIET * 2), None);
     }
 
     #[test]

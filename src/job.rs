@@ -188,9 +188,29 @@ pub fn load(jobs_dir: &Path) -> Result<Snapshot> {
     Ok(Snapshot { jobs })
 }
 
+/// The file, parsed — with one retry.
+///
+/// Claude Code rewrites `state.json` in place, so a read timed badly enough
+/// returns half a document, which parses as nothing. Once that is the whole
+/// difference between a job that is on the panel and a job that is not, and
+/// the rewrite is over in microseconds; a second look a moment later steps
+/// over it. A job that is genuinely unreadable still costs only one extra
+/// read per refresh.
+fn read_state(path: &Path) -> Option<RawState> {
+    if let Some(raw) = parse(path) {
+        return Some(raw);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    parse(path)
+}
+
+fn parse(path: &Path) -> Option<RawState> {
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
 fn read_one(dir: &Path, short: &str) -> Option<Job> {
-    let text = std::fs::read_to_string(dir.join("state.json")).ok()?;
-    let raw: RawState = serde_json::from_str(&text).ok()?;
+    let raw = read_state(&dir.join("state.json"))?;
 
     let done = raw.state.as_deref() == Some("done");
     let needs = raw

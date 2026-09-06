@@ -124,7 +124,24 @@ answered in its own tab, say.
 It fires on the *transition*, not on a poll tick. Savras opening beside four
 sessions that already need you is silent; a question already on screen is never
 re-announced. A burst of sessions asking at once is one ping that counts them,
-and twenty quiet seconds follow.
+and twenty quiet seconds follow — `--quiet <seconds>` moves that.
+
+Those seconds are silence, not deafness. A session that starts asking while the
+window is still running is *held*, and announced the moment it closes; it is
+never dropped, and it is marked in the panel when it is finally said. That was
+the one way a real question could go unheard, and it was the difference between
+a ping that works and a ping that works most of the time. What is held is also
+re-checked before it is said: a session that went back to working, or that you
+have since opened, is dropped rather than announced twenty seconds stale.
+
+Two smaller ways a question used to slip past, both closed. Savras *samples*
+the jobs directory — it is not told about changes — so a session that answers
+one question and asks another between two samples never appears to change
+status; the question text is now compared as well, and different words are a
+new question. And a `state.json` caught mid-rewrite parses as nothing at all,
+which briefly made the session vanish; a job now has to be missing from three
+readings in a row before Savras forgets what it was doing, and an unparseable
+file is read a second time before it is believed.
 
 The session showing in the working pane is spared a ping — but only while the
 terminal has focus, because only then is it asking you in person. Switch to
@@ -138,6 +155,7 @@ saw.
 svr --ping done       ping when a session finishes, too
 svr --ping off        no notification, no sound
 svr --no-sound        notify silently
+svr --quiet 5         a shorter silence after each ping
 ```
 
 The sound is `afplay` on macOS, `canberra-gtk-play` or `paplay` on Linux,
@@ -172,6 +190,7 @@ svr --tmux             use tmux, so the session survives a crash
 svr solo               just the panel, with no working pane
 svr --ping <when>      ping on needs (the default), done, or off
 svr --no-sound         notify without a sound
+svr --quiet <seconds>  silence after a ping; news is held, not lost (default 20)
 svr --once             print the current sessions as plain text and exit
 svr --jobs-dir <path>  read jobs from somewhere other than ~/.claude/jobs
 ```
