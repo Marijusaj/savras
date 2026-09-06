@@ -80,7 +80,7 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         count_span(snap.count(Status::Done), "done", Color::DarkGray),
     ]);
 
-    let title = Line::from(vec![
+    let mut title = vec![
         Span::styled(
             "SAVRAS",
             Style::default()
@@ -95,7 +95,18 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             },
             Style::default().fg(Color::DarkGray),
         ),
-    ]);
+    ];
+    // What the ping was about, held on screen until you go to it: a sound you
+    // half-heard from another room is no use without the name.
+    if app.alert_count() > 0 {
+        title.push(Span::styled(
+            format!("  ● {}", app.alert_count()),
+            Style::default()
+                .fg(Color::Indexed(220))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    let title = Line::from(title);
 
     frame.render_widget(Paragraph::new(vec![title, counts]), area);
 }
@@ -147,7 +158,10 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             ))),
             Row::Spacer => ListItem::new(Line::from("")),
-            Row::Job(i) => ListItem::new(job_line(&app.snapshot.jobs[*i], name_width, area.width)),
+            Row::Job(i) => {
+                let job = &app.snapshot.jobs[*i];
+                ListItem::new(job_line(job, app.alerted(job), name_width, area.width))
+            }
         })
         .collect();
 
@@ -155,7 +169,9 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
-fn job_line(job: &Job, name_width: u16, total_width: u16) -> Line<'static> {
+/// One session's row. `alerted` means it pinged and you have not been to it —
+/// the sound is gone in a second, so the panel has to keep pointing.
+fn job_line(job: &Job, alerted: bool, name_width: u16, total_width: u16) -> Line<'static> {
     let age = age(job.updated_at, Utc::now());
     let color = badge_color(job);
     // Claude Code shows the pull request a session produced; it is often the
@@ -166,7 +182,17 @@ fn job_line(job: &Job, name_width: u16, total_width: u16) -> Line<'static> {
         .map(|l| format!(" #{} ", l.id))
         .unwrap_or_default();
 
-    let mut spans = vec![
+    // The marker sits where the status star does, so it costs no width in a
+    // panel that has none to spare, and a filled dot against a star is a
+    // difference you can see without reading.
+    let mark = if alerted {
+        Span::styled(
+            "● ",
+            Style::default()
+                .fg(Color::Indexed(220))
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
         Span::styled(
             "✳ ",
             Style::default().fg(match job.status {
@@ -174,7 +200,11 @@ fn job_line(job: &Job, name_width: u16, total_width: u16) -> Line<'static> {
                 Status::Working => Color::Indexed(117),
                 Status::Done => Color::Indexed(114),
             }),
-        ),
+        )
+    };
+
+    let mut spans = vec![
+        mark,
         Span::styled(
             pad(&job.name, name_width as usize),
             Style::default()
@@ -382,6 +412,49 @@ mod tests {
                     "children":[{"id":"357","kind":"pr","href":"http://x/357"}],
                     "sessionId":"sess-fin"}"#,
             )
+    }
+
+    /// Same, but with a session marked as having pinged.
+    fn render_alerted(fixture: &Fixture, short: &str, w: u16, h: u16) -> Vec<String> {
+        let mut app = App::new(fixture.0.clone());
+        app.alert([short.to_string()]);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_session_that_pinged_is_marked_and_counted() {
+        // Hearing a ping and not knowing which of four waiting sessions made
+        // it is the same as not being told at all.
+        let lines = render_alerted(&three_jobs(), "aaa", 60, 24);
+        let text = lines.join("\n");
+
+        assert!(text.contains("● 1"), "the header says how many are waiting");
+        let asking = lines
+            .iter()
+            .find(|l| l.contains("ASK"))
+            .expect("the asking session is on screen");
+        assert!(asking.contains('●'), "marked: {asking}");
+
+        let working = lines.iter().find(|l| l.contains("ROADMAP")).unwrap();
+        assert!(working.contains('✳'), "unmarked sessions keep the star");
+        assert!(!working.contains('●'));
+    }
+
+    #[test]
+    fn with_nothing_waiting_the_header_says_nothing_extra() {
+        let text = render(&three_jobs(), 60, 24).join("\n");
+        assert!(!text.contains('●'));
     }
 
     #[test]

@@ -104,6 +104,23 @@ notification, written to the terminal as an OSC 9 escape sequence, and a sound.
 No dependency, no permissions dialog, and it works over SSH — the notification
 comes from your terminal, not from the binary.
 
+The panel says which session it was. A session that has pinged carries a bright
+`●` where its status star normally sits, and the header counts them:
+
+```
+SAVRAS  ◦ live  ● 1
+2 needs input · 2 working · 5 done
+
+Needs input
+● AGENT-2     approve Bash: M=/User…    #382 5m     ← this one just asked
+✳ AGENT       1) approve AGENT-2 bu…    #369 5m
+```
+
+A sound is over in a second and you may be in another application when it
+happens, so the mark stays until you go to the session: opening it, or moving
+the cursor onto it, clears it, and so does the session no longer needing you —
+answered in its own tab, say.
+
 It fires on the *transition*, not on a poll tick. Savras opening beside four
 sessions that already need you is silent; a question already on screen is never
 re-announced. A burst of sessions asking at once is one ping that counts them,
@@ -153,6 +170,8 @@ svr -- claude          ... with Claude Code beside it
 svr --side left        put the panel on the left instead of the right
 svr --tmux             use tmux, so the session survives a crash
 svr solo               just the panel, with no working pane
+svr --ping <when>      ping on needs (the default), done, or off
+svr --no-sound         notify without a sound
 svr --once             print the current sessions as plain text and exit
 svr --jobs-dir <path>  read jobs from somewhere other than ~/.claude/jobs
 ```
@@ -194,9 +213,9 @@ Next up is **M3 · Repos** — group and sort the panel by repository. Then
 ## Development
 
 ```sh
-cargo test        # 84 tests: parsing, grouping, navigation, ping
-                  # transitions, focus reporting, argument handling,
-                  # tmux layout, and render buffers
+cargo test        # 94 tests: parsing, grouping, navigation, ping
+                  # transitions and marks, focus reporting, argument
+                  # handling, tmux layout, and render buffers
 cargo build --release
 ```
 

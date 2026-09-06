@@ -350,7 +350,7 @@ fn event_loop(
                         let opened = if matches!(action, Action::Reopen) {
                             reopen(&mut session)
                         } else {
-                            open_selected(&mut session, &app)
+                            open_selected(&mut session, &mut app)
                         };
                         match opened {
                             Ok(true) => {
@@ -383,9 +383,10 @@ fn event_loop(
             // terminal has focus; in another application it is as invisible
             // as any other, and must ping like one.
             let open = session.open.clone();
-            session
+            let pinged = session
                 .ping
                 .poll(&app.snapshot, watching(window_focused, open.as_deref()));
+            app.alert(pinged);
             last_refresh = Instant::now();
             dirty = true;
         }
@@ -409,12 +410,16 @@ fn watching(focused: bool, open: Option<&str>) -> Option<&str> {
 /// Replace the working pane with the selected session. The program that was
 /// there is killed; the Claude Code session it was showing is not — those live
 /// in Claude Code's daemon, which is why reopening one is just a resume.
-fn open_selected(session: &mut Session, app: &App) -> Result<bool> {
+fn open_selected(session: &mut Session, app: &mut App) -> Result<bool> {
     let Some(job) = app.selected_job() else {
         return Ok(false);
     };
     session.open = Some(job.short.clone());
     session.reopen = Some(resume(job));
+    // Going to a session is the clearest possible way of saying you saw which
+    // one it was.
+    let short = job.short.clone();
+    app.attend_to(&short);
     reopen(session)
 }
 

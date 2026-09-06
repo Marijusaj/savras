@@ -332,7 +332,8 @@ fn event_loop(
             app.refresh();
             // Nothing is open beside the panel in this mode, so every session
             // is one you are not looking at.
-            ping.poll(&app.snapshot, None);
+            let pinged = ping.poll(&app.snapshot, None);
+            app.alert(pinged);
             dirty_since = None;
             last_load = Instant::now();
         }

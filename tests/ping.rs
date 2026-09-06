@@ -82,6 +82,13 @@ fn a_session_that_starts_asking_notifies_the_terminal() {
         .take_while(|c| *c != '\x07')
         .collect();
     assert_eq!(body, "RUN needs you — answer: which one?");
+
+    // And the panel says which session it was: the sound is over in a second,
+    // and you may have been in another application when it happened.
+    assert!(
+        seen.contains('●'),
+        "the pinged session is not marked on screen"
+    );
 }
 
 fn drain(rx: &std::sync::mpsc::Receiver<Vec<u8>>, patience: Duration) -> String {

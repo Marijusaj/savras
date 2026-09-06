@@ -43,11 +43,16 @@ impl When {
     }
 }
 
-/// One ping's worth of news: what to say, and how many sessions it covers.
+/// One ping's worth of news: what to say, and which sessions it was about.
+///
+/// The panel needs `shorts` as much as the notification needs the words: a
+/// sound tells you *someone* wants you, and the panel is where you find out
+/// which — see `App::alert`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Notice {
     pub title: String,
     pub body: String,
+    pub shorts: Vec<String>,
 }
 
 pub struct Ping {
@@ -123,30 +128,35 @@ impl Ping {
         }
         self.last = Some(now);
 
-        let notice = match fired.as_slice() {
-            [job] => Notice {
-                title: match job.status {
+        let shorts = fired.iter().map(|j| j.short.clone()).collect();
+        let (title, body) = match fired.as_slice() {
+            [job] => (
+                match job.status {
                     Status::NeedsInput => format!("{} needs you", job.name),
                     _ => format!("{} finished", job.name),
                 },
-                body: job.summary.clone(),
-            },
+                job.summary.clone(),
+            ),
             many => {
                 let asking = many
                     .iter()
                     .filter(|j| j.status == Status::NeedsInput)
                     .count();
-                Notice {
-                    title: format!("{} sessions", many.len()),
-                    body: if asking > 0 {
+                (
+                    format!("{} sessions", many.len()),
+                    if asking > 0 {
                         format!("{asking} needing you")
                     } else {
                         "finished".into()
                     },
-                }
+                )
             }
         };
-        Some(notice)
+        Some(Notice {
+            title,
+            body,
+            shorts,
+        })
     }
 
     fn worth_saying(&self, status: Status) -> bool {
@@ -157,10 +167,15 @@ impl Ping {
         }
     }
 
-    /// The whole point, in one call: look, and make noise if there is reason to.
-    pub fn poll(&mut self, snapshot: &Snapshot, watching: Option<&str>) {
-        if let Some(notice) = self.observe(snapshot, watching, Instant::now()) {
-            notice.announce(self.sound);
+    /// The whole point, in one call: look, make noise if there is reason to,
+    /// and hand back the sessions it was about so the panel can point at them.
+    pub fn poll(&mut self, snapshot: &Snapshot, watching: Option<&str>) -> Vec<String> {
+        match self.observe(snapshot, watching, Instant::now()) {
+            Some(notice) => {
+                notice.announce(self.sound);
+                notice.shorts
+            }
+            None => Vec::new(),
         }
     }
 }
@@ -314,6 +329,8 @@ mod tests {
         let notice = ping.observe(&snap(&f), None, Instant::now()).unwrap();
         assert_eq!(notice.title, "RUN needs you");
         assert_eq!(notice.body, "answer: which one?");
+        // The panel marks these, so the sound has something to point at.
+        assert_eq!(notice.shorts, ["aaa"]);
     }
 
     #[test]
@@ -406,6 +423,11 @@ mod tests {
         let notice = ping.observe(&snap(&f), None, now).unwrap();
         assert_eq!(notice.title, "3 sessions");
         assert_eq!(notice.body, "3 needing you");
+        // One sound, but all three get marked — the count in the title is no
+        // help finding them in the list.
+        let mut shorts = notice.shorts.clone();
+        shorts.sort();
+        assert_eq!(shorts, ["aaa", "bbb", "ccc"]);
     }
 
     #[test]

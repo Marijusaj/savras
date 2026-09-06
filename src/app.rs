@@ -1,5 +1,6 @@
 //! Panel state: what is on screen and what is selected.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use ratatui::widgets::ListState;
@@ -24,6 +25,12 @@ pub struct App {
     /// False when the filesystem watcher could not start and we are falling
     /// back to polling — worth telling the user, since latency changes.
     pub watching: bool,
+    /// Jobs that have pinged and that you have not been to yet, by short id.
+    ///
+    /// The status groups already say *who* needs you; a ping says *someone
+    /// just started to*, and without this the panel cannot tell you which of
+    /// four waiting sessions made the sound.
+    alerted: HashSet<String>,
     pub should_quit: bool,
 }
 
@@ -36,10 +43,39 @@ impl App {
             list_state: ListState::default(),
             error: None,
             watching: false,
+            alerted: HashSet::new(),
             should_quit: false,
         };
         app.refresh();
         app
+    }
+
+    /// Mark the jobs a ping just fired for. They stay marked until you go to
+    /// them — the sound is over in a second, and you may not be at the screen
+    /// when it happens.
+    pub fn alert(&mut self, shorts: impl IntoIterator<Item = String>) {
+        self.alerted.extend(shorts);
+    }
+
+    /// Whether this job is still waiting for you to notice it.
+    pub fn alerted(&self, job: &Job) -> bool {
+        self.alerted.contains(&job.short)
+    }
+
+    pub fn alert_count(&self) -> usize {
+        self.alerted.len()
+    }
+
+    /// You have been to it: opening it, or moving the cursor onto it, is
+    /// enough to say you have seen which one it was.
+    fn attend(&mut self) {
+        if let Some(short) = self.selected_job().map(|j| j.short.clone()) {
+            self.alerted.remove(&short);
+        }
+    }
+
+    pub fn attend_to(&mut self, short: &str) {
+        self.alerted.remove(short);
     }
 
     /// Re-read from disk, keeping the cursor on the same job where possible.
@@ -56,6 +92,18 @@ impl App {
 
         self.rebuild_rows();
         self.restore_selection(anchor);
+        self.forget_stale_alerts();
+    }
+
+    /// A mark is about a session waiting on you. Once it is gone, or back to
+    /// working — you answered it in its own tab, say — there is nothing left
+    /// to point at.
+    fn forget_stale_alerts(&mut self) {
+        let jobs = &self.snapshot.jobs;
+        self.alerted.retain(|short| {
+            jobs.iter()
+                .any(|j| &j.short == short && j.status != Status::Working)
+        });
     }
 
     fn rebuild_rows(&mut self) {
@@ -135,6 +183,7 @@ impl App {
             }
             if matches!(self.rows[i as usize], Row::Job(_)) {
                 self.list_state.select(Some(i as usize));
+                self.attend();
                 return;
             }
         }
@@ -152,6 +201,7 @@ impl App {
         } else {
             self.list_state.select(self.first_job_row());
         }
+        self.attend();
     }
 }
 
@@ -273,6 +323,65 @@ mod tests {
 
         assert!(app.selected_job().is_some(), "cursor must land on a job");
         assert!(app.error.is_none());
+    }
+
+    #[test]
+    fn a_ping_marks_its_session_until_you_go_to_it() {
+        // The sound says someone wants you; the mark says which one, and has
+        // to survive you being in another application when it happened.
+        let f = fixture();
+        let mut app = App::new(f.0.clone());
+        app.alert(["aaa".to_string()]);
+
+        let asking = app.snapshot.jobs.iter().find(|j| j.name == "ASK").unwrap();
+        assert!(app.alerted(asking));
+        assert_eq!(app.alert_count(), 1);
+
+        // A refresh must not lose it: the panel re-reads every couple of
+        // seconds, and you may not be back yet.
+        app.refresh();
+        assert_eq!(app.alert_count(), 1);
+    }
+
+    #[test]
+    fn moving_the_cursor_onto_a_marked_session_is_seeing_it() {
+        let f = fixture();
+        let mut app = App::new(f.0.clone());
+        app.alert(["bbb".to_string()]);
+        assert_eq!(app.alert_count(), 1);
+
+        app.step(1); // onto RUN, which is job bbb
+        assert_eq!(app.selected_job().unwrap().name, "RUN");
+        assert_eq!(app.alert_count(), 0, "you looked straight at it");
+    }
+
+    #[test]
+    fn a_session_that_stops_asking_stops_being_marked() {
+        // You answered it in its own tab. There is nothing left to point at,
+        // and a mark that outlives its reason teaches you to ignore marks.
+        let f = fixture();
+        let mut app = App::new(f.0.clone());
+        app.alert(["aaa".to_string()]);
+
+        std::fs::write(
+            f.0.join("aaa").join("state.json"),
+            r#"{"state":"working","name":"ASK","detail":"back to work"}"#,
+        )
+        .unwrap();
+        app.refresh();
+        assert_eq!(app.alert_count(), 0);
+    }
+
+    #[test]
+    fn a_marked_session_that_disappears_is_forgotten() {
+        let f = fixture();
+        let mut app = App::new(f.0.clone());
+        app.alert(["ccc".to_string()]);
+        assert_eq!(app.alert_count(), 1);
+
+        std::fs::remove_dir_all(f.0.join("ccc")).unwrap();
+        app.refresh();
+        assert_eq!(app.alert_count(), 0);
     }
 
     #[test]

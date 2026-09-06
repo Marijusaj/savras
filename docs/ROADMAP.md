@@ -43,6 +43,11 @@ never re-announced; a burst of sessions is one ping that counts them, and a
 20-second quiet period follows. `--ping done` includes finished sessions,
 `--ping off` and `--no-sound` turn the halves off separately.
 
+The panel marks what pinged: a bright `●` in place of the status star, and a
+count in the header. Without it the sound was useless — it says someone wants
+you, and with four sessions in Needs input it cannot say which. The mark clears
+when you go to the session, or when the session stops needing you.
+
 The session in the working pane is spared a ping only while the terminal has
 focus. Sparing it unconditionally was the first cut and it was wrong: with the
 window behind a browser, the session you had open is exactly the one you would
