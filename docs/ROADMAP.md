@@ -100,8 +100,18 @@ tabs running behind you, since each is a live `claude attach`.
 
 Command chords were the ask and are impossible: Command is not in the xterm
 modifier encoding, so a terminal keeps every one of them and the pty never sees
-it. Shift-Option is what reaches us; mapping `cmd-shift-←/→` to send
-`\033[1;4D`/`\033[1;4C` in the terminal gets the intended feel back.
+it. Shift-Option reaches us — but only where the terminal encodes modifiers on
+arrows, and **Terminal.app does not**: it sends shift-option-↑ as a plain
+`ESC [ A`, byte-identical to the arrow the session in the pane wants, so the
+first cut did nothing there and spilled `[A[B` across the shell prompt instead.
+
+Hence `ctrl-o`, which is the actual default: a control byte is the only kind of
+key every terminal delivers unchanged. It goes forward only, which two tabs
+makes moot. It is taken only when a second tab exists, so a shell that has
+never opened one keeps the key. `--switch <letter>` moves it and refuses the
+letters that are already enter, tab, backspace, the signals, or Savras's own
+ctrl-g and ctrl-l. Mapping `cmd-shift-←/→` to `\033[1;4D`/`\033[1;4C` in the
+terminal still gets the two-directional feel back for anyone who wants it.
 
 ### M2.3 · Parallel agents
 `a` in the panel starts a parallel agent under the selected session's lead: a

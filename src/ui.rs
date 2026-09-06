@@ -358,7 +358,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint) {
         // The chord is the one key worth advertising from the working pane:
         // it is the only thing you do without coming here first.
         (None, Hint::Background) => Span::styled(
-            truncate("ctrl-g to focus · ⇧⌥←→ flip tabs", area.width as usize),
+            truncate(
+                &match app.switch_hint() {
+                    Some(key) => format!("ctrl-g focus · {key} next tab"),
+                    None => "ctrl-g to focus".to_string(),
+                },
+                area.width as usize,
+            ),
             Style::default().fg(Color::DarkGray),
         ),
     };
@@ -557,6 +563,46 @@ mod tests {
         assert!(text.contains("a agent"), "starting an agent: {text}");
         assert!(text.contains("x close"), "closing a tab: {text}");
         assert!(text.contains("enter open"));
+    }
+
+    #[test]
+    fn the_switch_key_is_offered_only_once_it_would_go_somewhere() {
+        // Advertising a key that does nothing is worse than advertising none:
+        // you press it, nothing happens, and you conclude it is broken.
+        let fixture = three_jobs();
+        let render_background = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(44, 24)).unwrap();
+            terminal
+                .draw(|frame| draw_in(frame, frame.area(), app, Hint::Background))
+                .unwrap();
+            (0..24)
+                .map(|y| {
+                    (0..44)
+                        .map(|x| {
+                            terminal
+                                .backend()
+                                .buffer()
+                                .cell((x, y))
+                                .unwrap()
+                                .symbol()
+                                .to_string()
+                        })
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+
+        let mut app = App::new(fixture.0.clone());
+        app.set_switch(Some("ctrl-o".into()));
+        assert!(
+            !render_background(&mut app).contains("ctrl-o"),
+            "with one pane there is no second tab to flip to"
+        );
+
+        app.set_tabs(Some("aaa"), vec!["aaa".into(), "bbb".into()]);
+        let text = render_background(&mut app);
+        assert!(text.contains("ctrl-o next tab"), "{text}");
     }
 
     #[test]

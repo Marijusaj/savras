@@ -38,6 +38,17 @@ const ESC: u8 = 0x1b;
 /// Savras cannot see it happen, so it needs a way to be told to repaint.
 const REPAINT: u8 = 0x0c; // Ctrl-L
 
+/// Flip to the next tab. A control byte, because that is the only kind of key
+/// every terminal delivers unchanged: Terminal.app does not encode modifiers
+/// on arrow keys at all, so `shift-option-↑` arrives there as a plain
+/// `ESC [ A` and cannot be told from the arrow your session wants.
+///
+/// Ctrl-O is the one control key readline and Claude Code both leave alone —
+/// the rest are line editing (`a e k u w`), history (`n p`), search (`r`), or
+/// signals. `--switch` moves it, and it is only ever taken when you have more
+/// than one tab open, so until then it reaches your shell like any other key.
+pub const SWITCH: u8 = 0x0f; // Ctrl-O
+
 const TICK: Duration = Duration::from_millis(16);
 /// Repaint at least this often even when nothing changed, so ages keep ticking.
 const REDRAW: Duration = Duration::from_millis(500);
@@ -318,6 +329,7 @@ pub fn run(
     side: Side,
     command: Vec<String>,
     jobs_dir: PathBuf,
+    switch: Option<u8>,
     ping: Ping,
 ) -> Result<()> {
     let (cols, rows) = crossterm::terminal::size().context("reading the terminal size")?;
@@ -338,6 +350,7 @@ pub fn run(
         size: (cols, rows),
         input: stdin_thread(),
         tabs: Tabs::new(work),
+        switch,
         ping,
     };
 
@@ -363,6 +376,9 @@ struct Session {
     /// front is never pinged for: it is asking you in person, on the other
     /// half of the screen.
     tabs: Tabs,
+    /// The key that flips to the next tab, or `None` when `--switch off`
+    /// hands it back to the child.
+    switch: Option<u8>,
     ping: Ping,
 }
 
@@ -377,6 +393,13 @@ fn event_loop(
     mut session: Session,
 ) -> Result<()> {
     let mut app = App::new(session.jobs_dir.clone());
+    // Ctrl-O renders as "ctrl-o": the byte is the letter with its top three
+    // bits cleared, so putting them back names the key again.
+    app.set_switch(
+        session
+            .switch
+            .map(|key| format!("ctrl-{}", (key | 0x60) as char)),
+    );
     // Starting an agent runs `claude --bg`, which takes long enough that doing
     // it on this thread would visibly stall the panel. The outcome comes back
     // here, since a session that failed to start must say so rather than
@@ -452,7 +475,8 @@ fn event_loop(
                 let was_confirming = confirming;
                 let action = if bytes.is_empty() {
                     Action::Nothing // nothing but a focus event
-                } else if let Some(delta) = tab_chord(&bytes) {
+                } else if let Some(delta) = switch(&bytes, session.switch, session.tabs.open.len())
+                {
                     // Flipping tabs works from either side, and without going
                     // through the panel: it is the one thing you do often
                     // enough that three keystrokes is two too many.
@@ -678,13 +702,37 @@ fn dead_pane_key(bytes: &[u8]) -> Action {
     }
 }
 
+/// Which way to flip, if this keystroke says to flip at all.
+///
+/// Two ways in. The switch key — Ctrl-O by default — always goes forward, and
+/// works in every terminal because a control byte is delivered unchanged
+/// everywhere. Shift-Option with an arrow goes either way, and is nicer, but
+/// only reaches us in terminals that encode modifiers on arrows; Terminal.app
+/// does not, so it cannot be the only way in.
+///
+/// `open` is how many tabs there are. With one, there is nowhere to flip to,
+/// and the key is handed to the child instead: until you actually have tabs,
+/// Ctrl-O is your shell's again.
+fn switch(bytes: &[u8], key: Option<u8>, open: usize) -> Option<isize> {
+    if open < 2 {
+        return None;
+    }
+    if key.is_some_and(|k| bytes.contains(&k)) {
+        // One key, so it wraps forward. With two tabs — the common case —
+        // forward and back are the same place.
+        return Some(1);
+    }
+    tab_chord(bytes)
+}
+
 /// Shift-Option with an arrow: flip one tab back or forward.
 ///
 /// Command chords cannot be used, however much they feel right — Command is
 /// not part of the xterm modifier encoding at all, so the terminal keeps every
 /// one of them for its own tabs and the pty never sees it. Shift-Option does
-/// reach us. Both axes are accepted: up/down matches the panel's vertical
-/// list, left/right matches the terminal tab keys the hands already know.
+/// reach us, where the terminal encodes it. Both axes are accepted: up/down
+/// matches the panel's vertical list, left/right matches the terminal tab keys
+/// the hands already know.
 ///
 /// `;4` is shift+alt; `;10` is shift+meta, which terminals configured to send
 /// Option as Meta use instead.
@@ -1189,6 +1237,32 @@ mod tests {
         // Terminals set to send Option as Meta encode the same chord as ;10.
         assert_eq!(tab_chord(b"\x1b[1;10A"), Some(-1));
         assert_eq!(tab_chord(b"\x1b[1;10C"), Some(1));
+    }
+
+    #[test]
+    fn the_switch_key_flips_forward_from_any_terminal() {
+        // A control byte is the only kind of key every terminal delivers
+        // unchanged, which is the whole reason this exists: Terminal.app sends
+        // shift-option-arrows as plain arrows, so the chord cannot reach us
+        // there at all.
+        assert_eq!(switch(&[SWITCH], Some(SWITCH), 2), Some(1));
+        // Typing that arrives in the same read as the key still counts.
+        assert_eq!(switch(b"\x0fls\r", Some(SWITCH), 3), Some(1));
+        // A different letter, from `--switch`.
+        assert_eq!(switch(&[0x0f], Some(0x15), 2), None);
+        assert_eq!(switch(&[0x15], Some(0x15), 2), Some(1));
+    }
+
+    #[test]
+    fn the_switch_key_is_the_childs_until_there_is_a_second_tab() {
+        // Stealing ctrl-o from a shell that has only ever had one pane would
+        // be taking a key for a feature that is not in use.
+        assert_eq!(switch(&[SWITCH], Some(SWITCH), 1), None);
+        assert_eq!(switch(&[SWITCH], Some(SWITCH), 0), None);
+        // ...and `--switch off` never takes it at all.
+        assert_eq!(switch(&[SWITCH], None, 4), None);
+        // The arrow chord is still read when it arrives.
+        assert_eq!(switch(b"\x1b[1;4A", None, 4), Some(-1));
     }
 
     #[test]

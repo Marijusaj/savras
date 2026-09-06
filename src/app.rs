@@ -36,6 +36,10 @@ pub struct App {
     /// and unattended, which is exactly the thing worth being able to see.
     tabs: Vec<String>,
     front: Option<String>,
+    /// What to call the key that flips tabs, when there is one. Only ever
+    /// shown once a second tab exists: a key that would do nothing is worse
+    /// than no key at all, because you try it and conclude it is broken.
+    switch_label: Option<String>,
     pub should_quit: bool,
 }
 
@@ -61,6 +65,7 @@ impl App {
             alerted: HashSet::new(),
             tabs: Vec::new(),
             front: None,
+            switch_label: None,
             should_quit: false,
         };
         app.refresh();
@@ -85,6 +90,20 @@ impl App {
     pub fn set_tabs(&mut self, front: Option<&str>, open: Vec<String>) {
         self.front = front.map(str::to_string);
         self.tabs = open;
+    }
+
+    /// Name the key that flips tabs, for the footer to offer.
+    pub fn set_switch(&mut self, label: Option<String>) {
+        self.switch_label = label;
+    }
+
+    /// The key to advertise for flipping tabs — only once flipping would go
+    /// somewhere.
+    pub fn switch_hint(&self) -> Option<&str> {
+        if self.behind_count() == 0 {
+            return None;
+        }
+        self.switch_label.as_deref()
     }
 
     pub fn tab(&self, job: &Job) -> Tab {

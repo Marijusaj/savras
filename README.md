@@ -120,19 +120,28 @@ Needs input
 ✳ ROADMAP     58 tier-A items…                 3d   ← not open
 ```
 
-`shift-option-←/→` or `shift-option-↑/↓` flips one tab along, wrapping, from
-either side of the divider. Left/right is the muscle memory your terminal
+**`ctrl-o` flips to the next tab**, wrapping, from either side of the divider.
+A control byte, because that is the only kind of key every terminal delivers
+unchanged. It is taken only once you have a second tab open — until then it
+reaches your shell like any other key — and `--switch <letter>` moves it,
+`--switch off` gives it back for good.
+
+One key, so it only goes forward. With two tabs open, which is the usual
+number, forward and back are the same place.
+
+`shift-option-←/→` or `shift-option-↑/↓` also flips, in either direction, in
+terminals that encode modifiers on arrow keys. Left/right is the muscle memory your terminal
 already trained; up/down matches the panel's own list. `enter` on a session you
 already have open brings that tab forward rather than attaching to it twice.
 `x` in the panel closes the selected session's tab, and `q` closes a tab whose
 session has exited.
 
-**Terminal.app needs four settings before the chord works at all.** It does not
-encode modifiers on arrow keys: shift-option-↑ arrives as a plain up-arrow,
-indistinguishable from the one your session wants, so Savras cannot act on it
-without eating the arrow keys entirely. iTerm2, Ghostty, WezTerm and kitty all
-send it properly and need nothing. In Terminal.app, go to **Settings →
-Profiles → Keyboard**, press **+** four times and add:
+**Terminal.app is why `ctrl-o` exists.** It does not encode modifiers on arrow
+keys at all: shift-option-↑ arrives as a plain up-arrow, indistinguishable from
+the one your session wants, so Savras cannot act on it without eating the arrow
+keys entirely. `ctrl-o` works there and everywhere. If you would rather have
+the two-directional chord in Terminal.app, go to **Settings → Profiles →
+Keyboard**, press **+** four times and add:
 
 | Key | Modifier | Action | Send text |
 |-----|----------|--------|-----------|
@@ -295,6 +304,7 @@ svr solo               just the panel, with no working pane
 svr --ping <when>      ping on needs (the default), done, or off
 svr --no-sound         notify without a sound
 svr --quiet <seconds>  silence after a ping; news is held, not lost (default 20)
+svr --switch <letter>  ctrl-<letter> flips to the next tab (default o), or off
 svr --once             print the current sessions as plain text and exit
 svr --jobs-dir <path>  read jobs from somewhere other than ~/.claude/jobs
 ```

@@ -55,6 +55,7 @@ options:
   --ping <when>       ping on needs (default), done, or off
   --no-sound          notify without a sound
   --quiet <seconds>   silence after a ping, news held until it ends (default 20)
+  --switch <letter>   ctrl-<letter> flips to the next tab (default o), or off
   --once              print the current sessions as plain text and exit
   --jobs-dir <path>   read jobs from somewhere other than ~/.claude/jobs
   -h, --help          show this help
@@ -69,7 +70,7 @@ examples:
 
 keys, with the panel focused:
   ctrl-g     move the keyboard between your work and the panel
-  shift-option-arrows  flip between the sessions you have open
+  ctrl-o     flip to the next open session (see --switch)
   ↑/↓, k/j   move        enter   open the selected session
   g/G        first/last  esc, q  back to your work
   x          close the selected session's tab
@@ -115,6 +116,8 @@ struct Options {
     ping: When,
     sound: bool,
     quiet: Duration,
+    /// The control byte that flips to the next tab; `None` disables it.
+    switch: Option<u8>,
 }
 
 fn main() -> Result<()> {
@@ -143,6 +146,7 @@ fn main() -> Result<()> {
             side,
             command,
             jobs_dir(options.jobs_dir)?,
+            options.switch,
             Ping::new(options.ping, options.sound, options.quiet),
         );
     }
@@ -156,6 +160,38 @@ fn main() -> Result<()> {
             Ping::new(options.ping, options.sound, options.quiet),
         ),
     }
+}
+
+/// `--switch o` means Ctrl-O, and `--switch off` means give the key back.
+///
+/// A control byte, not a chord: control bytes are the only keys every terminal
+/// delivers unchanged, which is the whole reason this option exists.
+fn parse_switch(raw: &str) -> Result<Option<u8>> {
+    if raw == "off" || raw == "none" {
+        return Ok(None);
+    }
+    let mut letters = raw.chars();
+    let letter = match (letters.next(), letters.next()) {
+        (Some(c), None) if c.is_ascii_alphabetic() => c.to_ascii_lowercase(),
+        _ => anyhow::bail!("--switch takes a single letter or off, not {raw}"),
+    };
+    // Letters whose control byte is already something else entirely: g and l
+    // are Savras's own keys, and the rest are enter, tab, backspace and the
+    // signals, none of which can be handed to anything.
+    if let Some(what) = match letter {
+        'g' => Some("ctrl-g, which focuses the panel"),
+        'l' => Some("ctrl-l, which repaints the screen"),
+        'c' => Some("ctrl-c, which interrupts"),
+        'd' => Some("ctrl-d, which is end-of-file"),
+        'h' => Some("backspace"),
+        'i' => Some("tab"),
+        'j' | 'm' => Some("enter"),
+        _ => None,
+    } {
+        anyhow::bail!("--switch {letter} is {what}; pick another letter");
+    }
+    // Ctrl-<letter> is the letter with its top three bits cleared.
+    Ok(Some(letter.to_ascii_uppercase() as u8 & 0x1f))
 }
 
 fn jobs_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -176,6 +212,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
         ping: When::default(),
         sound: true,
         quiet: ping::QUIET,
+        switch: Some(host::SWITCH),
     };
     let mut width = panel::DEFAULT_WIDTH;
     let mut command = Vec::new();
@@ -220,6 +257,10 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
                 is_panel = false;
             }
             "--no-sound" => options.sound = false,
+            "--switch" => {
+                let raw = args.next().context("--switch needs a letter, or off")?;
+                options.switch = parse_switch(&raw)?;
+            }
             "--quiet" => {
                 let raw = args.next().context("--quiet needs a number of seconds")?;
                 let secs: f64 = raw
@@ -505,6 +546,26 @@ mod tests {
         assert!(!parse_ok(&["--no-sound"]).sound);
         assert!(parse(vec!["--ping".into(), "loud".into()]).is_err());
         assert!(parse(vec!["--ping".into()]).is_err());
+    }
+
+    #[test]
+    fn the_switch_key_can_be_moved_or_given_back() {
+        assert_eq!(parse_ok(&[]).switch, Some(host::SWITCH));
+        assert_eq!(parse_ok(&["--switch", "u"]).switch, Some(0x15));
+        assert_eq!(parse_ok(&["--switch", "U"]).switch, Some(0x15));
+        assert_eq!(parse_ok(&["--switch", "off"]).switch, None);
+
+        // Letters whose control byte is already something else say so, rather
+        // than silently binding a key that can never arrive.
+        for taken in ["g", "l", "c", "d", "i", "m"] {
+            assert!(
+                parse(vec!["--switch".into(), taken.into()]).is_err(),
+                "--switch {taken} must be refused"
+            );
+        }
+        assert!(parse(vec!["--switch".into(), "oo".into()]).is_err());
+        assert!(parse(vec!["--switch".into(), "1".into()]).is_err());
+        assert!(parse(vec!["--switch".into()]).is_err());
     }
 
     #[test]
