@@ -36,8 +36,8 @@ pub struct App {
     /// and unattended, which is exactly the thing worth being able to see.
     tabs: Vec<String>,
     front: Option<String>,
-    /// What to call the key that flips tabs, when there is one. Only ever
-    /// shown once a second tab exists: a key that would do nothing is worse
+    /// What to call the keys that flip between sessions. Only ever shown once
+    /// there is a session to flip to: a key that would do nothing is worse
     /// than no key at all, because you try it and conclude it is broken.
     switch_label: Option<String>,
     pub should_quit: bool,
@@ -97,10 +97,10 @@ impl App {
         self.switch_label = label;
     }
 
-    /// The key to advertise for flipping tabs — only once flipping would go
-    /// somewhere.
+    /// The keys to advertise for flipping sessions — only once there is a
+    /// session to flip to.
     pub fn switch_hint(&self) -> Option<&str> {
-        if self.behind_count() == 0 {
+        if self.snapshot.is_empty() {
             return None;
         }
         self.switch_label.as_deref()
@@ -133,6 +133,19 @@ impl App {
     fn attend(&mut self) {
         if let Some(short) = self.selected_job().map(|j| j.short.clone()) {
             self.alerted.remove(&short);
+        }
+    }
+
+    /// Put the cursor on a session, so that flipping to it in the pane moves
+    /// the panel's highlight with you — the panel is meant to say where you
+    /// are, and a cursor left three rows behind says the opposite.
+    pub fn select(&mut self, short: &str) {
+        let row = self.rows.iter().position(|r| match r {
+            Row::Job(i) => self.snapshot.jobs[*i].short == short,
+            _ => false,
+        });
+        if let Some(row) = row {
+            self.list_state.select(Some(row));
         }
     }
 

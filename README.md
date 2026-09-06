@@ -120,9 +120,15 @@ Needs input
 ✳ ROADMAP     58 tier-A items…                 3d   ← not open
 ```
 
-**`ctrl-w` and `ctrl-s` flip back and forward** through your open sessions,
-wrapping, from either side of the divider. **`ctrl-shift-←/→`** and
-`ctrl-shift-↑/↓` do the same thing, and so does `shift-option` with an arrow.
+**`ctrl-w` and `ctrl-s` walk the panel's list**, back and forward, from either
+side of the divider. **`ctrl-shift-←/→`** and `ctrl-shift-↑/↓` do the same
+thing, and so does `shift-option` with an arrow.
+
+They step through **the rows you can see**, in the order you see them, with
+your shell at the head of the list — not through the panes that happen to be
+open. Landing on a session opens it if it has no pane yet, so every row is one
+press away rather than three, and the panel's cursor moves with you so the
+highlight always says where you are.
 
 Both, on purpose. Savras reads raw bytes, so it can accept every encoding of
 the same intent at once: the control keys reach it in *any* terminal, the
@@ -131,11 +137,10 @@ to detect and nothing to configure — a chord your terminal cannot send simply
 never arrives, and the control keys are still there.
 
 Ctrl-W costs you something and it is worth knowing: it is delete-previous-word
-in a shell and in Claude Code's input, and Savras takes it. Two things soften
-that. It is only taken once you have a **second tab open** — until then it
-reaches your shell like any other key — and `--switch <back><forward>` moves
-both keys (`svr --switch ou` for ctrl-o and ctrl-u), `--switch <letter>` binds
-one key that wraps forward, `--switch off` hands them back for good.
+in a shell and in Claude Code's input, and Savras takes it whenever there is a
+session to flip to — which, in practice, is always. `--switch <back><forward>`
+moves both keys (`svr --switch ou` for ctrl-o and ctrl-u), `--switch <letter>`
+binds one key that wraps forward, and `--switch off` hands them back for good.
 
 Ctrl-S is free despite its reputation: the flow control that freezes a terminal
 is turned off by raw mode, which Savras is already in. Left/right is the muscle memory your terminal

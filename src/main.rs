@@ -70,7 +70,7 @@ examples:
 
 keys, with the panel focused:
   ctrl-g     move the keyboard between your work and the panel
-  ctrl-w/s   flip back and forward through your open sessions,
+  ctrl-w/s   walk the panel's list, opening each session as you land,
              as do ctrl-shift-arrows where the terminal sends them
   ↑/↓, k/j   move        enter   open the selected session
   g/G        first/last  esc, q  back to your work

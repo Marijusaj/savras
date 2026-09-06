@@ -360,7 +360,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint) {
         (None, Hint::Background) => Span::styled(
             truncate(
                 &match app.switch_hint() {
-                    Some(keys) => format!("ctrl-g focus · {keys} tabs"),
+                    Some(keys) => format!("ctrl-g focus · {keys} sessions"),
                     None => "ctrl-g to focus".to_string(),
                 },
                 area.width as usize,
@@ -569,7 +569,6 @@ mod tests {
     fn the_switch_key_is_offered_only_once_it_would_go_somewhere() {
         // Advertising a key that does nothing is worse than advertising none:
         // you press it, nothing happens, and you conclude it is broken.
-        let fixture = three_jobs();
         let render_background = |app: &mut App| {
             let mut terminal = Terminal::new(TestBackend::new(44, 24)).unwrap();
             terminal
@@ -593,16 +592,22 @@ mod tests {
                 .join("\n")
         };
 
-        let mut app = App::new(fixture.0.clone());
+        // An empty panel: nowhere to flip to, so the keys belong to the shell
+        // and are not advertised.
+        let empty = Fixture::new("ui-switch-empty");
+        let mut app = App::new(empty.0.clone());
         app.set_switch(Some("ctrl-w/s".into()));
         assert!(
             !render_background(&mut app).contains("ctrl-w/s"),
-            "with one pane there is no second tab to flip to"
+            "with no sessions at all there is nowhere to flip to"
         );
 
-        app.set_tabs(Some("aaa"), vec!["aaa".into(), "bbb".into()]);
+        // One session is already somewhere to go — you need never have opened
+        // a pane, because flipping walks the panel's rows, not your panes.
+        let mut app = App::new(three_jobs().0.clone());
+        app.set_switch(Some("ctrl-w/s".into()));
         let text = render_background(&mut app);
-        assert!(text.contains("ctrl-w/s tabs"), "{text}");
+        assert!(text.contains("ctrl-w/s sessions"), "{text}");
     }
 
     #[test]

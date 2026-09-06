@@ -114,11 +114,18 @@ configuration — an encoding a terminal cannot send simply never arrives.
 Deliberately not accepted: `;2` (plain shift) and `;5` (plain ctrl) are
 selection and word-movement in the program running in the pane.
 
+The cycle is **the panel's own list**, with the shell at the head of it, and
+landing on a session opens it if it has no pane yet. The first cut cycled the
+panes that happened to be alive, which with one session opened meant flipping
+between an empty shell and that one session while five more rows sat there
+untouched — a hidden set instead of the rows on screen. The panel's cursor
+moves with you, so the highlight says where you are.
+
 W and S because they sit under the left hand where ctrl already is, and up/down
 reads the way the panel's list runs. The cost is real and named rather than
-hidden: ctrl-w is delete-previous-word. It is only taken once a second tab
-exists, so a shell that has never opened one keeps it, and `--switch` moves
-both keys — two letters for back and forward, one for a single key that wraps,
+hidden: ctrl-w is delete-previous-word. It is taken whenever the panel has a session to
+flip to, which is nearly always — the price of every row being one press away.
+`--switch` moves both keys — two letters for back and forward, one for a single key that wraps,
 `off` to hand them back. It refuses letters that are already enter, tab,
 backspace, the signals, or Savras's own ctrl-g and ctrl-l, and refuses binding
 one letter to both directions.

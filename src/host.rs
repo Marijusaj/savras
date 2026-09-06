@@ -24,6 +24,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::App;
 use crate::focus;
+use crate::job::Snapshot;
 use crate::ping::Ping;
 use crate::ui::{self, Hint};
 use crate::watch::Watch;
@@ -49,10 +50,11 @@ const REPAINT: u8 = 0x0c; // Ctrl-L
 /// is, and up/down reads the way the panel's list runs.
 ///
 /// The cost, stated plainly: Ctrl-W is delete-previous-word in a shell and in
-/// Claude Code's input, and Savras takes it once you have a second tab open.
-/// `--switch` moves both keys, and `--switch off` gives them back. Ctrl-S is
-/// free despite its reputation: the flow control that freezes a terminal is
-/// turned off by raw mode, which Savras is already in.
+/// Claude Code's input, and Savras takes it whenever the panel has a session
+/// to flip to — which is nearly always. `--switch` moves both keys, and
+/// `--switch off` gives them back. Ctrl-S is free despite its reputation: the
+/// flow control that freezes a terminal is turned off by raw mode, which
+/// Savras is already in.
 pub const SWITCH_BACK: u8 = 0x17; // Ctrl-W
 pub const SWITCH_FORWARD: u8 = 0x13; // Ctrl-S
 
@@ -320,18 +322,6 @@ impl Tabs {
             .position(|t| t.short.as_deref() == Some(short))
     }
 
-    /// Move `delta` tabs along, wrapping. Wrapping is what a terminal's own tab
-    /// keys do, and with two tabs open — the common case — it is the whole
-    /// feature: one chord flips between them.
-    fn cycle(&mut self, delta: isize) -> bool {
-        if self.open.len() < 2 {
-            return false;
-        }
-        let n = self.open.len() as isize;
-        self.current = (((self.current as isize + delta) % n + n) % n) as usize;
-        true
-    }
-
     fn go_to(&mut self, index: usize) {
         if index < self.open.len() {
             self.current = index;
@@ -512,7 +502,7 @@ fn event_loop(
                 let was_confirming = confirming;
                 let action = if bytes.is_empty() {
                     Action::Nothing // nothing but a focus event
-                } else if let Some(delta) = switch(&bytes, session.switch, session.tabs.open.len())
+                } else if let Some(delta) = switch(&bytes, session.switch, !app.snapshot.is_empty())
                 {
                     // Flipping tabs works from either side, and without going
                     // through the panel: it is the one thing you do often
@@ -534,12 +524,39 @@ fn event_loop(
                     Action::ConfirmQuit => confirming = true,
                     Action::Focus(next) => focus = next,
                     Action::Cycle(delta) => {
-                        if session.tabs.cycle(delta) {
-                            // A tab you have flipped to is a tab you have been
-                            // to, whatever it was asking.
-                            attend_front(&mut session, &mut app);
-                            focus = Focus::Work;
-                            terminal.clear()?;
+                        let stop = neighbour(&app.snapshot, session.tabs.short(), delta);
+                        let moved = match stop {
+                            // Back to the shell you started in, which is
+                            // always the tab Savras opened with.
+                            Some(Stop::Shell) => {
+                                let home = session
+                                    .tabs
+                                    .open
+                                    .iter()
+                                    .position(|pane| pane.short.is_none());
+                                match home {
+                                    Some(index) => {
+                                        session.tabs.go_to(index);
+                                        Ok(true)
+                                    }
+                                    None => Ok(false),
+                                }
+                            }
+                            Some(Stop::Session(short)) => {
+                                open_short(&mut session, &mut app, &short)
+                            }
+                            None => Ok(false),
+                        };
+                        match moved {
+                            Ok(true) => {
+                                // A session you have flipped to is one you have
+                                // been to, whatever it was asking.
+                                attend_front(&mut session, &mut app);
+                                focus = Focus::Work;
+                                terminal.clear()?;
+                            }
+                            Ok(false) => {}
+                            Err(e) => app.error = Some(format!("could not open: {e}")),
                         }
                     }
                     Action::AddAgent => start_agent(&mut app, &starting),
@@ -646,17 +663,25 @@ fn watching(focused: bool, open: Option<&str>) -> Option<&str> {
 /// and it must *not* start a second copy — that is how you end up attached to
 /// one session twice and reading the wrong one.
 fn open_selected(session: &mut Session, app: &mut App) -> Result<bool> {
-    let Some(job) = app.selected_job() else {
+    let Some(short) = app.selected_job().map(|job| job.short.clone()) else {
         return Ok(false);
     };
-    let short = job.short.clone();
+    open_short(session, app, &short)
+}
 
-    if let Some(index) = session.tabs.position(&short) {
+/// Bring a session to the front by id, opening it if it has no pane yet.
+fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool> {
+    if let Some(index) = session.tabs.position(short) {
         session.tabs.go_to(index);
-        app.attend_to(&short);
+        app.attend_to(short);
+        app.select(short);
         return Ok(true);
     }
 
+    let Some(job) = app.snapshot.jobs.iter().find(|j| j.short == short) else {
+        return Ok(false);
+    };
+    let short = short.to_string();
     let (command, cwd) = resume(job);
     let (cols, rows) = session.work_size();
     // Spawn before touching the tab list, so a failure changes nothing.
@@ -669,7 +694,42 @@ fn open_selected(session: &mut Session, app: &mut App) -> Result<bool> {
     // Going to a session is the clearest possible way of saying you saw which
     // one it was.
     app.attend_to(&short);
+    app.select(&short);
     Ok(true)
+}
+
+/// Where one press of a switch key lands.
+#[derive(Debug, PartialEq, Eq)]
+enum Stop {
+    /// The shell Savras started with, which sits in front of the first session.
+    Shell,
+    Session(String),
+}
+
+/// The stop one step from where you are, in the order the panel shows.
+///
+/// The cycle is the panel's own list, with your shell at the head of it. That
+/// is the whole correction over the first cut, which cycled the *panes that
+/// happened to be alive*: flipping has to walk the rows you can see, or it
+/// takes you somewhere the screen never mentioned — an empty shell and the one
+/// session you had opened, while five more sat in the list untouched.
+///
+/// Landing on a session opens it if it has no pane yet, so every row is one
+/// press away rather than three.
+fn neighbour(snapshot: &Snapshot, front: Option<&str>, delta: isize) -> Option<Stop> {
+    if snapshot.jobs.is_empty() {
+        return None;
+    }
+    // The shell is stop zero; the sessions follow it in display order.
+    let stops = snapshot.jobs.len() as isize + 1;
+    let here = front
+        .and_then(|short| snapshot.jobs.iter().position(|j| j.short == short))
+        .map_or(0, |i| i as isize + 1);
+    let next = ((here + delta) % stops + stops) % stops;
+    Some(match next {
+        0 => Stop::Shell,
+        i => Stop::Session(snapshot.jobs[i as usize - 1].short.clone()),
+    })
 }
 
 /// Run the front tab's session again, in place, after it exited.
@@ -747,11 +807,11 @@ fn dead_pane_key(bytes: &[u8]) -> Action {
 /// only reaches us in terminals that encode modifiers on arrows; Terminal.app
 /// does not, so it cannot be the only way in.
 ///
-/// `open` is how many tabs there are. With one, there is nowhere to flip to,
-/// and the key is handed to the child instead: until you actually have tabs,
-/// Ctrl-O is your shell's again.
-fn switch(bytes: &[u8], keys: Switch, open: usize) -> Option<isize> {
-    if open < 2 {
+/// `somewhere_to_go` is whether there is any session to flip to at all. With
+/// none, the keys are handed to the child instead — a panel showing nothing
+/// has no business taking ctrl-w from your shell.
+fn switch(bytes: &[u8], keys: Switch, somewhere_to_go: bool) -> Option<isize> {
+    if !somewhere_to_go {
         return None;
     }
     if keys.back.is_some_and(|k| bytes.contains(&k)) {
@@ -1295,31 +1355,31 @@ mod tests {
         // which is the whole reason these exist: Terminal.app sends
         // ctrl-shift-arrows as plain arrows, so a chord cannot reach us there.
         let keys = Switch::default();
-        assert_eq!(switch(&[SWITCH_BACK], keys, 2), Some(-1));
-        assert_eq!(switch(&[SWITCH_FORWARD], keys, 2), Some(1));
+        assert_eq!(switch(&[SWITCH_BACK], keys, true), Some(-1));
+        assert_eq!(switch(&[SWITCH_FORWARD], keys, true), Some(1));
         // Typing that arrives in the same read as the key still counts.
-        assert_eq!(switch(b"\x13ls\r", keys, 3), Some(1));
+        assert_eq!(switch(b"\x13ls\r", keys, true), Some(1));
         // Other letters, from `--switch`.
         let moved = Switch {
             back: Some(0x0f),
             forward: Some(0x15),
         };
-        assert_eq!(switch(&[SWITCH_BACK], moved, 2), None);
-        assert_eq!(switch(&[0x0f], moved, 2), Some(-1));
-        assert_eq!(switch(&[0x15], moved, 2), Some(1));
+        assert_eq!(switch(&[SWITCH_BACK], moved, true), None);
+        assert_eq!(switch(&[0x0f], moved, true), Some(-1));
+        assert_eq!(switch(&[0x15], moved, true), Some(1));
     }
 
     #[test]
-    fn the_switch_keys_are_the_childs_until_there_is_a_second_tab() {
-        // Ctrl-W is delete-previous-word. Taking it from a shell that has
-        // never opened a second pane would be taking it for nothing.
+    fn the_switch_keys_are_the_childs_when_there_is_nowhere_to_go() {
+        // Ctrl-W is delete-previous-word. A panel showing no sessions at all
+        // has no business taking it from your shell.
         let keys = Switch::default();
-        assert_eq!(switch(&[SWITCH_BACK], keys, 1), None);
-        assert_eq!(switch(&[SWITCH_FORWARD], keys, 0), None);
+        assert_eq!(switch(&[SWITCH_BACK], keys, false), None);
+        assert_eq!(switch(&[SWITCH_FORWARD], keys, false), None);
         // ...and `--switch off` never takes them at all.
-        assert_eq!(switch(&[SWITCH_BACK], Switch::OFF, 4), None);
+        assert_eq!(switch(&[SWITCH_BACK], Switch::OFF, true), None);
         // The arrow chord is still read when it arrives.
-        assert_eq!(switch(b"\x1b[1;6D", Switch::OFF, 4), Some(-1));
+        assert_eq!(switch(b"\x1b[1;6D", Switch::OFF, true), Some(-1));
     }
 
     #[test]
@@ -1353,24 +1413,69 @@ mod tests {
         }
     }
 
-    #[test]
-    fn flipping_tabs_wraps_in_both_directions() {
-        let mut tabs = three_tabs();
-        assert_eq!(tabs.current, 2, "a new tab comes to the front");
+    fn three_sessions() -> Fixture {
+        Fixture::new("host-neighbour")
+            .job("aaa", r#"{"state":"working","name":"A"}"#)
+            .job("bbb", r#"{"state":"working","name":"B"}"#)
+            .job("ccc", r#"{"state":"working","name":"C"}"#)
+    }
 
-        assert!(tabs.cycle(1));
-        assert_eq!(tabs.current, 0, "forward from the last is the first");
-        assert!(tabs.cycle(-1));
-        assert_eq!(tabs.current, 2, "back from the first is the last");
-        assert!(tabs.cycle(-1));
-        assert_eq!(tabs.current, 1);
+    /// The panel's own order, which is what flipping has to follow.
+    fn order(app: &App) -> Vec<String> {
+        app.snapshot.jobs.iter().map(|j| j.short.clone()).collect()
     }
 
     #[test]
-    fn one_tab_has_nowhere_to_flip_to() {
-        let mut tabs = Tabs::new(pane(None).work);
-        assert!(!tabs.cycle(1), "with one tab the chord must do nothing");
-        assert_eq!(tabs.current, 0);
+    fn flipping_walks_the_rows_the_panel_shows() {
+        // The first cut cycled the panes that happened to be alive, which with
+        // one session opened meant flipping between an empty shell and that
+        // one session while every other row sat there untouched.
+        let f = three_sessions();
+        let app = App::new(f.0.clone());
+        let rows = order(&app);
+        let snap = &app.snapshot;
+
+        // From the shell, forward is the first row on screen.
+        assert_eq!(
+            neighbour(snap, None, 1),
+            Some(Stop::Session(rows[0].clone()))
+        );
+        // ...and on through the list, in the order you can see.
+        assert_eq!(
+            neighbour(snap, Some(&rows[0]), 1),
+            Some(Stop::Session(rows[1].clone()))
+        );
+        assert_eq!(
+            neighbour(snap, Some(&rows[1]), -1),
+            Some(Stop::Session(rows[0].clone()))
+        );
+    }
+
+    #[test]
+    fn the_shell_sits_at_the_head_of_the_cycle() {
+        // It must stay reachable: it is where you started, and often where the
+        // command you actually wanted to run lives.
+        let f = three_sessions();
+        let app = App::new(f.0.clone());
+        let rows = order(&app);
+        let snap = &app.snapshot;
+
+        assert_eq!(neighbour(snap, Some(&rows[0]), -1), Some(Stop::Shell));
+        // Wrapping the other way: past the last session is the shell again.
+        assert_eq!(neighbour(snap, Some(&rows[2]), 1), Some(Stop::Shell));
+        assert_eq!(
+            neighbour(snap, None, -1),
+            Some(Stop::Session(rows[2].clone()))
+        );
+    }
+
+    #[test]
+    fn with_no_sessions_there_is_nowhere_to_flip() {
+        let f = Fixture::new("host-nowhere");
+        let app = App::new(f.0.clone());
+        assert_eq!(neighbour(&app.snapshot, None, 1), None);
+        // ...and the keys are left to the child rather than swallowed.
+        assert_eq!(switch(&[SWITCH_BACK], Switch::default(), false), None);
     }
 
     #[test]
