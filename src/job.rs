@@ -176,14 +176,17 @@ pub fn load(jobs_dir: &Path) -> Result<Snapshot> {
         }
     }
 
-    // Group first, then freshest within each group: the rows most likely to
-    // need you are the ones nearest the top.
-    jobs.sort_by(|a, b| {
-        a.status
-            .cmp(&b.status)
-            .then(b.updated_at.cmp(&a.updated_at))
-            .then(a.name.cmp(&b.name))
-    });
+    // Group first — the rows most likely to need you are nearest the top —
+    // then by name, which does not move.
+    //
+    // Freshest-first was the original second key and it had to go. A working
+    // session rewrites its timestamp every few seconds, so rows swapped places
+    // while you were looking at them: pressing the switch key twice landed
+    // somewhere different each time, and the panel could not be navigated by
+    // muscle memory at all. A name is the one thing about a session that
+    // stands still, so the list only moves when a session changes *status* —
+    // which is a change worth seeing.
+    jobs.sort_by(|a, b| a.status.cmp(&b.status).then(a.name.cmp(&b.name)));
 
     Ok(Snapshot { jobs })
 }
@@ -304,6 +307,54 @@ mod tests {
     use super::*;
 
     use crate::testing::Fixture;
+
+    #[test]
+    fn the_order_does_not_move_when_a_session_merely_works() {
+        // The list is navigated, not just read: the switch keys walk it, and
+        // rows that reshuffle every few seconds make that a lottery. Only a
+        // change of *status* may move a row.
+        let f = Fixture::new("job-stable")
+            .job(
+                "a",
+                r#"{"state":"working","name":"ZEBRA","updatedAt":"2026-01-01T00:00:00Z"}"#,
+            )
+            .job(
+                "b",
+                r#"{"state":"working","name":"ALPHA","updatedAt":"2020-01-01T00:00:00Z"}"#,
+            );
+
+        let names =
+            |s: &Snapshot| -> Vec<String> { s.jobs.iter().map(|j| j.name.clone()).collect() };
+        assert_eq!(names(&load(&f.0).unwrap()), ["ALPHA", "ZEBRA"]);
+
+        // ZEBRA does some work and rewrites its timestamp. The order must not
+        // care: freshest-first is what made the panel shuffle underfoot.
+        std::fs::write(
+            f.0.join("b").join("state.json"),
+            r#"{"state":"working","name":"ALPHA","updatedAt":"2030-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        assert_eq!(names(&load(&f.0).unwrap()), ["ALPHA", "ZEBRA"]);
+    }
+
+    #[test]
+    fn a_change_of_status_is_the_one_thing_that_moves_a_row() {
+        let f = Fixture::new("job-status-moves")
+            .job("a", r#"{"state":"working","name":"ALPHA"}"#)
+            .job("b", r#"{"state":"working","name":"BETA"}"#);
+        let names =
+            |s: &Snapshot| -> Vec<String> { s.jobs.iter().map(|j| j.name.clone()).collect() };
+        assert_eq!(names(&load(&f.0).unwrap()), ["ALPHA", "BETA"]);
+
+        // BETA starts asking, and asking sorts above working — a move you
+        // want to see, unlike a timestamp ticking.
+        std::fs::write(
+            f.0.join("b").join("state.json"),
+            r#"{"state":"working","name":"BETA","needs":"answer: which?"}"#,
+        )
+        .unwrap();
+        assert_eq!(names(&load(&f.0).unwrap()), ["BETA", "ALPHA"]);
+    }
 
     #[test]
     fn groups_by_needs_then_state() {

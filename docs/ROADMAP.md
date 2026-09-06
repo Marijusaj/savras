@@ -115,7 +115,17 @@ Deliberately not accepted: `;2` (plain shift) and `;5` (plain ctrl) are
 selection and word-movement in the program running in the pane.
 
 The cycle is **the panel's own list**, with the shell at the head of it, and
-landing on a session opens it if it has no pane yet. The first cut cycled the
+landing on a session opens it if it has no pane yet.
+
+Which forced a second correction, because a list you *navigate* has a
+requirement a list you only read does not: it must hold still. Rows were sorted
+freshest-first inside each status group, and a working session rewrites its
+timestamp every few seconds, so rows traded places while you were looking at
+them and the switch keys became a lottery — press twice, land somewhere else.
+Sorting by name inside the group fixes it: the list now moves only when a
+session changes status. The header also carries the name of the session in the
+pane, since Claude Code draws its own name only sometimes and the panel always
+knows. The first cut cycled the
 panes that happened to be alive, which with one session opened meant flipping
 between an empty shell and that one session while five more rows sat there
 untouched — a hidden set instead of the rows on screen. The panel's cursor

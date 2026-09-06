@@ -97,6 +97,18 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::DarkGray),
         ),
     ];
+    // Which session is in the pane beside this panel. It goes first, in the
+    // session's own colour, because "which one am I typing into" is the
+    // question you ask most often and the pane itself does not reliably say.
+    if let Some(name) = app.front_name() {
+        title.push(Span::raw("  "));
+        title.push(Span::styled(
+            format!("▶ {name}"),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
     // What the ping was about, held on screen until you go to it: a sound you
     // half-heard from another room is no use without the name.
     if app.alert_count() > 0 {
@@ -491,6 +503,31 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn the_header_says_which_session_the_pane_is_showing() {
+        // Claude Code does not reliably draw its own name where you can see
+        // it, so a pane full of output looks like any other pane. The panel
+        // always knows which session it is, so it always says.
+        let fixture = three_jobs();
+        let mut app = App::new(fixture.0.clone());
+        app.set_tabs(Some("bbb"), vec!["aaa".into(), "bbb".into()]);
+        let mut terminal = Terminal::new(TestBackend::new(44, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let header: String = (0..44)
+            .map(|x| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((x, 0))
+                    .unwrap()
+                    .symbol()
+                    .to_string()
+            })
+            .collect();
+
+        assert!(header.contains("▶ ROADMAP"), "header was: {header}");
     }
 
     #[test]

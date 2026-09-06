@@ -125,10 +125,21 @@ side of the divider. **`ctrl-shift-←/→`** and `ctrl-shift-↑/↓` do the sa
 thing, and so does `shift-option` with an arrow.
 
 They step through **the rows you can see**, in the order you see them, with
-your shell at the head of the list — not through the panes that happen to be
-open. Landing on a session opens it if it has no pane yet, so every row is one
-press away rather than three, and the panel's cursor moves with you so the
-highlight always says where you are.
+your shell at the head of the list. Landing on a session opens it if it has no
+pane yet, so every row is one press away rather than three, and the panel's
+cursor moves with you so the highlight always says where you are.
+
+**The order holds still.** Rows are grouped by status and then sorted by name,
+never by how recently a session did something. Freshest-first was the first cut
+and it made the panel unnavigable: a working session rewrites its timestamp
+every few seconds, so rows swapped places under your fingers and pressing the
+key twice landed somewhere different each time. A name is the one thing about a
+session that stands still, so the list now only moves when a session changes
+*status* — which is a change you want to see.
+
+**The header says which session you are in**, by name, next to the title. The
+pane itself does not reliably say — Claude Code draws its own name only
+sometimes — and the panel always knows.
 
 Both, on purpose. Savras reads raw bytes, so it can accept every encoding of
 the same intent at once: the control keys reach it in *any* terminal, the

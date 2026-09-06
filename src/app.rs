@@ -106,6 +106,21 @@ impl App {
         self.switch_label.as_deref()
     }
 
+    /// The name of the session in the working pane, for the header to carry.
+    ///
+    /// Claude Code does not always draw its own name where you can see it, and
+    /// a pane full of somebody else's output looks much like any other. The
+    /// panel is the one place that always knows, so it is the one place that
+    /// should always say.
+    pub fn front_name(&self) -> Option<&str> {
+        let short = self.front.as_deref()?;
+        self.snapshot
+            .jobs
+            .iter()
+            .find(|j| j.short == short)
+            .map(|j| j.name.as_str())
+    }
+
     pub fn tab(&self, job: &Job) -> Tab {
         if self.front.as_deref() == Some(job.short.as_str()) {
             Tab::Front
