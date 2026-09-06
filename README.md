@@ -120,35 +120,45 @@ Needs input
 ✳ ROADMAP     58 tier-A items…                 3d   ← not open
 ```
 
-**`ctrl-o` flips to the next tab**, wrapping, from either side of the divider.
-A control byte, because that is the only kind of key every terminal delivers
-unchanged. It is taken only once you have a second tab open — until then it
-reaches your shell like any other key — and `--switch <letter>` moves it,
-`--switch off` gives it back for good.
+**`ctrl-w` and `ctrl-s` flip back and forward** through your open sessions,
+wrapping, from either side of the divider. **`ctrl-shift-←/→`** and
+`ctrl-shift-↑/↓` do the same thing, and so does `shift-option` with an arrow.
 
-One key, so it only goes forward. With two tabs open, which is the usual
-number, forward and back are the same place.
+Both, on purpose. Savras reads raw bytes, so it can accept every encoding of
+the same intent at once: the control keys reach it in *any* terminal, the
+chords reach it in the ones that encode modifiers on arrows. There is nothing
+to detect and nothing to configure — a chord your terminal cannot send simply
+never arrives, and the control keys are still there.
 
-`shift-option-←/→` or `shift-option-↑/↓` also flips, in either direction, in
-terminals that encode modifiers on arrow keys. Left/right is the muscle memory your terminal
+Ctrl-W costs you something and it is worth knowing: it is delete-previous-word
+in a shell and in Claude Code's input, and Savras takes it. Two things soften
+that. It is only taken once you have a **second tab open** — until then it
+reaches your shell like any other key — and `--switch <back><forward>` moves
+both keys (`svr --switch ou` for ctrl-o and ctrl-u), `--switch <letter>` binds
+one key that wraps forward, `--switch off` hands them back for good.
+
+Ctrl-S is free despite its reputation: the flow control that freezes a terminal
+is turned off by raw mode, which Savras is already in. Left/right is the muscle memory your terminal
 already trained; up/down matches the panel's own list. `enter` on a session you
 already have open brings that tab forward rather than attaching to it twice.
 `x` in the panel closes the selected session's tab, and `q` closes a tab whose
 session has exited.
 
-**Terminal.app is why `ctrl-o` exists.** It does not encode modifiers on arrow
-keys at all: shift-option-↑ arrives as a plain up-arrow, indistinguishable from
-the one your session wants, so Savras cannot act on it without eating the arrow
-keys entirely. `ctrl-o` works there and everywhere. If you would rather have
-the two-directional chord in Terminal.app, go to **Settings → Profiles →
-Keyboard**, press **+** four times and add:
+**Terminal.app is why the control keys exist.** It does not encode modifiers on
+arrow keys at all: `ctrl-shift-←` arrives there as a bare `ESC [ D`, identical
+to the plain left-arrow your session wants, so no program running inside it can
+tell the two apart — this is a limit of that terminal, not of Savras, and no
+protocol fixes it because the modifier never enters the byte stream. Ctrl-W and
+Ctrl-S work there and everywhere. If you would rather have the arrows in
+Terminal.app, go to **Settings → Profiles → Keyboard**, press **+** four times
+and add:
 
 | Key | Modifier | Action | Send text |
 |-----|----------|--------|-----------|
-| ↑ | Shift, Option | Send Text | `\033[1;4A` |
-| ↓ | Shift, Option | Send Text | `\033[1;4B` |
-| → | Shift, Option | Send Text | `\033[1;4C` |
-| ← | Shift, Option | Send Text | `\033[1;4D` |
+| ↑ | Control, Shift | Send Text | `\033[1;6A` |
+| ↓ | Control, Shift | Send Text | `\033[1;6B` |
+| → | Control, Shift | Send Text | `\033[1;6C` |
+| ← | Control, Shift | Send Text | `\033[1;6D` |
 
 Type the `\033` by pressing the **esc** key in that field; it shows as `\033`.
 
@@ -304,7 +314,7 @@ svr solo               just the panel, with no working pane
 svr --ping <when>      ping on needs (the default), done, or off
 svr --no-sound         notify without a sound
 svr --quiet <seconds>  silence after a ping; news is held, not lost (default 20)
-svr --switch <letter>  ctrl-<letter> flips to the next tab (default o), or off
+svr --switch <keys>    ctrl-<back><forward> flips tabs (default ws), or off
 svr --once             print the current sessions as plain text and exit
 svr --jobs-dir <path>  read jobs from somewhere other than ~/.claude/jobs
 ```

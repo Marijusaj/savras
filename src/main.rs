@@ -30,7 +30,7 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 
 use app::App;
-use host::Side;
+use host::{Side, Switch};
 use ping::{Ping, When};
 use watch::Watch;
 
@@ -55,7 +55,7 @@ options:
   --ping <when>       ping on needs (default), done, or off
   --no-sound          notify without a sound
   --quiet <seconds>   silence after a ping, news held until it ends (default 20)
-  --switch <letter>   ctrl-<letter> flips to the next tab (default o), or off
+  --switch <keys>     ctrl-<back><forward> flips tabs (default ws), or off
   --once              print the current sessions as plain text and exit
   --jobs-dir <path>   read jobs from somewhere other than ~/.claude/jobs
   -h, --help          show this help
@@ -70,7 +70,8 @@ examples:
 
 keys, with the panel focused:
   ctrl-g     move the keyboard between your work and the panel
-  ctrl-o     flip to the next open session (see --switch)
+  ctrl-w/s   flip back and forward through your open sessions,
+             as do ctrl-shift-arrows where the terminal sends them
   ↑/↓, k/j   move        enter   open the selected session
   g/G        first/last  esc, q  back to your work
   x          close the selected session's tab
@@ -116,8 +117,8 @@ struct Options {
     ping: When,
     sound: bool,
     quiet: Duration,
-    /// The control byte that flips to the next tab; `None` disables it.
-    switch: Option<u8>,
+    /// The keys that flip between tabs.
+    switch: Switch,
 }
 
 fn main() -> Result<()> {
@@ -162,19 +163,49 @@ fn main() -> Result<()> {
     }
 }
 
-/// `--switch o` means Ctrl-O, and `--switch off` means give the key back.
+/// `--switch ws` is Ctrl-W back and Ctrl-S forward, `--switch o` is one key
+/// that wraps forward, and `--switch off` hands both back to the child.
 ///
-/// A control byte, not a chord: control bytes are the only keys every terminal
-/// delivers unchanged, which is the whole reason this option exists.
-fn parse_switch(raw: &str) -> Result<Option<u8>> {
+/// Control bytes, not chords: they are the only keys every terminal delivers
+/// unchanged, which is the whole reason this option exists.
+fn parse_switch(raw: &str) -> Result<Switch> {
     if raw == "off" || raw == "none" {
-        return Ok(None);
+        return Ok(Switch::OFF);
     }
-    let mut letters = raw.chars();
-    let letter = match (letters.next(), letters.next()) {
-        (Some(c), None) if c.is_ascii_alphabetic() => c.to_ascii_lowercase(),
-        _ => anyhow::bail!("--switch takes a single letter or off, not {raw}"),
-    };
+    let letters: Vec<char> = raw.chars().collect();
+    match letters.as_slice() {
+        // Two letters are back and forward, in that order — `ws` is the
+        // default written out.
+        [back, forward] => {
+            let (back, forward) = (control(*back)?, control(*forward)?);
+            if back == forward {
+                anyhow::bail!(
+                    "--switch {raw} binds one key to both directions; \
+                     use a single letter if you want one key that wraps forward"
+                );
+            }
+            Ok(Switch {
+                back: Some(back),
+                forward: Some(forward),
+            })
+        }
+        // One letter only goes forward, and wraps. With two tabs open, which
+        // is the usual number, forward and back are the same place anyway.
+        [only] => Ok(Switch {
+            back: None,
+            forward: Some(control(*only)?),
+        }),
+        _ => anyhow::bail!("--switch takes one or two letters, or off, not {raw}"),
+    }
+}
+
+/// The control byte a letter makes, refusing the ones that are already
+/// something else.
+fn control(letter: char) -> Result<u8> {
+    if !letter.is_ascii_alphabetic() {
+        anyhow::bail!("--switch takes letters, not {letter}");
+    }
+    let letter = letter.to_ascii_lowercase();
     // Letters whose control byte is already something else entirely: g and l
     // are Savras's own keys, and the rest are enter, tab, backspace and the
     // signals, none of which can be handed to anything.
@@ -191,7 +222,7 @@ fn parse_switch(raw: &str) -> Result<Option<u8>> {
         anyhow::bail!("--switch {letter} is {what}; pick another letter");
     }
     // Ctrl-<letter> is the letter with its top three bits cleared.
-    Ok(Some(letter.to_ascii_uppercase() as u8 & 0x1f))
+    Ok(letter.to_ascii_uppercase() as u8 & 0x1f)
 }
 
 fn jobs_dir(explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -212,7 +243,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
         ping: When::default(),
         sound: true,
         quiet: ping::QUIET,
-        switch: Some(host::SWITCH),
+        switch: Switch::default(),
     };
     let mut width = panel::DEFAULT_WIDTH;
     let mut command = Vec::new();
@@ -549,11 +580,30 @@ mod tests {
     }
 
     #[test]
-    fn the_switch_key_can_be_moved_or_given_back() {
-        assert_eq!(parse_ok(&[]).switch, Some(host::SWITCH));
-        assert_eq!(parse_ok(&["--switch", "u"]).switch, Some(0x15));
-        assert_eq!(parse_ok(&["--switch", "U"]).switch, Some(0x15));
-        assert_eq!(parse_ok(&["--switch", "off"]).switch, None);
+    fn the_switch_keys_can_be_moved_or_given_back() {
+        assert_eq!(parse_ok(&[]).switch, Switch::default());
+        assert_eq!(
+            parse_ok(&["--switch", "ws"]).switch,
+            Switch::default(),
+            "the default, written out"
+        );
+        // Two letters are back and forward, in that order.
+        assert_eq!(
+            parse_ok(&["--switch", "OU"]).switch,
+            Switch {
+                back: Some(0x0f),
+                forward: Some(0x15)
+            }
+        );
+        // One letter only goes forward, and wraps.
+        assert_eq!(
+            parse_ok(&["--switch", "o"]).switch,
+            Switch {
+                back: None,
+                forward: Some(0x0f)
+            }
+        );
+        assert_eq!(parse_ok(&["--switch", "off"]).switch, Switch::OFF);
 
         // Letters whose control byte is already something else say so, rather
         // than silently binding a key that can never arrive.

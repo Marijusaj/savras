@@ -105,13 +105,30 @@ arrows, and **Terminal.app does not**: it sends shift-option-↑ as a plain
 `ESC [ A`, byte-identical to the arrow the session in the pane wants, so the
 first cut did nothing there and spilled `[A[B` across the shell prompt instead.
 
-Hence `ctrl-o`, which is the actual default: a control byte is the only kind of
-key every terminal delivers unchanged. It goes forward only, which two tabs
-makes moot. It is taken only when a second tab exists, so a shell that has
-never opened one keeps the key. `--switch <letter>` moves it and refuses the
-letters that are already enter, tab, backspace, the signals, or Savras's own
-ctrl-g and ctrl-l. Mapping `cmd-shift-←/→` to `\033[1;4D`/`\033[1;4C` in the
-terminal still gets the two-directional feel back for anyone who wants it.
+So both, at once. Savras reads raw bytes, so accepting several encodings of
+one intent costs nothing: `ctrl-w`/`ctrl-s` reach it in any terminal, and
+`ctrl-shift-arrows` (`;6`), shift-option (`;4`) and shift-meta (`;10`) reach it
+wherever the terminal encodes them. No capability negotiation, no
+configuration — an encoding a terminal cannot send simply never arrives.
+
+Deliberately not accepted: `;2` (plain shift) and `;5` (plain ctrl) are
+selection and word-movement in the program running in the pane.
+
+W and S because they sit under the left hand where ctrl already is, and up/down
+reads the way the panel's list runs. The cost is real and named rather than
+hidden: ctrl-w is delete-previous-word. It is only taken once a second tab
+exists, so a shell that has never opened one keeps it, and `--switch` moves
+both keys — two letters for back and forward, one for a single key that wraps,
+`off` to hand them back. It refuses letters that are already enter, tab,
+backspace, the signals, or Savras's own ctrl-g and ctrl-l, and refuses binding
+one letter to both directions.
+
+Evaluated and rejected: the Kitty keyboard protocol (`CSI > 1 u`) and xterm's
+`modifyOtherKeys` (`CSI > 4 ; 2 m`), which let a program ask its terminal for
+richer key data. Terminal.app implements neither, and more fundamentally never
+encodes arrow modifiers in any form — there is no flag to turn on, because the
+information never enters the byte stream. Worth revisiting only if the panel
+ever wants keys that the plain xterm encoding cannot express.
 
 ### M2.3 · Parallel agents
 `a` in the panel starts a parallel agent under the selected session's lead: a

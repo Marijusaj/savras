@@ -38,16 +38,58 @@ const ESC: u8 = 0x1b;
 /// Savras cannot see it happen, so it needs a way to be told to repaint.
 const REPAINT: u8 = 0x0c; // Ctrl-L
 
-/// Flip to the next tab. A control byte, because that is the only kind of key
-/// every terminal delivers unchanged: Terminal.app does not encode modifiers
-/// on arrow keys at all, so `shift-option-↑` arrives there as a plain
-/// `ESC [ A` and cannot be told from the arrow your session wants.
+/// Flipping tabs, one key each way.
 ///
-/// Ctrl-O is the one control key readline and Claude Code both leave alone —
-/// the rest are line editing (`a e k u w`), history (`n p`), search (`r`), or
-/// signals. `--switch` moves it, and it is only ever taken when you have more
-/// than one tab open, so until then it reaches your shell like any other key.
-pub const SWITCH: u8 = 0x0f; // Ctrl-O
+/// Control bytes, because they are the only keys *every* terminal delivers
+/// unchanged. Terminal.app does not encode modifiers on arrow keys at all —
+/// `ctrl-shift-←` arrives there as a bare `ESC [ D`, identical to the arrow
+/// the session in the pane wants — so a chord cannot be the only way in.
+///
+/// W and S because they sit under the left hand where the ctrl key already
+/// is, and up/down reads the way the panel's list runs.
+///
+/// The cost, stated plainly: Ctrl-W is delete-previous-word in a shell and in
+/// Claude Code's input, and Savras takes it once you have a second tab open.
+/// `--switch` moves both keys, and `--switch off` gives them back. Ctrl-S is
+/// free despite its reputation: the flow control that freezes a terminal is
+/// turned off by raw mode, which Savras is already in.
+pub const SWITCH_BACK: u8 = 0x17; // Ctrl-W
+pub const SWITCH_FORWARD: u8 = 0x13; // Ctrl-S
+
+/// The two keys that flip tabs, either of which may be given back to the
+/// child with `--switch off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Switch {
+    pub back: Option<u8>,
+    pub forward: Option<u8>,
+}
+
+impl Default for Switch {
+    fn default() -> Self {
+        Switch {
+            back: Some(SWITCH_BACK),
+            forward: Some(SWITCH_FORWARD),
+        }
+    }
+}
+
+impl Switch {
+    pub const OFF: Switch = Switch {
+        back: None,
+        forward: None,
+    };
+
+    /// How to name these keys in the footer — `ctrl-w/s`, or `ctrl-o` when
+    /// only one of them is bound.
+    fn label(&self) -> Option<String> {
+        let name = |key: u8| ((key | 0x60) as char).to_string();
+        match (self.back, self.forward) {
+            (Some(back), Some(forward)) => Some(format!("ctrl-{}/{}", name(back), name(forward))),
+            (Some(only), None) | (None, Some(only)) => Some(format!("ctrl-{}", name(only))),
+            (None, None) => None,
+        }
+    }
+}
 
 const TICK: Duration = Duration::from_millis(16);
 /// Repaint at least this often even when nothing changed, so ages keep ticking.
@@ -329,7 +371,7 @@ pub fn run(
     side: Side,
     command: Vec<String>,
     jobs_dir: PathBuf,
-    switch: Option<u8>,
+    switch: Switch,
     ping: Ping,
 ) -> Result<()> {
     let (cols, rows) = crossterm::terminal::size().context("reading the terminal size")?;
@@ -376,9 +418,8 @@ struct Session {
     /// front is never pinged for: it is asking you in person, on the other
     /// half of the screen.
     tabs: Tabs,
-    /// The key that flips to the next tab, or `None` when `--switch off`
-    /// hands it back to the child.
-    switch: Option<u8>,
+    /// The keys that flip tabs, or given back to the child by `--switch off`.
+    switch: Switch,
     ping: Ping,
 }
 
@@ -395,11 +436,7 @@ fn event_loop(
     let mut app = App::new(session.jobs_dir.clone());
     // Ctrl-O renders as "ctrl-o": the byte is the letter with its top three
     // bits cleared, so putting them back names the key again.
-    app.set_switch(
-        session
-            .switch
-            .map(|key| format!("ctrl-{}", (key | 0x60) as char)),
-    );
+    app.set_switch(session.switch.label());
     // Starting an agent runs `claude --bg`, which takes long enough that doing
     // it on this thread would visibly stall the panel. The outcome comes back
     // here, since a session that failed to start must say so rather than
@@ -713,31 +750,39 @@ fn dead_pane_key(bytes: &[u8]) -> Action {
 /// `open` is how many tabs there are. With one, there is nowhere to flip to,
 /// and the key is handed to the child instead: until you actually have tabs,
 /// Ctrl-O is your shell's again.
-fn switch(bytes: &[u8], key: Option<u8>, open: usize) -> Option<isize> {
+fn switch(bytes: &[u8], keys: Switch, open: usize) -> Option<isize> {
     if open < 2 {
         return None;
     }
-    if key.is_some_and(|k| bytes.contains(&k)) {
-        // One key, so it wraps forward. With two tabs — the common case —
-        // forward and back are the same place.
+    if keys.back.is_some_and(|k| bytes.contains(&k)) {
+        return Some(-1);
+    }
+    if keys.forward.is_some_and(|k| bytes.contains(&k)) {
         return Some(1);
     }
     tab_chord(bytes)
 }
 
-/// Shift-Option with an arrow: flip one tab back or forward.
+/// A modified arrow: flip one tab back or forward.
 ///
-/// Command chords cannot be used, however much they feel right — Command is
-/// not part of the xterm modifier encoding at all, so the terminal keeps every
-/// one of them for its own tabs and the pty never sees it. Shift-Option does
-/// reach us, where the terminal encodes it. Both axes are accepted: up/down
-/// matches the panel's vertical list, left/right matches the terminal tab keys
-/// the hands already know.
+/// Every terminal that reports modifiers at all uses the same shape,
+/// `ESC [ 1 ; <modifiers> <arrow>`, so accepting several modifier values costs
+/// nothing and means the chord works wherever it can be sent — no capability
+/// negotiation, no configuration. A terminal that cannot send one simply never
+/// sends it, and the control keys are still there.
 ///
-/// `;4` is shift+alt; `;10` is shift+meta, which terminals configured to send
-/// Option as Meta use instead.
+/// The values are xterm's: 1 plus shift(1) + alt(2) + ctrl(4), and +8 again
+/// for meta. So `6` is ctrl-shift, `4` is shift-alt, and `10` is shift-meta,
+/// which terminals set to send Option as Meta use instead of `4`.
+///
+/// Deliberately absent: `2` (plain shift) and `5` (plain ctrl) are selection
+/// and word-movement in the programs running in the pane, and `9`/`13` would
+/// be Command — which no terminal ever sends, since Command is not in this
+/// encoding at all and every terminal keeps those chords for its own tabs.
+const CHORDS: [&[u8]; 3] = [b"6", b"4", b"10"];
+
 fn tab_chord(bytes: &[u8]) -> Option<isize> {
-    for modifiers in [b"4", b"10".as_slice()] {
+    for modifiers in CHORDS {
         for (arrow, delta) in [(b'A', -1), (b'D', -1), (b'B', 1), (b'C', 1)] {
             let mut sequence = vec![ESC, b'[', b'1', b';'];
             sequence.extend_from_slice(modifiers);
@@ -1230,6 +1275,11 @@ mod tests {
     fn the_chord_reaches_us_on_both_axes_and_both_encodings() {
         // Up and left go back, down and right go forward: the panel's list is
         // vertical, and the terminal tab keys people already know are not.
+        // Ctrl-shift, which is what most terminals send for the chord.
+        assert_eq!(tab_chord(b"\x1b[1;6A"), Some(-1));
+        assert_eq!(tab_chord(b"\x1b[1;6D"), Some(-1));
+        assert_eq!(tab_chord(b"\x1b[1;6C"), Some(1));
+        // Shift-option, for terminals that send that instead.
         assert_eq!(tab_chord(b"\x1b[1;4A"), Some(-1));
         assert_eq!(tab_chord(b"\x1b[1;4D"), Some(-1));
         assert_eq!(tab_chord(b"\x1b[1;4B"), Some(1));
@@ -1240,29 +1290,51 @@ mod tests {
     }
 
     #[test]
-    fn the_switch_key_flips_forward_from_any_terminal() {
-        // A control byte is the only kind of key every terminal delivers
-        // unchanged, which is the whole reason this exists: Terminal.app sends
-        // shift-option-arrows as plain arrows, so the chord cannot reach us
-        // there at all.
-        assert_eq!(switch(&[SWITCH], Some(SWITCH), 2), Some(1));
+    fn the_switch_keys_flip_both_ways_from_any_terminal() {
+        // Control bytes are the only keys every terminal delivers unchanged,
+        // which is the whole reason these exist: Terminal.app sends
+        // ctrl-shift-arrows as plain arrows, so a chord cannot reach us there.
+        let keys = Switch::default();
+        assert_eq!(switch(&[SWITCH_BACK], keys, 2), Some(-1));
+        assert_eq!(switch(&[SWITCH_FORWARD], keys, 2), Some(1));
         // Typing that arrives in the same read as the key still counts.
-        assert_eq!(switch(b"\x0fls\r", Some(SWITCH), 3), Some(1));
-        // A different letter, from `--switch`.
-        assert_eq!(switch(&[0x0f], Some(0x15), 2), None);
-        assert_eq!(switch(&[0x15], Some(0x15), 2), Some(1));
+        assert_eq!(switch(b"\x13ls\r", keys, 3), Some(1));
+        // Other letters, from `--switch`.
+        let moved = Switch {
+            back: Some(0x0f),
+            forward: Some(0x15),
+        };
+        assert_eq!(switch(&[SWITCH_BACK], moved, 2), None);
+        assert_eq!(switch(&[0x0f], moved, 2), Some(-1));
+        assert_eq!(switch(&[0x15], moved, 2), Some(1));
     }
 
     #[test]
-    fn the_switch_key_is_the_childs_until_there_is_a_second_tab() {
-        // Stealing ctrl-o from a shell that has only ever had one pane would
-        // be taking a key for a feature that is not in use.
-        assert_eq!(switch(&[SWITCH], Some(SWITCH), 1), None);
-        assert_eq!(switch(&[SWITCH], Some(SWITCH), 0), None);
-        // ...and `--switch off` never takes it at all.
-        assert_eq!(switch(&[SWITCH], None, 4), None);
+    fn the_switch_keys_are_the_childs_until_there_is_a_second_tab() {
+        // Ctrl-W is delete-previous-word. Taking it from a shell that has
+        // never opened a second pane would be taking it for nothing.
+        let keys = Switch::default();
+        assert_eq!(switch(&[SWITCH_BACK], keys, 1), None);
+        assert_eq!(switch(&[SWITCH_FORWARD], keys, 0), None);
+        // ...and `--switch off` never takes them at all.
+        assert_eq!(switch(&[SWITCH_BACK], Switch::OFF, 4), None);
         // The arrow chord is still read when it arrives.
-        assert_eq!(switch(b"\x1b[1;4A", None, 4), Some(-1));
+        assert_eq!(switch(b"\x1b[1;6D", Switch::OFF, 4), Some(-1));
+    }
+
+    #[test]
+    fn the_footer_names_whichever_keys_are_bound() {
+        assert_eq!(Switch::default().label().as_deref(), Some("ctrl-w/s"));
+        assert_eq!(
+            Switch {
+                back: None,
+                forward: Some(0x0f)
+            }
+            .label()
+            .as_deref(),
+            Some("ctrl-o")
+        );
+        assert_eq!(Switch::OFF.label(), None);
     }
 
     #[test]

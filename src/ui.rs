@@ -360,7 +360,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint) {
         (None, Hint::Background) => Span::styled(
             truncate(
                 &match app.switch_hint() {
-                    Some(key) => format!("ctrl-g focus · {key} next tab"),
+                    Some(keys) => format!("ctrl-g focus · {keys} tabs"),
                     None => "ctrl-g to focus".to_string(),
                 },
                 area.width as usize,
@@ -594,15 +594,15 @@ mod tests {
         };
 
         let mut app = App::new(fixture.0.clone());
-        app.set_switch(Some("ctrl-o".into()));
+        app.set_switch(Some("ctrl-w/s".into()));
         assert!(
-            !render_background(&mut app).contains("ctrl-o"),
+            !render_background(&mut app).contains("ctrl-w/s"),
             "with one pane there is no second tab to flip to"
         );
 
         app.set_tabs(Some("aaa"), vec!["aaa".into(), "bbb".into()]);
         let text = render_background(&mut app);
-        assert!(text.contains("ctrl-o next tab"), "{text}");
+        assert!(text.contains("ctrl-w/s tabs"), "{text}");
     }
 
     #[test]
