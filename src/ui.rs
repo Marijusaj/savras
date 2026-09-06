@@ -340,7 +340,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint) {
         ),
         (None, Hint::Focused) => Span::styled(
             truncate(
-                "↑↓ move · enter open · x close tab · esc back · Q quit",
+                // A 44-column footer holds about forty characters, so the
+                // arrows and esc — which nobody needs telling — give up their
+                // place to the keys you would otherwise never find.
+                "enter open · a agent · x close · Q quit",
                 area.width as usize,
             ),
             Style::default().fg(Color::DarkGray),
@@ -521,6 +524,39 @@ mod tests {
             text.contains("▷ 1"),
             "the header counts the tabs behind you"
         );
+    }
+
+    #[test]
+    fn the_focused_footer_advertises_the_keys_you_would_not_guess() {
+        // A key nobody can see is a key nobody has. The footer is the only
+        // place the panel says what it can do, and it truncates at the panel
+        // width — so the keys that need announcing have to come first.
+        let fixture = three_jobs();
+        let mut app = App::new(fixture.0.clone());
+        let mut terminal = Terminal::new(TestBackend::new(44, 24)).unwrap();
+        terminal
+            .draw(|frame| draw_in(frame, frame.area(), &mut app, Hint::Focused))
+            .unwrap();
+        let text: String = (0..24)
+            .map(|y| {
+                (0..44)
+                    .map(|x| {
+                        terminal
+                            .backend()
+                            .buffer()
+                            .cell((x, y))
+                            .unwrap()
+                            .symbol()
+                            .to_string()
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("a agent"), "starting an agent: {text}");
+        assert!(text.contains("x close"), "closing a tab: {text}");
+        assert!(text.contains("enter open"));
     }
 
     #[test]

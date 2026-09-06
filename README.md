@@ -127,11 +127,27 @@ already have open brings that tab forward rather than attaching to it twice.
 `x` in the panel closes the selected session's tab, and `q` closes a tab whose
 session has exited.
 
+**Terminal.app needs four settings before the chord works at all.** It does not
+encode modifiers on arrow keys: shift-option-↑ arrives as a plain up-arrow,
+indistinguishable from the one your session wants, so Savras cannot act on it
+without eating the arrow keys entirely. iTerm2, Ghostty, WezTerm and kitty all
+send it properly and need nothing. In Terminal.app, go to **Settings →
+Profiles → Keyboard**, press **+** four times and add:
+
+| Key | Modifier | Action | Send text |
+|-----|----------|--------|-----------|
+| ↑ | Shift, Option | Send Text | `\033[1;4A` |
+| ↓ | Shift, Option | Send Text | `\033[1;4B` |
+| → | Shift, Option | Send Text | `\033[1;4C` |
+| ← | Shift, Option | Send Text | `\033[1;4D` |
+
+Type the `\033` by pressing the **esc** key in that field; it shows as `\033`.
+
 Command chords cannot be used for this, however much `cmd-shift-←/→` is what
 the fingers want: Command is not part of the terminal's modifier encoding at
 all, so the terminal keeps every Command chord for its own tabs and the program
-inside never sees one. If you want the Cmd feel, map `cmd-shift-←/→` in your
-terminal to send `\033[1;4D` and `\033[1;4C` — iTerm2 calls this "Send Escape
+inside never sees one. If you want the Cmd feel, map `cmd-shift-←/→` the same
+way, sending `\033[1;4D` and `\033[1;4C` — iTerm2 calls this "Send Escape
 Sequence", and Ghostty and WezTerm have the same thing in their config.
 
 The cost is worth knowing: an open tab is a live `claude attach` and a
