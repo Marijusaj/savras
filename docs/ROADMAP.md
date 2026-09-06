@@ -103,6 +103,36 @@ modifier encoding, so a terminal keeps every one of them and the pty never sees
 it. Shift-Option is what reaches us; mapping `cmd-shift-←/→` to send
 `\033[1;4D`/`\033[1;4C` in the terminal gets the intended feel back.
 
+### M2.3 · Parallel agents
+`a` in the panel starts a parallel agent under the selected session's lead: a
+real background session (`claude --bg -n <LEAD>-<n>`), in the lead's own
+repository, whose **opening prompt is the briefing**. That is what makes the
+message genuinely sent rather than drafted — there is no supported way to put
+words into a session that is already running, so instead of messaging an agent
+after starting it, Savras starts it with what it needs to know. The lead is
+told by the agent itself, in its first act, through Claude Code's own
+messaging.
+
+The group needs no configuration because the names already carry it: Claude
+Code names repeats `NAME-2`, `NAME-3`, so the bare name leads and the numbered
+ones follow. Two sessions sharing a base name are a group; one is not, which is
+what keeps a lone `PR-357` from being read as somebody's agent. The lead falls
+back to the lowest-numbered agent when the bare name is not running — a lead
+has to be a session that can actually be messaged, or the address handed to
+every new agent goes nowhere.
+
+The panel shows the relationship in the detail footer rather than the rows: a
+44-column row has no width for it, and "who commands whom" is a question you
+ask about one session at a time.
+
+This is where the read-only rule bends, and the shape of the bend is
+deliberate. Savras still never writes to `~/.claude/`, and still cannot disturb
+a session that is running. It can now *start* one. The alternatives were worse:
+typing into the pane only reaches the session in front of you, and reaching a
+running session at all would mean speaking the private socket protocol under
+`/tmp/cc-socks/`, which is undocumented and would break on any Claude Code
+release.
+
 ---
 
 ## Next

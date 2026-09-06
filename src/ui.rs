@@ -7,6 +7,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap},
 };
 
+use crate::agents;
 use crate::app::{App, Row, Tab};
 use crate::job::{age, Job, Status};
 
@@ -287,6 +288,16 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
         ),
     ])];
 
+    // Where this session sits in its group. The detail footer is the right
+    // place for it: the rows have no width to spare, and "who commands whom"
+    // is a question you ask about one session at a time.
+    if let Some(group) = agents::group_of(&app.snapshot, job) {
+        lines.push(Line::from(Span::styled(
+            truncate(&group.describe(job), area.width as usize),
+            Style::default().fg(Color::Indexed(140)),
+        )));
+    }
+
     if !job.links.is_empty() {
         let links = job
             .links
@@ -510,6 +521,33 @@ mod tests {
             text.contains("▷ 1"),
             "the header counts the tabs behind you"
         );
+    }
+
+    #[test]
+    fn the_detail_says_where_a_session_sits_in_its_group() {
+        // Rows have no width for it, and "who commands whom" is a question you
+        // ask about one session at a time — so it lives in the detail footer.
+        let fixture = Fixture::new("ui-group")
+            .job(
+                "aaa",
+                r#"{"state":"working","name":"LEAD","detail":"planning","cwd":"/tmp/r"}"#,
+            )
+            .job(
+                "bbb",
+                r#"{"state":"working","name":"LEAD-2","detail":"building","cwd":"/tmp/r"}"#,
+            );
+        let text = render(&fixture, 60, 24).join("\n");
+        assert!(
+            text.contains("leads LEAD-2"),
+            "the lead's row must say who it commands:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_session_in_no_group_says_nothing_about_groups() {
+        let text = render(&three_jobs(), 60, 24).join("\n");
+        assert!(!text.contains("leads "));
+        assert!(!text.contains("parallel agent"));
     }
 
     #[test]

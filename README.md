@@ -34,11 +34,15 @@ concluded.
 Claude Code already writes the state of every session to
 `~/.claude/jobs/<id>/state.json`. Savras watches that directory and renders it.
 
-It is **read-only**. It never writes to `~/.claude/`, never talks to Claude Code
-over any interface, and never touches the network. It cannot disturb the
-sessions it reports on, and if a Claude Code upgrade changes the format the
-panel degrades rather than breaks — unparseable jobs are skipped, unknown
-fields ignored.
+Reading is all it does to the sessions it watches. It never writes to
+`~/.claude/`, never touches the network, and cannot disturb a session that is
+already running. If a Claude Code upgrade changes the format the panel degrades
+rather than breaks — unparseable jobs are skipped, unknown fields ignored.
+
+One exception, and it is deliberate: [parallel agents](#parallel-agents) lets
+you *start* a session, with `claude --bg`. Starting is not disturbing — the
+sessions already on the panel are untouched by it — but it is the one place
+Savras does something rather than looking, and it is worth knowing about.
 
 ## Install
 
@@ -136,6 +140,50 @@ running behind the one you are looking at. Sessions you have never opened cost
 nothing. Leaving the shell you started with still closes Savras — but only
 while you are looking at it; exiting it in a background tab leaves a dead tab
 rather than taking your other sessions down from somewhere you cannot see.
+
+### Parallel agents
+
+A **parallel agent** is a session of its own that takes its work from another
+session. Not a subagent: a subagent lives inside one model's turn and dies with
+it, while a parallel agent has its own context, its own row in the panel, and
+keeps running between assignments. You can open it, talk to it directly, and it
+can message its peers.
+
+`a` on any session in the panel starts one:
+
+```
+                you press  a  on AGENT
+                           │
+                           ▼
+   claude --bg -n AGENT-3 "You are AGENT-3, a parallel agent working
+                           under AGENT. … message AGENT to say you are
+                           up and ask what it needs …"
+                           │
+   AGENT-3 starts ──SendMessage──▶ AGENT   "AGENT-3 here, ready."
+```
+
+The briefing is the new session's **opening prompt**, so it is genuinely sent
+rather than drafted, and it arrives before the agent has done anything. The
+lead is told by the agent itself, in its first act — Savras never interrupts a
+session that is already running, and there is no supported way to put words
+into one that has already started.
+
+**Nothing is configured.** The group is read out of the names, the way
+everything else here is read off the disk: Claude Code names a second session
+with the same name `NAME-2` and a third `NAME-3`, so the bare name leads and
+the numbered ones follow. Two sessions sharing a base name are a group; one is
+just a session, which is also what stops a lone `PR-357` being read as somebody
+else's agent. If the session a group was named after exits, the lowest-numbered
+agent leads — a lead has to be a session you can actually message, or every new
+agent is handed an address that goes nowhere.
+
+The panel says where each session sits in its group, in the detail footer:
+`leads AGENT-2, AGENT-3` under the lead, `parallel agent under AGENT` under a
+member.
+
+This is the one thing Savras does that is not looking. It still never writes to
+`~/.claude/`, and it still cannot disturb a session that is running — but it
+can now *start* one, with `claude --bg`, in that group's own repository.
 
 ### Ping
 

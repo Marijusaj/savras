@@ -89,6 +89,8 @@ enum Action {
     CloseFront,
     /// Close the tab holding the session the panel cursor is on.
     CloseSelected,
+    /// Start a parallel agent under the selected session's lead.
+    AddAgent,
 }
 
 /// The program running beside the panel, and the pseudo-terminal it lives in.
@@ -375,6 +377,11 @@ fn event_loop(
     mut session: Session,
 ) -> Result<()> {
     let mut app = App::new(session.jobs_dir.clone());
+    // Starting an agent runs `claude --bg`, which takes long enough that doing
+    // it on this thread would visibly stall the panel. The outcome comes back
+    // here, since a session that failed to start must say so rather than
+    // silently never appearing.
+    let (starting, started) = mpsc::channel::<Result<String>>();
     let watch = Watch::start(&session.jobs_dir);
     app.watching = watch.live;
     // What is already on screen when Savras opens is not news.
@@ -474,6 +481,7 @@ fn event_loop(
                             terminal.clear()?;
                         }
                     }
+                    Action::AddAgent => start_agent(&mut app, &starting),
                     Action::CloseFront | Action::CloseSelected => {
                         let target = match action {
                             Action::CloseFront => Some(session.tabs.current),
@@ -525,6 +533,17 @@ fn event_loop(
             while tab.work.output.try_recv().is_ok() {
                 dirty |= i == front;
             }
+        }
+
+        while let Ok(outcome) = started.try_recv() {
+            match outcome {
+                // The new session writes its own state.json within a moment,
+                // and the panel is watching that directory — so the row
+                // appears on its own, and there is nothing to announce.
+                Ok(_) => app.error = None,
+                Err(e) => app.error = Some(format!("could not start an agent: {e}")),
+            }
+            dirty = true;
         }
 
         if watch.changed() || last_refresh.elapsed() >= REFRESH {
@@ -603,6 +622,39 @@ fn reopen(session: &mut Session) -> Result<bool> {
     let work = Work::spawn(&command, Some(&cwd), cols, rows, Origin::Opened)?;
     session.tabs.front_mut().work = work;
     Ok(true)
+}
+
+/// Start a parallel agent under the selected session's lead.
+///
+/// The lead is the selected session's *base* name, so pressing this on
+/// `AGENT-3` adds a fourth agent under `AGENT` rather than starting a group
+/// beneath a group. It runs in the lead's own repository, because an agent
+/// that cannot see the code is no use.
+///
+/// This is the one thing Savras does that is not looking: it *starts*
+/// sessions. It still never writes to `~/.claude/`, and it still never
+/// interrupts a session that is already running — the new agent introduces
+/// itself to its lead, through Claude Code's own messaging, as its first act.
+fn start_agent(app: &mut App, outcome: &mpsc::Sender<Result<String>>) {
+    let Some(job) = app.selected_job() else {
+        return;
+    };
+    // The lead has to be a session that is actually running, because the new
+    // agent is told to message it by name. The *numbering* follows the base
+    // name, so a group led by `SAVRAS-2` still adds `SAVRAS-4` next.
+    let leader = crate::agents::lead_of(&app.snapshot, job);
+    let lead = leader.name.clone();
+    // Its own repository: an agent that cannot see the code is no use.
+    let cwd = leader.cwd.clone();
+    let (base, _) = crate::agents::split(&job.name);
+    let name = crate::agents::next_name(&app.snapshot, base);
+
+    app.error = Some(format!("starting {name}…"));
+    let outcome = outcome.clone();
+    std::thread::spawn(move || {
+        let briefing = crate::agents::briefing(&lead, &name);
+        let _ = outcome.send(crate::agents::start(&name, &briefing, &cwd));
+    });
 }
 
 /// Clear the mark on whatever session is now in front — flipping to a tab is
@@ -712,6 +764,7 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: bool) -> Action {
         // An open tab is a live session and a screen buffer, so a tab set you
         // can only grow is a leak you cannot see.
         [b'x'] => return Action::CloseSelected,
+        [b'a'] => return Action::AddAgent,
         // Quitting closes the working pane as well, so it asks first.
         [b'Q'] => return Action::ConfirmQuit,
         // Esc and q give the terminal back rather than quitting: in a side
@@ -1221,6 +1274,13 @@ mod tests {
             panel_key(b"x", &mut app, false),
             Action::CloseSelected
         ));
+    }
+
+    #[test]
+    fn a_starts_a_parallel_agent() {
+        let f = Fixture::new("host-agent").job("aaa", r#"{"state":"working","name":"X"}"#);
+        let mut app = App::new(f.0.clone());
+        assert!(matches!(panel_key(b"a", &mut app, false), Action::AddAgent));
     }
 
     #[test]

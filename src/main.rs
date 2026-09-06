@@ -1,8 +1,10 @@
 //! Savras — a side panel that sees every Claude Code session you have running.
 //!
-//! Read-only by design: it watches `~/.claude/jobs/` and never writes there,
-//! so it cannot disturb the sessions it reports on.
+//! It watches `~/.claude/jobs/` and never writes there, so it cannot disturb
+//! the sessions it reports on. It can *start* one — see `agents` — which is
+//! the only thing it does that is not looking.
 
+mod agents;
 mod app;
 mod focus;
 mod host;
@@ -71,6 +73,7 @@ keys, with the panel focused:
   ↑/↓, k/j   move        enter   open the selected session
   g/G        first/last  esc, q  back to your work
   x          close the selected session's tab
+  a          start a parallel agent under this session's lead
   r          refresh     Q       quit Savras, after asking
   ctrl-l     paint the screen again, if the terminal has scrolled it
 
