@@ -64,15 +64,19 @@ examples:
   svr solo                     the panel on its own
   svr --once                   plain text, for scripts and status lines
 
-keys:
+keys, with the panel focused:
   ctrl-g     move the keyboard between your work and the panel
-  ↑/↓, k/j   move        enter  open the selected session
-  g/G        first/last  esc    back to your work
-  r          refresh     q      quit
+  ↑/↓, k/j   move        enter   open the selected session
+  g/G        first/last  esc, q  back to your work
+  r          refresh     Q       quit Savras, after asking
+  ctrl-l     paint the screen again, if the terminal has scrolled it
 
-A session arriving in Needs input pings: a desktop notification through the
-terminal, and a sound. `--ping done` pings for finished sessions too; the
-session showing in the working pane never pings.
+In `svr solo` there is no working pane to go back to, so q quits.
+
+A session arriving in Needs input pings: a sound, and a notification through
+the terminal where the terminal understands one. `--ping done` pings for
+finished sessions too. The session in the working pane is spared, but only
+while the terminal has focus — behind another window it pings like any other.
 ";
 
 /// How often to redraw. Ages tick in seconds, so this needs to be sub-second,

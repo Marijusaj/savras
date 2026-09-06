@@ -53,8 +53,13 @@ mouse already follows — and treats unknown focus as away.
 Two decisions worth keeping: **OSC 9 only, not OSC 9 and OSC 777** — WezTerm and
 Ghostty understand both, so sending both notifies twice, and a missing
 notification beats a doubled one. And Terminal.app, which understands neither,
-gets the sound and the bell; that is enough, and does not justify a signed
-helper app.
+is sent no sequence at all and gets the sound and the bell; the bell badges the
+tab, which is what you look for anyway.
+
+A banner through AppleScript was tried for Terminal.app and taken back out. It
+works, but macOS attributes such a notification to Script Editor, and clicking
+one launches Script Editor — a panel that opens another application when you
+answer it is worse than a bell.
 
 ---
 

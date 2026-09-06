@@ -33,6 +33,10 @@ use crate::watch::Watch;
 /// people never reach for it.
 const FOCUS_TOGGLE: u8 = 0x07; // Ctrl-G
 const ESC: u8 = 0x1b;
+/// Redraw everything from scratch. Terminal.app lets you scroll the view of an
+/// alternate-screen application, and a scrollbar drag sends no bytes at all —
+/// Savras cannot see it happen, so it needs a way to be told to repaint.
+const REPAINT: u8 = 0x0c; // Ctrl-L
 
 const TICK: Duration = Duration::from_millis(16);
 /// Repaint at least this often even when nothing changed, so ages keep ticking.
@@ -70,6 +74,11 @@ enum Origin {
 enum Action {
     Nothing,
     Focus(Focus),
+    /// Throw the drawn screen away and paint it again.
+    Repaint,
+    /// `Q` in the panel: quitting takes the working pane with it, so the
+    /// second press is the one that does it.
+    ConfirmQuit,
     /// Open the selected session in the working pane.
     Open,
     /// Run the last opened session again, after it exited.
@@ -270,6 +279,8 @@ fn event_loop(
     // counts as away: missing a question because we assumed you were watching
     // is worse than one ping you did not need.
     let mut window_focused = false;
+    // `Q` has been pressed once and the panel is asking whether to mean it.
+    let mut confirming = false;
 
     loop {
         // Follow the child in and out of mouse mode. Its request to enable
@@ -285,7 +296,7 @@ fn event_loop(
 
         if dirty || last_draw.elapsed() >= REDRAW {
             let banner = dead.then_some(exit_code);
-            terminal.draw(|frame| draw(frame, &mut app, &session, focus, banner))?;
+            terminal.draw(|frame| draw(frame, &mut app, &session, focus, banner, confirming))?;
             last_draw = Instant::now();
             dirty = false;
         }
@@ -317,15 +328,23 @@ fn event_loop(
                 } else {
                     focus::strip(&bytes)
                 };
+                let was_confirming = confirming;
                 let action = if bytes.is_empty() {
                     Action::Nothing // nothing but a focus event
                 } else if dead && focus == Focus::Work {
                     dead_pane_key(&bytes, &mut app)
                 } else {
-                    route(&bytes, focus, &mut app, &mut session.work)?
+                    route(&bytes, focus, &mut app, &mut session.work, confirming)?
                 };
+                // Any key answers the question, so the prompt never outlives
+                // the keystroke that followed it.
+                if was_confirming {
+                    confirming = false;
+                }
                 match action {
                     Action::Nothing => {}
+                    Action::Repaint => terminal.clear()?,
+                    Action::ConfirmQuit => confirming = true,
                     Action::Focus(next) => focus = next,
                     Action::Open | Action::Reopen => {
                         let opened = if matches!(action, Action::Reopen) {
@@ -431,8 +450,17 @@ fn resume(job: &crate::job::Job) -> (Vec<String>, PathBuf) {
 }
 
 /// Send keystrokes where they belong.
-fn route(bytes: &[u8], focus: Focus, app: &mut App, work: &mut Work) -> Result<Action> {
-    if bytes.contains(&FOCUS_TOGGLE) {
+fn route(
+    bytes: &[u8],
+    focus: Focus,
+    app: &mut App,
+    work: &mut Work,
+    confirming: bool,
+) -> Result<Action> {
+    // While the panel is asking whether to quit, the answer is the only thing
+    // that matters — including ctrl-g, which would otherwise leave the
+    // question hanging behind the working pane.
+    if bytes.contains(&FOCUS_TOGGLE) && !confirming {
         return Ok(Action::Focus(match focus {
             Focus::Work => Focus::Panel,
             Focus::Panel => Focus::Work,
@@ -447,19 +475,36 @@ fn route(bytes: &[u8], focus: Focus, app: &mut App, work: &mut Work) -> Result<A
             work.writer.flush()?;
             Ok(Action::Nothing)
         }
-        Focus::Panel => Ok(panel_key(bytes, app)),
+        Focus::Panel => Ok(panel_key(bytes, app, confirming)),
     }
 }
 
 /// The panel is read-only, so it needs a cursor, a way in, and a way out.
-fn panel_key(bytes: &[u8], app: &mut App) -> Action {
+///
+/// `confirming` is set once `Q` has been pressed: the next key either confirms
+/// the quit or cancels it, and nothing else happens in between.
+fn panel_key(bytes: &[u8], app: &mut App, confirming: bool) -> Action {
+    if confirming {
+        return match bytes {
+            [b'Q'] => {
+                app.should_quit = true;
+                Action::Nothing
+            }
+            // Anything else is "no": a quit that closes your working pane
+            // should need saying twice, and mean it both times.
+            _ => Action::Focus(Focus::Panel),
+        };
+    }
     match bytes {
         [b'j'] | [ESC, b'[', b'B'] => app.step(1),
         [b'k'] | [ESC, b'[', b'A'] => app.step(-1),
         [b'g'] => app.jump(false),
         [b'G'] => app.jump(true),
         [b'r'] => app.refresh(),
+        [REPAINT] => return Action::Repaint,
         [b'\r'] | [b'\n'] => return Action::Open,
+        // Quitting closes the working pane as well, so it asks first.
+        [b'Q'] => return Action::ConfirmQuit,
         // Esc and q give the terminal back rather than quitting: in a side
         // panel, closing the whole window is rarely what was meant.
         [ESC] | [b'q'] => return Action::Focus(Focus::Work),
@@ -468,7 +513,14 @@ fn panel_key(bytes: &[u8], app: &mut App) -> Action {
     Action::Nothing
 }
 
-fn draw(frame: &mut Frame, app: &mut App, session: &Session, focus: Focus, dead: Option<u32>) {
+fn draw(
+    frame: &mut Frame,
+    app: &mut App,
+    session: &Session,
+    focus: Focus,
+    dead: Option<u32>,
+    confirming: bool,
+) {
     let area = frame.area();
     let panel_width = session.width.min(area.width.saturating_sub(DIVIDER + 1));
     let widths = match session.side {
@@ -489,10 +541,10 @@ fn draw(frame: &mut Frame, app: &mut App, session: &Session, focus: Focus, dead:
         Side::Right => (chunks[0], chunks[2]),
     };
 
-    let hint = if focus == Focus::Panel {
-        Hint::Focused
-    } else {
-        Hint::Background
+    let hint = match (focus, confirming) {
+        (Focus::Panel, true) => Hint::Confirming,
+        (Focus::Panel, false) => Hint::Focused,
+        (Focus::Work, _) => Hint::Background,
     };
     ui::draw_in(frame, panel_area, app, hint);
 
@@ -780,6 +832,53 @@ mod tests {
     use crate::testing::Fixture;
 
     #[test]
+    fn quitting_from_the_panel_takes_two_presses() {
+        // `q` hands the keyboard back — closing the whole window is rarely
+        // what was meant in a side panel — so quitting is `Q`, and because it
+        // closes the working pane with it, it asks first.
+        let f = Fixture::new("quit").job("aaa", r#"{"state":"working","name":"X"}"#);
+        let mut app = App::new(f.0.clone());
+
+        assert!(matches!(
+            panel_key(b"q", &mut app, false),
+            Action::Focus(Focus::Work)
+        ));
+        assert!(!app.should_quit, "q is not a quit in the side panel");
+
+        assert!(matches!(
+            panel_key(b"Q", &mut app, false),
+            Action::ConfirmQuit
+        ));
+        assert!(!app.should_quit, "the first Q only asks");
+
+        panel_key(b"Q", &mut app, true);
+        assert!(app.should_quit, "the second Q means it");
+    }
+
+    #[test]
+    fn anything_but_a_second_q_cancels_the_quit() {
+        let f = Fixture::new("quit-cancel").job("aaa", r#"{"state":"working","name":"X"}"#);
+        let mut app = App::new(f.0.clone());
+        for answer in [&b"j"[..], b"\r", b"\x1b", b"q"] {
+            panel_key(answer, &mut app, true);
+            assert!(!app.should_quit, "{answer:?} must not quit Savras");
+        }
+    }
+
+    #[test]
+    fn the_panel_can_be_told_to_paint_itself_again() {
+        // Terminal.app lets you scroll the view of an alternate-screen
+        // application, and a scrollbar drag sends no bytes for Savras to
+        // notice, so the only cure is being asked to repaint.
+        let f = Fixture::new("repaint").job("aaa", r#"{"state":"working","name":"X"}"#);
+        let mut app = App::new(f.0.clone());
+        assert!(matches!(
+            panel_key(b"\x0c", &mut app, false),
+            Action::Repaint
+        ));
+    }
+
+    #[test]
     fn an_open_session_is_only_spared_a_ping_while_you_are_there() {
         // Looking at it: it is asking you in person, on the other half of the
         // screen, and a notification would be noise.
@@ -858,8 +957,8 @@ mod tests {
     fn enter_on_the_panel_asks_to_open_the_session() {
         let f = Fixture::new("host-open").job("aaa", r#"{"state":"working","name":"X"}"#);
         let mut app = App::new(f.0.clone());
-        assert!(matches!(panel_key(b"\r", &mut app), Action::Open));
-        assert!(matches!(panel_key(b"\n", &mut app), Action::Open));
+        assert!(matches!(panel_key(b"\r", &mut app, false), Action::Open));
+        assert!(matches!(panel_key(b"\n", &mut app, false), Action::Open));
     }
 
     #[test]
@@ -881,7 +980,7 @@ mod tests {
         let f = Fixture::new("host-esc").job("aaa", r#"{"state":"working","name":"X"}"#);
         let mut app = App::new(f.0.clone());
         assert!(matches!(
-            panel_key(b"\x1b", &mut app),
+            panel_key(b"\x1b", &mut app, false),
             Action::Focus(Focus::Work)
         ));
         assert!(!app.should_quit, "the panel must not close the window");

@@ -29,6 +29,9 @@ pub enum Hint {
     Focused,
     /// A column beside a working pane that has the keyboard.
     Background,
+    /// Focused, with `Q` pressed once: quitting closes the working pane too,
+    /// so it asks before it does.
+    Confirming,
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -260,8 +263,15 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint) {
             Style::default().fg(Color::DarkGray),
         ),
         (None, Hint::Focused) => Span::styled(
-            "↑↓ move · enter open · esc back",
+            "↑↓ move · enter open · esc back · Q quit",
             Style::default().fg(Color::DarkGray),
+        ),
+        (None, Hint::Confirming) => Span::styled(
+            truncate(
+                "Q again to quit Savras · any key stays",
+                area.width as usize,
+            ),
+            Style::default().fg(Color::Yellow),
         ),
         (None, Hint::Background) => {
             Span::styled("ctrl-g to focus", Style::default().fg(Color::DarkGray))

@@ -171,13 +171,25 @@ impl Notice {
     /// Both are best-effort and neither can fail loudly — a panel that panics
     /// because a sound file moved is worse than a silent one.
     pub fn announce(&self, sound: bool) {
-        let mut out = std::io::stdout();
-        let _ = out.write_all(wrap(&osc9(&self.title, &self.body)).as_bytes());
-        let _ = out.flush();
+        if understands_osc9(std::env::var("TERM_PROGRAM").ok().as_deref()) {
+            let mut out = std::io::stdout();
+            let _ = out.write_all(wrap(&osc9(&self.title, &self.body)).as_bytes());
+            let _ = out.flush();
+        }
         if sound {
             play();
         }
     }
+}
+
+/// Whether to send the sequence at all.
+///
+/// Terminal.app understands no notification sequence, and a terminal that does
+/// not understand one may print it rather than swallow it — across the panel,
+/// which is worse than the notification is worth. It gets the sound and the
+/// bell instead, which is what it is good at.
+fn understands_osc9(term_program: Option<&str>) -> bool {
+    term_program != Some("Apple_Terminal")
 }
 
 /// OSC 9, understood by iTerm2, WezTerm, Ghostty, kitty and Windows Terminal.
@@ -439,6 +451,17 @@ mod tests {
         assert!(seq.ends_with('\x07'));
         assert_eq!(seq.matches('\x07').count(), 1);
         assert!(!seq[4..].contains('\x1b'));
+    }
+
+    #[test]
+    fn the_one_terminal_that_cannot_read_it_is_not_sent_it() {
+        assert!(!understands_osc9(Some("Apple_Terminal")));
+        assert!(understands_osc9(Some("iTerm.app")));
+        assert!(understands_osc9(Some("WezTerm")));
+        assert!(understands_osc9(Some("ghostty")));
+        // Unknown terminals get it: standard OSC parsing swallows a sequence
+        // it does not recognise, so the risk is small and the gain is real.
+        assert!(understands_osc9(None));
     }
 
     #[test]

@@ -126,8 +126,10 @@ svr --no-sound        notify silently
 The sound is `afplay` on macOS, `canberra-gtk-play` or `paplay` on Linux,
 `[console]::beep` on Windows, with the terminal bell underneath all of them.
 iTerm2, WezTerm, Ghostty, kitty and Windows Terminal understand OSC 9.
-Terminal.app understands no notification sequence at all, so there the sound and
-the bell are the whole story.
+Terminal.app understands no notification sequence at all and is sent none — a
+terminal that cannot parse a sequence may print it across the panel instead of
+swallowing it — so there the sound and the bell are the whole story. They are
+enough: the bell puts a badge on the tab, which is what you look for anyway.
 
 ### tmux, if you want it
 
@@ -157,12 +159,24 @@ svr --jobs-dir <path>  read jobs from somewhere other than ~/.claude/jobs
 
 `--once` is for status lines, scripts, and anywhere without a TTY.
 
-| key | |
-|---|---|
-| `↑` `↓` / `k` `j` | move |
-| `g` / `G` | first / last |
-| `r` | refresh now |
-| `q` / `Esc` | quit |
+| key | with the panel focused | in `svr solo` |
+|---|---|---|
+| `↑` `↓` / `k` `j` | move | move |
+| `g` / `G` | first / last | first / last |
+| `r` | refresh now | refresh now |
+| `enter` | open the selected session | — |
+| `q` / `Esc` | back to your work | quit |
+| `Q` | quit Savras, after asking | quit |
+| `ctrl-l` | paint the screen again | paint the screen again |
+
+Quitting the side panel closes the working pane with it, so `Q` asks before it
+does — the footer says so, and any other key answers no.
+
+`ctrl-l` is there for one specific annoyance: Terminal.app lets you scroll the
+view of a full-screen application, and a scrollbar drag sends no bytes at all,
+so Savras cannot see it happen and cannot repaint on its own. Scrolling back to
+the bottom is the real cure; `ctrl-l` redraws everything if the screen is left
+looking wrong.
 
 The panel is responsive. Summaries are truncated to fit rather than dropped, so
 a 44-column sidebar still tells you what each session is doing; only when fewer
