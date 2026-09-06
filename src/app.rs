@@ -31,7 +31,22 @@ pub struct App {
     /// just started to*, and without this the panel cannot tell you which of
     /// four waiting sessions made the sound.
     alerted: HashSet<String>,
+    /// Sessions with a tab open, and which of them is in front. The panel is
+    /// the only place that says so: a session in a background tab is running
+    /// and unattended, which is exactly the thing worth being able to see.
+    tabs: Vec<String>,
+    front: Option<String>,
     pub should_quit: bool,
+}
+
+/// How a session relates to the working pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    /// In the pane right now.
+    Front,
+    /// Open in a tab behind the one you are looking at.
+    Behind,
+    None,
 }
 
 impl App {
@@ -44,6 +59,8 @@ impl App {
             error: None,
             watching: false,
             alerted: HashSet::new(),
+            tabs: Vec::new(),
+            front: None,
             should_quit: false,
         };
         app.refresh();
@@ -60,6 +77,32 @@ impl App {
     /// Whether this job is still waiting for you to notice it.
     pub fn alerted(&self, job: &Job) -> bool {
         self.alerted.contains(&job.short)
+    }
+
+    /// Tell the panel which sessions are open in tabs, and which is in front.
+    /// The standalone panel has no working pane, so it never calls this and
+    /// every session stays [`Tab::None`].
+    pub fn set_tabs(&mut self, front: Option<&str>, open: Vec<String>) {
+        self.front = front.map(str::to_string);
+        self.tabs = open;
+    }
+
+    pub fn tab(&self, job: &Job) -> Tab {
+        if self.front.as_deref() == Some(job.short.as_str()) {
+            Tab::Front
+        } else if self.tabs.iter().any(|short| short == &job.short) {
+            Tab::Behind
+        } else {
+            Tab::None
+        }
+    }
+
+    /// How many sessions are open behind the one you are looking at.
+    pub fn behind_count(&self) -> usize {
+        self.tabs
+            .iter()
+            .filter(|short| self.front.as_deref() != Some(short.as_str()))
+            .count()
     }
 
     pub fn alert_count(&self) -> usize {

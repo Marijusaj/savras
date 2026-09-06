@@ -89,6 +89,20 @@ without ever being said, all closed:
 short one lets the end-to-end test drive two pings in five seconds rather than
 forty.
 
+### M2.2 · Tabs
+Every opened session keeps its own pane, alive behind the one in front, so
+flipping back shows the screen you left rather than a fresh attach.
+`shift-option-←/→` or `↑/↓` flips one along, wrapping, from either side of the
+divider — the point being that it takes no `ctrl-g` first, because switching is
+the thing you do most often. `enter` on an already-open session brings its tab
+forward instead of attaching twice; `x` closes a tab; the header counts the
+tabs running behind you, since each is a live `claude attach`.
+
+Command chords were the ask and are impossible: Command is not in the xterm
+modifier encoding, so a terminal keeps every one of them and the pty never sees
+it. Shift-Option is what reaches us; mapping `cmd-shift-←/→` to send
+`\033[1;4D`/`\033[1;4C` in the terminal gets the intended feel back.
+
 ---
 
 ## Next

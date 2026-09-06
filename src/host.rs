@@ -83,6 +83,12 @@ enum Action {
     Open,
     /// Run the last opened session again, after it exited.
     Reopen,
+    /// Flip this many tabs along, wrapping.
+    Cycle(isize),
+    /// Close the tab in front.
+    CloseFront,
+    /// Close the tab holding the session the panel cursor is on.
+    CloseSelected,
 }
 
 /// The program running beside the panel, and the pseudo-terminal it lives in.
@@ -189,6 +195,122 @@ impl Drop for Work {
     }
 }
 
+/// One open session: its pane, and how to bring it back if it exits.
+struct Pane {
+    /// The session it is showing, so opening that session again finds this tab
+    /// rather than starting a second copy of it. `None` is the shell Savras
+    /// started with, which is a tab like any other.
+    short: Option<String>,
+    reopen: Option<(Vec<String>, PathBuf)>,
+    work: Work,
+}
+
+/// The sessions you have open, and which one is in front.
+///
+/// The whole of "tabs" is that a hidden session is *not* stopped: it keeps its
+/// pseudo-terminal, its reader thread and its screen, so coming back to it
+/// shows the screen you left — scrollback, half-typed message and all — rather
+/// than a fresh attach. Everything else here is bookkeeping around that.
+///
+/// The cost is honest and worth stating: an open tab is a live `claude attach`
+/// and a 2000-line scrollback buffer, so tabs are opened deliberately and can
+/// be closed. Sessions you have never opened cost nothing.
+struct Tabs {
+    open: Vec<Pane>,
+    current: usize,
+}
+
+impl Tabs {
+    fn new(work: Work) -> Self {
+        Tabs {
+            open: vec![Pane {
+                short: None,
+                reopen: None,
+                work,
+            }],
+            current: 0,
+        }
+    }
+
+    fn front(&self) -> &Pane {
+        &self.open[self.current]
+    }
+
+    fn front_mut(&mut self) -> &mut Pane {
+        &mut self.open[self.current]
+    }
+
+    fn work(&self) -> &Work {
+        &self.front().work
+    }
+
+    fn work_mut(&mut self) -> &mut Work {
+        &mut self.front_mut().work
+    }
+
+    /// Which session is in front, if it is a session and not the shell.
+    fn short(&self) -> Option<&str> {
+        self.front().short.as_deref()
+    }
+
+    /// Every session with a tab open, the shell excepted — what the panel
+    /// marks.
+    fn shorts(&self) -> Vec<String> {
+        self.open.iter().filter_map(|t| t.short.clone()).collect()
+    }
+
+    fn position(&self, short: &str) -> Option<usize> {
+        self.open
+            .iter()
+            .position(|t| t.short.as_deref() == Some(short))
+    }
+
+    /// Move `delta` tabs along, wrapping. Wrapping is what a terminal's own tab
+    /// keys do, and with two tabs open — the common case — it is the whole
+    /// feature: one chord flips between them.
+    fn cycle(&mut self, delta: isize) -> bool {
+        if self.open.len() < 2 {
+            return false;
+        }
+        let n = self.open.len() as isize;
+        self.current = (((self.current as isize + delta) % n + n) % n) as usize;
+        true
+    }
+
+    fn go_to(&mut self, index: usize) {
+        if index < self.open.len() {
+            self.current = index;
+        }
+    }
+
+    fn push(&mut self, tab: Pane) {
+        self.open.push(tab);
+        self.current = self.open.len() - 1;
+    }
+
+    /// Close a tab and land on a neighbour. The last tab cannot be closed —
+    /// that is quitting, and quitting asks first.
+    fn close(&mut self, index: usize) -> bool {
+        if self.open.len() < 2 || index >= self.open.len() {
+            return false;
+        }
+        self.open.remove(index);
+        if self.current >= index && self.current > 0 {
+            self.current -= 1;
+        }
+        true
+    }
+
+    /// A hidden pane must be resized too, or it draws at the old size the
+    /// moment you flip to it — and a full-screen TUI in it never finds out.
+    fn resize_all(&mut self, cols: u16, rows: u16) -> Result<()> {
+        for tab in &mut self.open {
+            tab.work.resize(cols, rows)?;
+        }
+        Ok(())
+    }
+}
+
 pub fn run(
     width: u16,
     side: Side,
@@ -213,9 +335,7 @@ pub fn run(
         side,
         size: (cols, rows),
         input: stdin_thread(),
-        work,
-        reopen: None,
-        open: None,
+        tabs: Tabs::new(work),
         ping,
     };
 
@@ -237,12 +357,10 @@ struct Session {
     side: Side,
     size: (u16, u16),
     input: Receiver<Vec<u8>>,
-    work: Work,
-    /// The last session opened from the panel, so a dead pane can be retried.
-    reopen: Option<(Vec<String>, PathBuf)>,
-    /// Which session the working pane is showing, so it is never pinged for:
-    /// it is asking you in person, on the other half of the screen.
-    open: Option<String>,
+    /// The sessions you have open, and which of them is in front. The one in
+    /// front is never pinged for: it is asking you in person, on the other
+    /// half of the screen.
+    tabs: Tabs,
     ping: Ping,
 }
 
@@ -272,8 +390,6 @@ fn event_loop(
         vt100::MouseProtocolMode::None,
         vt100::MouseProtocolEncoding::Default,
     );
-    let mut dead = false;
-    let mut exit_code = 0;
     // Whether the terminal *window* has you — distinct from `focus` above,
     // which is only about which pane the keyboard is typing into. Unknown
     // counts as away: missing a question because we assumed you were watching
@@ -286,7 +402,7 @@ fn event_loop(
         // Follow the child in and out of mouse mode. Its request to enable
         // reporting only ever reached our parser, so mirror it outward or the
         // terminal keeps scrolling its own scrollback across both panes.
-        let wanted = session.work.mouse();
+        let wanted = session.tabs.work().mouse();
         if wanted != mouse {
             mouse = wanted;
             let mut out = std::io::stdout();
@@ -294,25 +410,23 @@ fn event_loop(
             out.flush()?;
         }
 
-        if dirty || last_draw.elapsed() >= REDRAW {
-            let banner = dead.then_some(exit_code);
-            terminal.draw(|frame| draw(frame, &mut app, &session, focus, banner, confirming))?;
-            last_draw = Instant::now();
-            dirty = false;
+        // Whether the tab in front has finished. Asked of the front tab each
+        // time round rather than latched, because flipping tabs changes the
+        // answer — a dead tab you flip away from must stop being the banner.
+        let dead = session.tabs.work_mut().exit_code();
+
+        // Leaving the shell you started with closes Savras — but only while you
+        // are looking at it. Exiting it in a background tab leaves a dead tab
+        // like any other, rather than taking the panel and your other sessions
+        // down from somewhere you cannot see.
+        if dead.is_some() && session.tabs.work().origin == Origin::Initial {
+            return Ok(());
         }
 
-        // Leaving the shell you started with closes Savras. A session opened
-        // from the panel exiting leaves its last screen on display, so you can
-        // read why, and the panel stays where it was.
-        if let Some(code) = session.work.exit_code() {
-            if session.work.origin == Origin::Initial {
-                return Ok(());
-            }
-            if !dead {
-                dead = true;
-                dirty = true;
-                exit_code = code;
-            }
+        if dirty || last_draw.elapsed() >= REDRAW {
+            terminal.draw(|frame| draw(frame, &mut app, &session, focus, dead, confirming))?;
+            last_draw = Instant::now();
+            dirty = false;
         }
 
         match session.input.recv_timeout(TICK) {
@@ -323,7 +437,7 @@ fn event_loop(
                 let bytes = shift_mouse(&bytes, work_offset(session.width, session.side));
                 // A program that never asked for focus reporting would print
                 // these as stray characters, so they go no further.
-                let bytes = if session.work.wants_focus.load(Ordering::Relaxed) {
+                let bytes = if session.tabs.work().wants_focus.load(Ordering::Relaxed) {
                     bytes
                 } else {
                     focus::strip(&bytes)
@@ -331,10 +445,15 @@ fn event_loop(
                 let was_confirming = confirming;
                 let action = if bytes.is_empty() {
                     Action::Nothing // nothing but a focus event
-                } else if dead && focus == Focus::Work {
-                    dead_pane_key(&bytes, &mut app)
+                } else if let Some(delta) = tab_chord(&bytes) {
+                    // Flipping tabs works from either side, and without going
+                    // through the panel: it is the one thing you do often
+                    // enough that three keystrokes is two too many.
+                    Action::Cycle(delta)
+                } else if dead.is_some() && focus == Focus::Work {
+                    dead_pane_key(&bytes)
                 } else {
-                    route(&bytes, focus, &mut app, &mut session.work, confirming)?
+                    route(&bytes, focus, &mut app, session.tabs.work_mut(), confirming)?
                 };
                 // Any key answers the question, so the prompt never outlives
                 // the keystroke that followed it.
@@ -346,6 +465,32 @@ fn event_loop(
                     Action::Repaint => terminal.clear()?,
                     Action::ConfirmQuit => confirming = true,
                     Action::Focus(next) => focus = next,
+                    Action::Cycle(delta) => {
+                        if session.tabs.cycle(delta) {
+                            // A tab you have flipped to is a tab you have been
+                            // to, whatever it was asking.
+                            attend_front(&mut session, &mut app);
+                            focus = Focus::Work;
+                            terminal.clear()?;
+                        }
+                    }
+                    Action::CloseFront | Action::CloseSelected => {
+                        let target = match action {
+                            Action::CloseFront => Some(session.tabs.current),
+                            _ => app
+                                .selected_job()
+                                .and_then(|job| session.tabs.position(&job.short)),
+                        };
+                        match target {
+                            Some(index) if session.tabs.close(index) => {
+                                terminal.clear()?;
+                            }
+                            // The last tab is the working pane itself, and
+                            // closing that is quitting — which asks first.
+                            Some(_) => confirming = true,
+                            None => {}
+                        }
+                    }
                     Action::Open | Action::Reopen => {
                         let opened = if matches!(action, Action::Reopen) {
                             reopen(&mut session)
@@ -355,7 +500,7 @@ fn event_loop(
                         match opened {
                             Ok(true) => {
                                 focus = Focus::Work;
-                                dead = false;
+                                terminal.clear()?;
                             }
                             Ok(false) => {}
                             Err(e) => app.error = Some(format!("could not open: {e}")),
@@ -371,22 +516,29 @@ fn event_loop(
             Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
         }
 
-        // The parser already holds whatever the child wrote; these are only
-        // wake-ups, so drain them and note that the screen moved.
-        while session.work.output.try_recv().is_ok() {
-            dirty = true;
+        // The parsers already hold whatever the children wrote; these are only
+        // wake-ups. Every tab is drained, or a hidden one's queue grows for as
+        // long as you leave it — but only the tab in front makes the screen
+        // dirty, since the others are not on it.
+        let front = session.tabs.current;
+        for (i, tab) in session.tabs.open.iter().enumerate() {
+            while tab.work.output.try_recv().is_ok() {
+                dirty |= i == front;
+            }
         }
 
         if watch.changed() || last_refresh.elapsed() >= REFRESH {
             app.refresh();
             // The session in the pane is only "in front of you" while the
             // terminal has focus; in another application it is as invisible
-            // as any other, and must ping like one.
-            let open = session.open.clone();
+            // as any other, and must ping like one. A session open in a tab
+            // *behind* another tab is not in front of you either.
+            let open = session.tabs.short().map(str::to_string);
             let pinged = session
                 .ping
                 .poll(&app.snapshot, watching(window_focused, open.as_deref()));
             app.alert(pinged);
+            app.set_tabs(session.tabs.short(), session.tabs.shorts());
             last_refresh = Instant::now();
             dirty = true;
         }
@@ -407,46 +559,95 @@ fn watching(focused: bool, open: Option<&str>) -> Option<&str> {
     open.filter(|_| focused)
 }
 
-/// Replace the working pane with the selected session. The program that was
-/// there is killed; the Claude Code session it was showing is not — those live
-/// in Claude Code's daemon, which is why reopening one is just a resume.
+/// Bring the selected session to the front: its existing tab if it has one,
+/// otherwise a new tab running it.
+///
+/// Opening a session you already have open is the common case once tabs exist,
+/// and it must *not* start a second copy — that is how you end up attached to
+/// one session twice and reading the wrong one.
 fn open_selected(session: &mut Session, app: &mut App) -> Result<bool> {
     let Some(job) = app.selected_job() else {
         return Ok(false);
     };
-    session.open = Some(job.short.clone());
-    session.reopen = Some(resume(job));
+    let short = job.short.clone();
+
+    if let Some(index) = session.tabs.position(&short) {
+        session.tabs.go_to(index);
+        app.attend_to(&short);
+        return Ok(true);
+    }
+
+    let (command, cwd) = resume(job);
+    let (cols, rows) = session.work_size();
+    // Spawn before touching the tab list, so a failure changes nothing.
+    let work = Work::spawn(&command, Some(&cwd), cols, rows, Origin::Opened)?;
+    session.tabs.push(Pane {
+        short: Some(short.clone()),
+        reopen: Some((command, cwd)),
+        work,
+    });
     // Going to a session is the clearest possible way of saying you saw which
     // one it was.
-    let short = job.short.clone();
     app.attend_to(&short);
-    reopen(session)
+    Ok(true)
 }
 
+/// Run the front tab's session again, in place, after it exited.
 fn reopen(session: &mut Session) -> Result<bool> {
-    let Some((command, cwd)) = session.reopen.clone() else {
+    let Some((command, cwd)) = session.tabs.front().reopen.clone() else {
         return Ok(false);
     };
     let (cols, rows) = session.work_size();
 
     // Spawn before dropping the old one, so a failure leaves the pane intact.
     let work = Work::spawn(&command, Some(&cwd), cols, rows, Origin::Opened)?;
-    session.work = work;
+    session.tabs.front_mut().work = work;
     Ok(true)
+}
+
+/// Clear the mark on whatever session is now in front — flipping to a tab is
+/// going to it.
+fn attend_front(session: &mut Session, app: &mut App) {
+    if let Some(short) = session.tabs.short().map(str::to_string) {
+        app.attend_to(&short);
+    }
 }
 
 /// Keys for a pane whose program has exited. Its last screen is still on
 /// display — usually the error that explains the exit — so the keys are about
 /// what to do next, not about typing into a dead terminal.
-fn dead_pane_key(bytes: &[u8], app: &mut App) -> Action {
+fn dead_pane_key(bytes: &[u8]) -> Action {
     match bytes {
         [b'\r'] | [b'\n'] => Action::Reopen,
-        [b'q'] => {
-            app.should_quit = true;
-            Action::Nothing
-        }
+        // Closing the tab, not Savras: the other sessions you have open are
+        // not implicated in this one exiting.
+        [b'q'] => Action::CloseFront,
         _ => Action::Nothing,
     }
+}
+
+/// Shift-Option with an arrow: flip one tab back or forward.
+///
+/// Command chords cannot be used, however much they feel right — Command is
+/// not part of the xterm modifier encoding at all, so the terminal keeps every
+/// one of them for its own tabs and the pty never sees it. Shift-Option does
+/// reach us. Both axes are accepted: up/down matches the panel's vertical
+/// list, left/right matches the terminal tab keys the hands already know.
+///
+/// `;4` is shift+alt; `;10` is shift+meta, which terminals configured to send
+/// Option as Meta use instead.
+fn tab_chord(bytes: &[u8]) -> Option<isize> {
+    for modifiers in [b"4", b"10".as_slice()] {
+        for (arrow, delta) in [(b'A', -1), (b'D', -1), (b'B', 1), (b'C', 1)] {
+            let mut sequence = vec![ESC, b'[', b'1', b';'];
+            sequence.extend_from_slice(modifiers);
+            sequence.push(arrow);
+            if bytes.windows(sequence.len()).any(|w| w == sequence) {
+                return Some(delta);
+            }
+        }
+    }
+    None
 }
 
 /// How to reopen a session: the command, and where to run it.
@@ -508,6 +709,9 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: bool) -> Action {
         [b'r'] => app.refresh(),
         [REPAINT] => return Action::Repaint,
         [b'\r'] | [b'\n'] => return Action::Open,
+        // An open tab is a live session and a screen buffer, so a tab set you
+        // can only grow is a leak you cannot see.
+        [b'x'] => return Action::CloseSelected,
         // Quitting closes the working pane as well, so it asks first.
         [b'Q'] => return Action::ConfirmQuit,
         // Esc and q give the terminal back rather than quitting: in a side
@@ -559,7 +763,7 @@ fn draw(
     .style(Style::default().fg(Color::Indexed(238)));
     frame.render_widget(divider, chunks[1]);
 
-    let parser = session.work.parser.lock().unwrap();
+    let parser = session.tabs.work().parser.lock().unwrap();
     draw_screen(
         frame,
         work_area,
@@ -746,7 +950,7 @@ fn resize_if_needed(session: &mut Session) -> Result<bool> {
     }
     session.size = size;
     let (cols, rows) = session.work_size();
-    session.work.resize(cols.max(1), rows)?;
+    session.tabs.resize_all(cols.max(1), rows)?;
     Ok(true)
 }
 
@@ -896,6 +1100,154 @@ mod tests {
         assert_eq!(watching(false, None), None);
     }
 
+    /// A pane running something harmless that stays alive, for testing the
+    /// bookkeeping around panes rather than the panes themselves.
+    fn pane(short: Option<&str>) -> Pane {
+        let work = Work::spawn(
+            &["cat".to_string()],
+            None,
+            80,
+            24,
+            short.map_or(Origin::Initial, |_| Origin::Opened),
+        )
+        .unwrap();
+        Pane {
+            short: short.map(str::to_string),
+            reopen: None,
+            work,
+        }
+    }
+
+    fn three_tabs() -> Tabs {
+        let mut tabs = Tabs::new(pane(None).work);
+        tabs.push(pane(Some("aaa")));
+        tabs.push(pane(Some("bbb")));
+        tabs
+    }
+
+    #[test]
+    fn the_chord_reaches_us_on_both_axes_and_both_encodings() {
+        // Up and left go back, down and right go forward: the panel's list is
+        // vertical, and the terminal tab keys people already know are not.
+        assert_eq!(tab_chord(b"\x1b[1;4A"), Some(-1));
+        assert_eq!(tab_chord(b"\x1b[1;4D"), Some(-1));
+        assert_eq!(tab_chord(b"\x1b[1;4B"), Some(1));
+        assert_eq!(tab_chord(b"\x1b[1;4C"), Some(1));
+        // Terminals set to send Option as Meta encode the same chord as ;10.
+        assert_eq!(tab_chord(b"\x1b[1;10A"), Some(-1));
+        assert_eq!(tab_chord(b"\x1b[1;10C"), Some(1));
+    }
+
+    #[test]
+    fn ordinary_keys_are_never_mistaken_for_the_chord() {
+        // A plain arrow, a shift-arrow and a ctrl-arrow all belong to the
+        // child; stealing any of them would break editing in the pane.
+        for keys in [
+            b"\x1b[A".as_slice(),
+            b"\x1b[1;2A",
+            b"\x1b[1;5D",
+            b"\x1b[1;3C",
+            b"hello",
+            b"\x1b",
+        ] {
+            assert_eq!(tab_chord(keys), None, "stole {keys:?}");
+        }
+    }
+
+    #[test]
+    fn flipping_tabs_wraps_in_both_directions() {
+        let mut tabs = three_tabs();
+        assert_eq!(tabs.current, 2, "a new tab comes to the front");
+
+        assert!(tabs.cycle(1));
+        assert_eq!(tabs.current, 0, "forward from the last is the first");
+        assert!(tabs.cycle(-1));
+        assert_eq!(tabs.current, 2, "back from the first is the last");
+        assert!(tabs.cycle(-1));
+        assert_eq!(tabs.current, 1);
+    }
+
+    #[test]
+    fn one_tab_has_nowhere_to_flip_to() {
+        let mut tabs = Tabs::new(pane(None).work);
+        assert!(!tabs.cycle(1), "with one tab the chord must do nothing");
+        assert_eq!(tabs.current, 0);
+    }
+
+    #[test]
+    fn a_session_already_open_is_found_rather_than_started_twice() {
+        // The whole point of tabs: opening a session you have open must bring
+        // its pane forward, not attach to the same session a second time.
+        let tabs = three_tabs();
+        assert_eq!(tabs.position("aaa"), Some(1));
+        assert_eq!(tabs.position("bbb"), Some(2));
+        assert_eq!(tabs.position("never-opened"), None);
+        assert_eq!(tabs.shorts(), ["aaa", "bbb"]);
+        assert_eq!(tabs.short(), Some("bbb"));
+    }
+
+    #[test]
+    fn closing_a_tab_lands_on_a_neighbour() {
+        let mut tabs = three_tabs();
+        tabs.go_to(1);
+        assert!(tabs.close(1));
+        assert_eq!(tabs.shorts(), ["bbb"]);
+        assert_eq!(tabs.current, 0, "closing lands on the tab before it");
+    }
+
+    #[test]
+    fn the_last_tab_cannot_be_closed() {
+        // It is the working pane itself, and closing that is quitting — which
+        // is a different key, and asks first.
+        let mut tabs = Tabs::new(pane(None).work);
+        assert!(!tabs.close(0));
+        assert_eq!(tabs.open.len(), 1);
+    }
+
+    #[test]
+    fn closing_a_tab_behind_you_leaves_you_where_you_are() {
+        let mut tabs = three_tabs();
+        tabs.go_to(2);
+        assert!(tabs.close(0));
+        assert_eq!(tabs.current, 1, "still on bbb, now one place along");
+        assert_eq!(tabs.short(), Some("bbb"));
+    }
+
+    #[test]
+    fn x_on_the_panel_closes_a_tab() {
+        let f = Fixture::new("host-close").job("aaa", r#"{"state":"working","name":"X"}"#);
+        let mut app = App::new(f.0.clone());
+        assert!(matches!(
+            panel_key(b"x", &mut app, false),
+            Action::CloseSelected
+        ));
+    }
+
+    #[test]
+    fn the_panel_knows_which_sessions_are_open_and_which_is_in_front() {
+        let f = Fixture::new("host-marks")
+            .job("aaa", r#"{"state":"working","name":"A"}"#)
+            .job("bbb", r#"{"state":"working","name":"B"}"#)
+            .job("ccc", r#"{"state":"working","name":"C"}"#);
+        let mut app = App::new(f.0.clone());
+        app.set_tabs(Some("bbb"), vec!["aaa".into(), "bbb".into()]);
+
+        let tab_of = |app: &App, short: &str| {
+            let job = app
+                .snapshot
+                .jobs
+                .iter()
+                .find(|j| j.short == short)
+                .unwrap()
+                .clone();
+            app.tab(&job)
+        };
+        assert_eq!(tab_of(&app, "bbb"), crate::app::Tab::Front);
+        assert_eq!(tab_of(&app, "aaa"), crate::app::Tab::Behind);
+        assert_eq!(tab_of(&app, "ccc"), crate::app::Tab::None);
+        assert_eq!(app.behind_count(), 1, "the one in front is not behind you");
+    }
+
     #[test]
     fn the_working_pane_gets_what_is_left_after_the_panel_and_divider() {
         assert_eq!(work_cols(180, 44), 135);
@@ -968,16 +1320,11 @@ mod tests {
 
     #[test]
     fn a_dead_pane_offers_a_way_out_instead_of_swallowing_keys() {
-        let f = Fixture::new("host-dead").job("aaa", r#"{"state":"working","name":"X"}"#);
-        let mut app = App::new(f.0.clone());
-
-        assert!(matches!(dead_pane_key(b"\r", &mut app), Action::Reopen));
-        assert!(!app.should_quit);
-        dead_pane_key(b"q", &mut app);
-        assert!(
-            app.should_quit,
-            "q must close a pane that cannot be typed into"
-        );
+        assert!(matches!(dead_pane_key(b"\r"), Action::Reopen));
+        // `q` closes the tab, not Savras: the other sessions you have open are
+        // not implicated in this one exiting.
+        assert!(matches!(dead_pane_key(b"q"), Action::CloseFront));
+        assert!(matches!(dead_pane_key(b"z"), Action::Nothing));
     }
 
     #[test]

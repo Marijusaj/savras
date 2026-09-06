@@ -80,7 +80,8 @@ output; Savras is the layout and the glue.
 
 `ctrl-g` moves the keyboard to the panel and back; with the panel focused,
 `enter` opens the selected session in the working pane and `esc` hands the
-keyboard back. Claude Code runs most sessions in its daemon, and those are
+keyboard back. **`shift-option-←/→`, or `↑/↓`, flips between the sessions you
+have open** without going through the panel at all. Claude Code runs most sessions in its daemon, and those are
 *attached* (`claude attach`), not resumed — asking to resume a running session
 is refused. Savras reads which kind a session is and uses the right command;
 attaching leaves the session running either way.
@@ -96,6 +97,45 @@ pane's own frame.
 
 [pty]: https://crates.io/crates/portable-pty
 [vt100]: https://crates.io/crates/vt100
+
+### Tabs
+
+Every session you open gets its own pane, and the pane **keeps running when you
+flip away from it**. Come back and you are looking at the screen you left:
+scrollback, the tool call halfway through, the message you had typed but not
+sent. That is the whole feature; everything else is bookkeeping around it.
+
+```
+SAVRAS  ◦ live  ● 1  ▷ 2
+1 needs input · 3 working · 2 done
+
+Needs input
+● AGENT-2     approve Bash: M=/User…    #382 5m
+▶ PLAN        pipeline validated end…         1m   ← in the pane now
+▷ SAVRAS      scaffolding the panel            8s   ← open, running, behind
+✳ ROADMAP     58 tier-A items…                 3d   ← not open
+```
+
+`shift-option-←/→` or `shift-option-↑/↓` flips one tab along, wrapping, from
+either side of the divider. Left/right is the muscle memory your terminal
+already trained; up/down matches the panel's own list. `enter` on a session you
+already have open brings that tab forward rather than attaching to it twice.
+`x` in the panel closes the selected session's tab, and `q` closes a tab whose
+session has exited.
+
+Command chords cannot be used for this, however much `cmd-shift-←/→` is what
+the fingers want: Command is not part of the terminal's modifier encoding at
+all, so the terminal keeps every Command chord for its own tabs and the program
+inside never sees one. If you want the Cmd feel, map `cmd-shift-←/→` in your
+terminal to send `\033[1;4D` and `\033[1;4C` — iTerm2 calls this "Send Escape
+Sequence", and Ghostty and WezTerm have the same thing in their config.
+
+The cost is worth knowing: an open tab is a live `claude attach` and a
+2000-line scrollback buffer, so the header carries a `▷` count of the tabs
+running behind the one you are looking at. Sessions you have never opened cost
+nothing. Leaving the shell you started with still closes Savras — but only
+while you are looking at it; exiting it in a background tab leaves a dead tab
+rather than taking your other sessions down from somewhere you cannot see.
 
 ### Ping
 

@@ -67,8 +67,10 @@ examples:
 
 keys, with the panel focused:
   ctrl-g     move the keyboard between your work and the panel
+  shift-option-arrows  flip between the sessions you have open
   ↑/↓, k/j   move        enter   open the selected session
   g/G        first/last  esc, q  back to your work
+  x          close the selected session's tab
   r          refresh     Q       quit Savras, after asking
   ctrl-l     paint the screen again, if the terminal has scrolled it
 

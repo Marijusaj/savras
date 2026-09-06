@@ -7,7 +7,7 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Padding, Paragraph, Wrap},
 };
 
-use crate::app::{App, Row};
+use crate::app::{App, Row, Tab};
 use crate::job::{age, Job, Status};
 
 /// Keep the summary as long as this many columns are left for it. Claude
@@ -106,6 +106,15 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    // Sessions you have open in tabs behind this one. Each is a live pane
+    // costing memory and a running `claude attach`, so the count is worth
+    // carrying where you can see it.
+    if app.behind_count() > 0 {
+        title.push(Span::styled(
+            format!("  ▷ {}", app.behind_count()),
+            Style::default().fg(Color::Indexed(245)),
+        ));
+    }
     let title = Line::from(title);
 
     frame.render_widget(Paragraph::new(vec![title, counts]), area);
@@ -160,7 +169,13 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
             Row::Spacer => ListItem::new(Line::from("")),
             Row::Job(i) => {
                 let job = &app.snapshot.jobs[*i];
-                ListItem::new(job_line(job, app.alerted(job), name_width, area.width))
+                ListItem::new(job_line(
+                    job,
+                    app.alerted(job),
+                    app.tab(job),
+                    name_width,
+                    area.width,
+                ))
             }
         })
         .collect();
@@ -171,7 +186,13 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
 
 /// One session's row. `alerted` means it pinged and you have not been to it —
 /// the sound is gone in a second, so the panel has to keep pointing.
-fn job_line(job: &Job, alerted: bool, name_width: u16, total_width: u16) -> Line<'static> {
+fn job_line(
+    job: &Job,
+    alerted: bool,
+    tab: Tab,
+    name_width: u16,
+    total_width: u16,
+) -> Line<'static> {
     let age = age(job.updated_at, Utc::now());
     let color = badge_color(job);
     // Claude Code shows the pull request a session produced; it is often the
@@ -185,6 +206,10 @@ fn job_line(job: &Job, alerted: bool, name_width: u16, total_width: u16) -> Line
     // The marker sits where the status star does, so it costs no width in a
     // panel that has none to spare, and a filled dot against a star is a
     // difference you can see without reading.
+    //
+    // A pinged session outranks an open one: the ping is the thing you have
+    // not dealt with, and going to a session clears its mark anyway, so the
+    // two rarely collide.
     let mark = if alerted {
         Span::styled(
             "● ",
@@ -192,6 +217,16 @@ fn job_line(job: &Job, alerted: bool, name_width: u16, total_width: u16) -> Line
                 .fg(Color::Indexed(220))
                 .add_modifier(Modifier::BOLD),
         )
+    } else if tab == Tab::Front {
+        Span::styled(
+            "▶ ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if tab == Tab::Behind {
+        // Open, running, and not on your screen — the state worth seeing.
+        Span::styled("▷ ", Style::default().fg(Color::Indexed(245)))
     } else {
         Span::styled(
             "✳ ",
@@ -293,7 +328,10 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint) {
             Style::default().fg(Color::DarkGray),
         ),
         (None, Hint::Focused) => Span::styled(
-            "↑↓ move · enter open · esc back · Q quit",
+            truncate(
+                "↑↓ move · enter open · x close tab · esc back · Q quit",
+                area.width as usize,
+            ),
             Style::default().fg(Color::DarkGray),
         ),
         (None, Hint::Confirming) => Span::styled(
@@ -303,9 +341,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint) {
             ),
             Style::default().fg(Color::Yellow),
         ),
-        (None, Hint::Background) => {
-            Span::styled("ctrl-g to focus", Style::default().fg(Color::DarkGray))
-        }
+        // The chord is the one key worth advertising from the working pane:
+        // it is the only thing you do without coming here first.
+        (None, Hint::Background) => Span::styled(
+            truncate("ctrl-g to focus · ⇧⌥←→ flip tabs", area.width as usize),
+            Style::default().fg(Color::DarkGray),
+        ),
     };
     frame.render_widget(Paragraph::new(Line::from(text)), area);
 }
@@ -430,6 +471,55 @@ mod tests {
                     .to_string()
             })
             .collect()
+    }
+
+    #[test]
+    fn open_tabs_are_marked_and_the_one_in_front_stands_apart() {
+        // A session running in a tab behind the one you are looking at is the
+        // state worth being able to see: it is live, and it is not on screen.
+        let fixture = three_jobs();
+        let mut app = App::new(fixture.0.clone());
+        app.set_tabs(Some("bbb"), vec!["aaa".into(), "bbb".into()]);
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let lines: Vec<String> = (0..24)
+            .map(|y| {
+                (0..60)
+                    .map(|x| {
+                        terminal
+                            .backend()
+                            .buffer()
+                            .cell((x, y))
+                            .unwrap()
+                            .symbol()
+                            .to_string()
+                    })
+                    .collect::<String>()
+            })
+            .collect();
+        let text = lines.join("\n");
+
+        let front = lines.iter().find(|l| l.contains("ROADMAP")).unwrap();
+        assert!(front.contains('▶'), "the tab in front: {front}");
+        let behind = lines.iter().find(|l| l.contains("ASK")).unwrap();
+        assert!(behind.contains('▷'), "a tab behind it: {behind}");
+        let closed = lines.iter().find(|l| l.contains("FIN")).unwrap();
+        assert!(closed.contains('✳'), "a session with no tab: {closed}");
+
+        assert!(
+            text.contains("▷ 1"),
+            "the header counts the tabs behind you"
+        );
+    }
+
+    #[test]
+    fn a_panel_with_no_working_pane_marks_no_tabs() {
+        // `svr solo` has nowhere to open a session, so nothing is ever in
+        // front and the stars are left alone.
+        let lines = render(&three_jobs(), 60, 24);
+        let text = lines.join("\n");
+        assert!(!text.contains('▶'));
+        assert!(!text.contains('▷'));
     }
 
     #[test]
