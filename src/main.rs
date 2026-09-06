@@ -78,6 +78,8 @@ keys, with the panel focused:
              n does the same with the panel focused
   x          close the selected tab, yours or a session's
   a          start a parallel agent under this session's lead
+  d          delete the selected session for good, after asking:
+             `claude stop` then `claude rm`, which x does not do
   r          refresh     Q       quit Savras, after asking
   ctrl-l     paint the screen again, if the terminal has scrolled it
 
@@ -132,6 +134,20 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+
+    // A panel inside a pane of another panel is two of everything: two lists
+    // of the same sessions, two sets of the keys, and an `attach` opened twice
+    // over the same session if you use them both. Nothing about it is what was
+    // wanted, and the way to another pane is ctrl-t rather than a second copy.
+    // `--once` is exempt: it is plain text, and a status line inside a pane is
+    // a perfectly good place to want it.
+    if host::nested() && !matches!(options.mode, Mode::Once) {
+        eprintln!(
+            "svr: Savras is already running in this terminal.\n\
+             Press ctrl-t for a tab of your own, and ctrl-w/ctrl-s to flip between them."
+        );
+        std::process::exit(2);
+    }
 
     if let Mode::Panel {
         width,

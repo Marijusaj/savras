@@ -194,6 +194,48 @@ pub fn start(name: &str, briefing: &str, cwd: &Path) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Delete a session: stop it, then remove it.
+///
+/// Two commands because they mean different things to Claude Code. `stop`
+/// ends the session and keeps its conversation; `rm` takes the session out of
+/// the list for good, and its worktree with it where that is safe. A session
+/// that has already exited has nothing to stop, so a failing `stop` is not an
+/// error — the delete is what was asked for, and `rm` is the part that has to
+/// work.
+///
+/// This is the second thing Savras does that is not looking, and like starting
+/// an agent it goes through Claude Code's own commands rather than touching
+/// `~/.claude/` itself. Which is the point: the daemon knows what a session is
+/// and what deleting one entails, and a directory removed behind its back
+/// leaves it believing otherwise.
+pub fn delete(short: &str) -> Result<String> {
+    let _ = Command::new("claude")
+        .arg("stop")
+        .arg(short)
+        .stdin(Stdio::null())
+        .output();
+
+    let out = Command::new("claude")
+        .arg("rm")
+        .arg(short)
+        .stdin(Stdio::null())
+        .output()
+        .context("running `claude rm` — is Claude Code on your PATH?")?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        let why = why.trim();
+        anyhow::bail!(
+            "claude rm failed{}",
+            if why.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", first_line(why))
+            }
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or(s)
 }

@@ -188,6 +188,17 @@ already have open brings that tab forward rather than attaching to it twice.
 `x` in the panel closes the selected session's tab, and `q` closes a tab whose
 session has exited.
 
+**`x` closes a tab; `d` deletes the session.** They are different things and
+the difference is the whole point of tabs: closing a tab ends the `attach`, not
+the session, which keeps running and stays in `claude agents`. That is what
+leaves finished sessions piling up there with nothing to clear them. `d` on a
+row asks — naming the session, in yellow, because it cannot be undone — and a
+second `d` runs Claude Code's own `claude stop` and then `claude rm`, which
+takes the session out of the list and its worktree with it where that is safe.
+Its tab closes with it. Savras still never writes to `~/.claude/` itself: the
+daemon knows what a session is, and a directory deleted behind its back leaves
+it believing otherwise.
+
 **Terminal.app is why the control keys exist.** It does not encode modifiers on
 arrow keys at all: `ctrl-shift-←` arrives there as a bare `ESC [ D`, identical
 to the plain left-arrow your session wants, so no program running inside it can
@@ -214,14 +225,23 @@ way, sending `\033[1;4D` and `\033[1;4C` — iTerm2 calls this "Send Escape
 Sequence", and Ghostty and WezTerm have the same thing in their config.
 
 **A pane opened onto a running session repaints itself a moment after it
-appears.** `claude attach` replays the session as it was *drawn* — wrapped for
-whatever width the terminal had when the lines were written. Replayed into a
-pane of a different width, the old wrapping and the new land on top of each
-other and the screen comes up scrambled. Nothing in the byte stream says so and
-the pane is already the right size, so there is no resize to notice; Savras
-jogs the pty one column narrow and straight back instead, and Claude Code
-answers the SIGWINCH by drawing the whole screen again at the size it is
-actually being shown at.
+appears**, and again whenever you come back to the terminal from another
+application. `claude attach` replays the session as it was *drawn* — wrapped
+for whatever width the terminal had when the lines were written. Replayed into
+a pane of a different width, the old wrapping and the new land on top of each
+other and the screen comes up interleaved with itself. Nothing in the byte
+stream says so and the pane is already the right size, so there is no resize to
+notice; Savras jogs the pty one column narrow and straight back instead, and
+Claude Code answers the SIGWINCH by drawing the whole screen again at the size
+it is actually being shown at. Coming back to the window is the other moment it
+shows, because that is when the program repaints unprompted.
+
+**Savras will not run inside itself.** A panel in a pane of another panel is
+two lists of the same sessions, two sets of the keys, and an `attach` opened
+twice over one session if you use both — so typing `svr` in a pane says so and
+tells you to press `ctrl-t` instead. Every pane carries `SAVRAS_PANE` in its
+environment, which is how the second one knows; `svr --once` is exempt, being
+plain text a status line inside a pane may well want.
 
 The cost is worth knowing: an open tab is a live `claude attach` and a
 2000-line scrollback buffer, so the header carries a `▷` count of the tabs

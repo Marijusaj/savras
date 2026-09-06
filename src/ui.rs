@@ -17,22 +17,25 @@ use crate::job::{age, Job, Status};
 const MIN_SUMMARY: usize = 8;
 /// Below this width the resume command in the footer wraps onto a second line.
 const WRAPS: u16 = 60;
+/// At this width and above, the key footer has room for the rarer keys too.
+const ROOMY: u16 = 58;
 /// Below this height the detail footer is dropped to keep rows visible.
 const SHORT: u16 = 16;
 
 /// How the panel is being used, which is all the renderer needs to know to
 /// offer the right keys.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Hint {
+pub enum Hint<'a> {
     /// Running on its own, in its own tab.
     Standalone,
     /// A column beside a working pane, holding the keyboard.
     Focused,
     /// A column beside a working pane that has the keyboard.
     Background,
-    /// Focused, with `Q` pressed once: quitting closes the working pane too,
-    /// so it asks before it does.
-    Confirming,
+    /// Focused, with a question open: the key that was pressed closes
+    /// something for good, so it asks before it does. Carries the question,
+    /// which names what is about to go.
+    Confirming(&'a str),
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
@@ -40,7 +43,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 /// Draw the panel into `area`.
-pub fn draw_in(frame: &mut Frame, area: Rect, app: &mut App, hint: Hint) {
+pub fn draw_in(frame: &mut Frame, area: Rect, app: &mut App, hint: Hint<'_>) {
     let show_detail = area.height >= SHORT && app.selected_job().is_some();
 
     let chunks = Layout::vertical([
@@ -372,7 +375,7 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint) {
+fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
     let text = match (&app.error, hint) {
         (Some(err), _) => Span::styled(
             truncate(err, area.width as usize),
@@ -386,17 +389,21 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint) {
             truncate(
                 // A 44-column footer holds about forty characters, so the
                 // arrows and esc — which nobody needs telling — give up their
-                // place to the keys you would otherwise never find.
-                "enter open · n tab · a agent · x close · Q quit",
+                // place to the keys you would otherwise never find. Past that
+                // there is room for the two rarer ones; `n` is also offered in
+                // the other footer, as ctrl-t, which is where you are standing
+                // when you want it.
+                if area.width >= ROOMY {
+                    "enter open · n tab · d delete · x close · a agent · Q quit"
+                } else {
+                    "enter open · d delete · x close · Q quit"
+                },
                 area.width as usize,
             ),
             Style::default().fg(Color::DarkGray),
         ),
-        (None, Hint::Confirming) => Span::styled(
-            truncate(
-                "Q again to quit Savras · any key stays",
-                area.width as usize,
-            ),
+        (None, Hint::Confirming(question)) => Span::styled(
+            truncate(question, area.width as usize),
             Style::default().fg(Color::Yellow),
         ),
         // The chord is the one key worth advertising from the working pane:
@@ -637,9 +644,30 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(text.contains("a agent"), "starting an agent: {text}");
+        // A 44-column panel gets the four that matter most, deleting included:
+        // it is the one key here that cannot be undone, so it must not be the
+        // one you find out about by accident.
+        assert!(text.contains("d delete"), "deleting a session: {text}");
         assert!(text.contains("x close"), "closing a tab: {text}");
         assert!(text.contains("enter open"));
+        assert!(text.contains("Q quit"), "quitting: {text}");
+
+        // Given room, the rarer two come back.
+        let mut wide = Terminal::new(TestBackend::new(70, 24)).unwrap();
+        wide.draw(|frame| draw_in(frame, frame.area(), &mut app, Hint::Focused))
+            .unwrap();
+        let last: String = (0..70)
+            .map(|x| {
+                wide.backend()
+                    .buffer()
+                    .cell((x, 23))
+                    .unwrap()
+                    .symbol()
+                    .to_string()
+            })
+            .collect();
+        assert!(last.contains("a agent"), "starting an agent: {last}");
+        assert!(last.contains("n tab"), "a tab of your own: {last}");
     }
 
     #[test]

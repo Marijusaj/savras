@@ -47,6 +47,21 @@ const REPAINT: u8 = 0x0c; // Ctrl-L
 /// A control byte, on the other hand, arrives unchanged everywhere.
 const NEW_TAB: u8 = 0x14; // Ctrl-T
 
+/// Set in every pane Savras opens, so a Savras started inside one can tell
+/// that it would be the second panel in the same terminal.
+const NESTED: &str = "SAVRAS_PANE";
+
+/// Whether this process is running inside a pane of another Savras.
+///
+/// An environment variable rather than anything cleverer because it is what a
+/// pane *is*: a child process, and its children after it. It survives shells,
+/// `sudo -E`, ssh into the same box and anything else that keeps the
+/// environment, and unsetting it is the escape hatch for whoever really means
+/// to nest one.
+pub fn nested() -> bool {
+    std::env::var_os(NESTED).is_some()
+}
+
 /// Flipping tabs, one key each way.
 ///
 /// Control bytes, because they are the only keys *every* terminal delivers
@@ -163,6 +178,34 @@ enum Action {
     AddAgent,
     /// Open another pane of your own, running what Savras was started with.
     NewTab,
+    /// `d` in the panel: ask whether the selected session should be deleted.
+    ConfirmDelete,
+    /// The second `d`: delete it.
+    Delete,
+}
+
+/// A question the panel is holding open, waiting for the same key again.
+///
+/// Both of these close something for good — the working pane and everything
+/// beside it, or a session and its conversation — and a single keystroke is
+/// too little to say so with.
+#[derive(Clone)]
+enum Confirm {
+    Quit,
+    Delete { short: String, name: String },
+}
+
+impl Confirm {
+    /// What the footer asks while the question is open. It names the session,
+    /// because "delete it" is only safe to answer if you can see which one.
+    fn question(&self) -> String {
+        match self {
+            Confirm::Quit => "Q again to quit Savras · any key stays".to_string(),
+            Confirm::Delete { name, .. } => {
+                format!("d again to delete {name} for good · any key keeps it")
+            }
+        }
+    }
 }
 
 /// The program running beside the panel, and the pseudo-terminal it lives in.
@@ -518,8 +561,9 @@ fn event_loop(
     // counts as away: missing a question because we assumed you were watching
     // is worse than one ping you did not need.
     let mut window_focused = false;
-    // `Q` has been pressed once and the panel is asking whether to mean it.
-    let mut confirming = false;
+    // A key has been pressed once and the panel is asking whether it was
+    // meant. Both questions here close something you cannot get back.
+    let mut confirming: Option<Confirm> = None;
 
     loop {
         // Follow the child in and out of mouse mode. Its request to enable
@@ -555,7 +599,8 @@ fn event_loop(
                 session.tabs.shorts(),
                 session.tabs.shells(),
             );
-            terminal.draw(|frame| draw(frame, &mut app, &session, focus, dead, confirming))?;
+            terminal
+                .draw(|frame| draw(frame, &mut app, &session, focus, dead, confirming.as_ref()))?;
             last_draw = Instant::now();
             dirty = false;
         }
@@ -563,6 +608,14 @@ fn event_loop(
         match session.input.recv_timeout(TICK) {
             Ok(bytes) => {
                 if let Some(gained) = focus::event(&bytes) {
+                    // Coming back to the window is when a stale idea of the
+                    // pane's width shows itself: the program repaints, wraps
+                    // its lines where the pane does not, and lands the tail on
+                    // top of the row it just wrote. Jog the size and it
+                    // repaints against the truth instead. See `Pane::redraw`.
+                    if gained && !window_focused {
+                        session.tabs.front_mut().redraw = Some(Instant::now());
+                    }
                     window_focused = gained;
                 }
                 let bytes = shift_mouse(&bytes, work_offset(session.width, session.side));
@@ -573,7 +626,7 @@ fn event_loop(
                 } else {
                     focus::strip(&bytes)
                 };
-                let was_confirming = confirming;
+                let was_confirming = confirming.clone();
                 let action = if bytes.is_empty() {
                     Action::Nothing // nothing but a focus event
                 } else if bytes.contains(&NEW_TAB) {
@@ -593,17 +646,42 @@ fn event_loop(
                 } else if dead.is_some() && focus == Focus::Work {
                     dead_pane_key(&bytes)
                 } else {
-                    route(&bytes, focus, &mut app, session.tabs.work_mut(), confirming)?
+                    route(
+                        &bytes,
+                        focus,
+                        &mut app,
+                        session.tabs.work_mut(),
+                        confirming.as_ref(),
+                    )?
                 };
                 // Any key answers the question, so the prompt never outlives
                 // the keystroke that followed it.
-                if was_confirming {
-                    confirming = false;
+                if was_confirming.is_some() {
+                    confirming = None;
                 }
                 match action {
                     Action::Nothing => {}
                     Action::Repaint => terminal.clear()?,
-                    Action::ConfirmQuit => confirming = true,
+                    Action::ConfirmQuit => confirming = Some(Confirm::Quit),
+                    Action::ConfirmDelete => {
+                        if let Some(job) = app.selected_job() {
+                            confirming = Some(Confirm::Delete {
+                                short: job.short.clone(),
+                                name: job.name.clone(),
+                            });
+                        }
+                    }
+                    Action::Delete => {
+                        if let Some(Confirm::Delete { short, name }) = &was_confirming {
+                            delete_session(
+                                &mut session,
+                                &mut app,
+                                &starting,
+                                short.clone(),
+                                name.clone(),
+                            );
+                        }
+                    }
                     Action::Focus(next) => focus = next,
                     Action::Cycle(delta) => {
                         let stop = neighbour(
@@ -666,7 +744,7 @@ fn event_loop(
                             }
                             // The last tab is the working pane itself, and
                             // closing that is quitting — which asks first.
-                            Some(_) => confirming = true,
+                            Some(_) => confirming = Some(Confirm::Quit),
                             None => {}
                         }
                     }
@@ -712,7 +790,9 @@ fn event_loop(
                 // and the panel is watching that directory — so the row
                 // appears on its own, and there is nothing to announce.
                 Ok(_) => app.error = None,
-                Err(e) => app.error = Some(format!("could not start an agent: {e}")),
+                // Already worded where it was raised: one channel now carries
+                // more than one kind of errand.
+                Err(e) => app.error = Some(format!("{e:#}")),
             }
             dirty = true;
         }
@@ -900,6 +980,32 @@ fn reopen(session: &mut Session) -> Result<bool> {
     Ok(true)
 }
 
+/// Delete a session, having asked. Its tab goes with it: an `attach` to a
+/// session that no longer exists is a pane that can only tell you so.
+///
+/// Off the main thread, because `claude stop` and `claude rm` take long enough
+/// between them that doing it here would visibly stall the panel — and the row
+/// disappears on its own when the directory does, so there is nothing to
+/// announce on success.
+fn delete_session(
+    session: &mut Session,
+    app: &mut App,
+    outcome: &mpsc::Sender<Result<String>>,
+    short: String,
+    name: String,
+) {
+    if let Some(index) = session.tabs.position(&short) {
+        session.tabs.close(index);
+    }
+    app.error = Some(format!("deleting {name}…"));
+    let outcome = outcome.clone();
+    std::thread::spawn(move || {
+        let _ = outcome.send(
+            crate::agents::delete(&short).with_context(|| format!("could not delete {name}")),
+        );
+    });
+}
+
 /// Start a parallel agent under the selected session's lead.
 ///
 /// The lead is the selected session's *base* name, so pressing this on
@@ -929,7 +1035,8 @@ fn start_agent(app: &mut App, outcome: &mpsc::Sender<Result<String>>) {
     let outcome = outcome.clone();
     std::thread::spawn(move || {
         let briefing = crate::agents::briefing(&lead, &name);
-        let _ = outcome.send(crate::agents::start(&name, &briefing, &cwd));
+        let _ = outcome
+            .send(crate::agents::start(&name, &briefing, &cwd).context("could not start an agent"));
     });
 }
 
@@ -1021,12 +1128,12 @@ fn route(
     focus: Focus,
     app: &mut App,
     work: &mut Work,
-    confirming: bool,
+    confirming: Option<&Confirm>,
 ) -> Result<Action> {
     // While the panel is asking whether to quit, the answer is the only thing
     // that matters — including ctrl-g, which would otherwise leave the
     // question hanging behind the working pane.
-    if bytes.contains(&FOCUS_TOGGLE) && !confirming {
+    if bytes.contains(&FOCUS_TOGGLE) && confirming.is_none() {
         return Ok(Action::Focus(match focus {
             Focus::Work => Focus::Panel,
             Focus::Panel => Focus::Work,
@@ -1049,17 +1156,28 @@ fn route(
 ///
 /// `confirming` is set once `Q` has been pressed: the next key either confirms
 /// the quit or cancels it, and nothing else happens in between.
-fn panel_key(bytes: &[u8], app: &mut App, confirming: bool) -> Action {
-    if confirming {
-        return match bytes {
-            [b'Q'] => {
-                app.should_quit = true;
-                Action::Nothing
-            }
-            // Anything else is "no": a quit that closes your working pane
-            // should need saying twice, and mean it both times.
-            _ => Action::Focus(Focus::Panel),
-        };
+fn panel_key(bytes: &[u8], app: &mut App, confirming: Option<&Confirm>) -> Action {
+    match confirming {
+        Some(Confirm::Quit) => {
+            return match bytes {
+                [b'Q'] => {
+                    app.should_quit = true;
+                    Action::Nothing
+                }
+                // Anything else is "no": a quit that closes your working pane
+                // should need saying twice, and mean it both times.
+                _ => Action::Focus(Focus::Panel),
+            };
+        }
+        // Deleting a session is not something Savras can undo, and neither can
+        // you: the conversation goes with it.
+        Some(Confirm::Delete { .. }) => {
+            return match bytes {
+                [b'd'] => Action::Delete,
+                _ => Action::Focus(Focus::Panel),
+            };
+        }
+        None => {}
     }
     match bytes {
         [b'j'] | [ESC, b'[', b'B'] => app.step(1),
@@ -1073,6 +1191,10 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: bool) -> Action {
         // can only grow is a leak you cannot see.
         [b'x'] => return Action::CloseSelected,
         [b'a'] => return Action::AddAgent,
+        // Closing a tab leaves the session running, which is the point of
+        // tabs — and why finished sessions pile up in `claude agents` with
+        // nothing here to get rid of them. This is that.
+        [b'd'] => return Action::ConfirmDelete,
         // A tab of your own, for the shell you wanted without leaving Savras
         // to get it. Ctrl-T does the same from the working pane.
         [b'n'] => return Action::NewTab,
@@ -1092,7 +1214,7 @@ fn draw(
     session: &Session,
     focus: Focus,
     dead: Option<u32>,
-    confirming: bool,
+    confirming: Option<&Confirm>,
 ) {
     let area = frame.area();
     let panel_width = session.width.min(area.width.saturating_sub(DIVIDER + 1));
@@ -1114,9 +1236,10 @@ fn draw(
         Side::Right => (chunks[0], chunks[2]),
     };
 
-    let hint = match (focus, confirming) {
-        (Focus::Panel, true) => Hint::Confirming,
-        (Focus::Panel, false) => Hint::Focused,
+    let question = confirming.map(Confirm::question);
+    let hint = match (focus, &question) {
+        (Focus::Panel, Some(what)) => Hint::Confirming(what),
+        (Focus::Panel, None) => Hint::Focused,
         (Focus::Work, _) => Hint::Background,
     };
     ui::draw_in(frame, panel_area, app, hint);
@@ -1352,6 +1475,10 @@ fn build_command(command: &[String], cwd: Option<&Path>) -> Result<CommandBuilde
     }
     // Tell the child what we can actually render.
     builder.env("TERM", "xterm-256color");
+    // So a Savras started in here knows it would be the second one. Read by
+    // [`nested`]; the value is the panel's own pid, which makes it obvious in
+    // `env` what set it and which panel is meant.
+    builder.env(NESTED, std::process::id().to_string());
     Ok(builder)
 }
 
@@ -1428,19 +1555,55 @@ mod tests {
         let mut app = App::new(f.0.clone());
 
         assert!(matches!(
-            panel_key(b"q", &mut app, false),
+            panel_key(b"q", &mut app, None),
             Action::Focus(Focus::Work)
         ));
         assert!(!app.should_quit, "q is not a quit in the side panel");
 
         assert!(matches!(
-            panel_key(b"Q", &mut app, false),
+            panel_key(b"Q", &mut app, None),
             Action::ConfirmQuit
         ));
         assert!(!app.should_quit, "the first Q only asks");
 
-        panel_key(b"Q", &mut app, true);
+        panel_key(b"Q", &mut app, Some(&Confirm::Quit));
         assert!(app.should_quit, "the second Q means it");
+    }
+
+    #[test]
+    fn deleting_a_session_takes_two_presses_and_names_it_in_between() {
+        // `x` closes a tab and leaves the session running, which is what tabs
+        // are for and why finished sessions pile up. `d` is the other thing,
+        // and it cannot be undone — so it asks, and the question says which
+        // session, because "delete it" is only answerable if you can see what
+        // "it" is.
+        let f = Fixture::new("delete").job("aaa", r#"{"state":"done","name":"OLD"}"#);
+        let mut app = App::new(f.0.clone());
+
+        assert!(matches!(
+            panel_key(b"d", &mut app, None),
+            Action::ConfirmDelete
+        ));
+        let asking = Confirm::Delete {
+            short: "aaa".into(),
+            name: "OLD".into(),
+        };
+        assert!(asking.question().contains("OLD"), "{}", asking.question());
+        assert!(matches!(
+            panel_key(b"d", &mut app, Some(&asking)),
+            Action::Delete
+        ));
+        // Anything else keeps it, including the keys that do something else
+        // entirely when no question is open.
+        for answer in [&b"j"[..], b"\r", b"\x1b", b"x", b"q"] {
+            assert!(
+                matches!(
+                    panel_key(answer, &mut app, Some(&asking)),
+                    Action::Focus(Focus::Panel)
+                ),
+                "{answer:?} must not delete a session"
+            );
+        }
     }
 
     #[test]
@@ -1448,7 +1611,7 @@ mod tests {
         let f = Fixture::new("quit-cancel").job("aaa", r#"{"state":"working","name":"X"}"#);
         let mut app = App::new(f.0.clone());
         for answer in [&b"j"[..], b"\r", b"\x1b", b"q"] {
-            panel_key(answer, &mut app, true);
+            panel_key(answer, &mut app, Some(&Confirm::Quit));
             assert!(!app.should_quit, "{answer:?} must not quit Savras");
         }
     }
@@ -1461,7 +1624,7 @@ mod tests {
         let f = Fixture::new("repaint").job("aaa", r#"{"state":"working","name":"X"}"#);
         let mut app = App::new(f.0.clone());
         assert!(matches!(
-            panel_key(b"\x0c", &mut app, false),
+            panel_key(b"\x0c", &mut app, None),
             Action::Repaint
         ));
     }
@@ -1718,7 +1881,7 @@ mod tests {
         // cmd-T for itself, so the reflex needs somewhere to land.
         let f = three_sessions();
         let mut app = App::new(f.0.clone());
-        assert!(matches!(panel_key(b"n", &mut app, false), Action::NewTab));
+        assert!(matches!(panel_key(b"n", &mut app, None), Action::NewTab));
         assert!(b"\x14".contains(&NEW_TAB));
     }
 
@@ -1782,7 +1945,7 @@ mod tests {
         let f = Fixture::new("host-close").job("aaa", r#"{"state":"working","name":"X"}"#);
         let mut app = App::new(f.0.clone());
         assert!(matches!(
-            panel_key(b"x", &mut app, false),
+            panel_key(b"x", &mut app, None),
             Action::CloseSelected
         ));
     }
@@ -1791,7 +1954,7 @@ mod tests {
     fn a_starts_a_parallel_agent() {
         let f = Fixture::new("host-agent").job("aaa", r#"{"state":"working","name":"X"}"#);
         let mut app = App::new(f.0.clone());
-        assert!(matches!(panel_key(b"a", &mut app, false), Action::AddAgent));
+        assert!(matches!(panel_key(b"a", &mut app, None), Action::AddAgent));
     }
 
     #[test]
@@ -1894,8 +2057,8 @@ mod tests {
     fn enter_on_the_panel_asks_to_open_the_session() {
         let f = Fixture::new("host-open").job("aaa", r#"{"state":"working","name":"X"}"#);
         let mut app = App::new(f.0.clone());
-        assert!(matches!(panel_key(b"\r", &mut app, false), Action::Open));
-        assert!(matches!(panel_key(b"\n", &mut app, false), Action::Open));
+        assert!(matches!(panel_key(b"\r", &mut app, None), Action::Open));
+        assert!(matches!(panel_key(b"\n", &mut app, None), Action::Open));
     }
 
     #[test]
@@ -1912,7 +2075,7 @@ mod tests {
         let f = Fixture::new("host-esc").job("aaa", r#"{"state":"working","name":"X"}"#);
         let mut app = App::new(f.0.clone());
         assert!(matches!(
-            panel_key(b"\x1b", &mut app, false),
+            panel_key(b"\x1b", &mut app, None),
             Action::Focus(Focus::Work)
         ));
         assert!(!app.should_quit, "the panel must not close the window");
