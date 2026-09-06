@@ -129,6 +129,34 @@ your shell at the head of the list. Landing on a session opens it if it has no
 pane yet, so every row is one press away rather than three, and the panel's
 cursor moves with you so the highlight always says where you are.
 
+**`ctrl-t` opens a tab of your own**, and `n` in the panel does the same. It
+runs what Savras was started with — your shell for plain `svr`, whatever
+followed `--` otherwise — in the directory Savras was started in. Your terminal
+keeps `cmd-t` for itself and always will, so the new tab it gives you is the
+wrong one: a window *beside* Savras, without the panel and without the sessions
+you have open. This is the same gesture, one level in.
+
+Those panes are rows, at the head of the list, carrying the same markers as the
+sessions below them:
+
+```
+SAVRAS  ◦ live  ▶ shell 2  ▷ 3
+1 needs input · 3 working · 2 done
+
+▷ shell
+▶ shell 2                                        ← the one you are typing in
+
+Needs input
+● AGENT-2     approve Bash: M=/User…    #382 5m
+```
+
+They are rows because they are stops: the flip keys walk them like anything
+else, and a stop you cannot see is one you go to without knowing where you
+went. One shell is drawn unnumbered and unnamed in the header, which is what an
+unnamed pane has always meant here. `x` closes the one under the cursor, and
+leaving it — `exit`, `ctrl-d` — leaves a dead tab rather than closing Savras;
+only the shell you *arrived* in still takes the panel with it.
+
 **The order holds still.** Rows are grouped by status and then sorted by name,
 never by how recently a session did something. Freshest-first was the first cut
 and it made the panel unnavigable: a working session rewrites its timestamp
@@ -184,6 +212,16 @@ all, so the terminal keeps every Command chord for its own tabs and the program
 inside never sees one. If you want the Cmd feel, map `cmd-shift-←/→` the same
 way, sending `\033[1;4D` and `\033[1;4C` — iTerm2 calls this "Send Escape
 Sequence", and Ghostty and WezTerm have the same thing in their config.
+
+**A pane opened onto a running session repaints itself a moment after it
+appears.** `claude attach` replays the session as it was *drawn* — wrapped for
+whatever width the terminal had when the lines were written. Replayed into a
+pane of a different width, the old wrapping and the new land on top of each
+other and the screen comes up scrambled. Nothing in the byte stream says so and
+the pane is already the right size, so there is no resize to notice; Savras
+jogs the pty one column narrow and straight back instead, and Claude Code
+answers the SIGWINCH by drawing the whole screen again at the size it is
+actually being shown at.
 
 The cost is worth knowing: an open tab is a live `claude attach` and a
 2000-line scrollback buffer, so the header carries a `▷` count of the tabs

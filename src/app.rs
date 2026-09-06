@@ -12,8 +12,22 @@ use crate::job::{self, Job, Snapshot, Status};
 pub enum Row {
     Heading(Status),
     Job(usize),
+    /// A pane of your own — the shell Savras started with, and any you have
+    /// added since. They sit at the head of the list because that is where
+    /// flipping already put them, and a stop you cannot see is a stop you
+    /// cannot use.
+    Shell(usize),
     /// A blank line between groups. Drawn, never selected.
     Spacer,
+}
+
+/// What the working pane is showing. The panel is told, so it can mark the
+/// row you are on and name it in the header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Front {
+    /// The nth pane of your own, counted in the order they were opened.
+    Shell(usize),
+    Session(String),
 }
 
 pub struct App {
@@ -35,7 +49,14 @@ pub struct App {
     /// the only place that says so: a session in a background tab is running
     /// and unattended, which is exactly the thing worth being able to see.
     tabs: Vec<String>,
-    front: Option<String>,
+    front: Option<Front>,
+    /// How many panes of your own are open — one at the very least, since
+    /// Savras always starts with a shell. Zero means there is no working pane
+    /// at all, which is the standalone panel.
+    shells: usize,
+    /// What to call them: the program Savras hosts, so `svr` says "shell" and
+    /// `svr -- claude` says "claude". A new tab runs the same thing.
+    shell_label: String,
     /// What to call the keys that flip between sessions. Only ever shown once
     /// there is a session to flip to: a key that would do nothing is worse
     /// than no key at all, because you try it and conclude it is broken.
@@ -53,6 +74,17 @@ pub enum Tab {
     None,
 }
 
+/// Where the cursor was, in terms that outlive a rebuild of the row list.
+enum Anchor {
+    Shell(usize),
+    Job(String),
+}
+
+/// Rows you can land on. Headings and blank lines are drawn, never selected.
+fn selectable(row: &Row) -> bool {
+    matches!(row, Row::Job(_) | Row::Shell(_))
+}
+
 impl App {
     pub fn new(jobs_dir: PathBuf) -> Self {
         let mut app = Self {
@@ -65,6 +97,8 @@ impl App {
             alerted: HashSet::new(),
             tabs: Vec::new(),
             front: None,
+            shells: 0,
+            shell_label: "shell".to_string(),
             switch_label: None,
             should_quit: false,
         };
@@ -87,9 +121,37 @@ impl App {
     /// Tell the panel which sessions are open in tabs, and which is in front.
     /// The standalone panel has no working pane, so it never calls this and
     /// every session stays [`Tab::None`].
-    pub fn set_tabs(&mut self, front: Option<&str>, open: Vec<String>) {
-        self.front = front.map(str::to_string);
+    pub fn set_tabs(&mut self, front: Front, open: Vec<String>, shells: usize) {
+        let was = self.shells;
+        self.front = Some(front);
         self.tabs = open;
+        self.shells = shells;
+        if was != shells {
+            // The rows changed shape, and the cursor has to survive it.
+            let anchor = self.anchor();
+            self.rebuild_rows();
+            self.restore_selection(anchor);
+        }
+    }
+
+    /// Name the panes of your own, after the program Savras hosts.
+    pub fn set_shell_label(&mut self, label: String) {
+        self.shell_label = label;
+    }
+
+    /// What the nth pane of your own is called. The first is unnumbered: with
+    /// one shell there is no number to tell it from, and with several the
+    /// numbers match the order you opened them.
+    pub fn shell_name(&self, i: usize) -> String {
+        if i == 0 {
+            self.shell_label.clone()
+        } else {
+            format!("{} {}", self.shell_label, i + 1)
+        }
+    }
+
+    pub fn shells(&self) -> usize {
+        self.shells
     }
 
     /// Name the key that flips tabs, for the footer to offer.
@@ -100,7 +162,7 @@ impl App {
     /// The keys to advertise for flipping sessions — only once there is a
     /// session to flip to.
     pub fn switch_hint(&self) -> Option<&str> {
-        if self.snapshot.is_empty() {
+        if self.snapshot.is_empty() && self.shells < 2 {
             return None;
         }
         self.switch_label.as_deref()
@@ -112,17 +174,31 @@ impl App {
     /// a pane full of somebody else's output looks much like any other. The
     /// panel is the one place that always knows, so it is the one place that
     /// should always say.
-    pub fn front_name(&self) -> Option<&str> {
-        let short = self.front.as_deref()?;
-        self.snapshot
-            .jobs
-            .iter()
-            .find(|j| j.short == short)
-            .map(|j| j.name.as_str())
+    pub fn front_name(&self) -> Option<String> {
+        match self.front.as_ref()? {
+            Front::Session(short) => self
+                .snapshot
+                .jobs
+                .iter()
+                .find(|j| &j.short == short)
+                .map(|j| j.name.clone()),
+            // One shell needs no naming — an unnamed pane *is* the shell, and
+            // that has been true since before there were tabs. Several do.
+            Front::Shell(_) if self.shells < 2 => None,
+            Front::Shell(i) => Some(self.shell_name(*i)),
+        }
+    }
+
+    /// Whether the nth pane of your own is the one in the working pane.
+    pub fn shell_tab(&self, i: usize) -> Tab {
+        match self.front {
+            Some(Front::Shell(front)) if front == i => Tab::Front,
+            _ => Tab::Behind,
+        }
     }
 
     pub fn tab(&self, job: &Job) -> Tab {
-        if self.front.as_deref() == Some(job.short.as_str()) {
+        if self.front == Some(Front::Session(job.short.clone())) {
             Tab::Front
         } else if self.tabs.iter().any(|short| short == &job.short) {
             Tab::Behind
@@ -133,10 +209,7 @@ impl App {
 
     /// How many sessions are open behind the one you are looking at.
     pub fn behind_count(&self) -> usize {
-        self.tabs
-            .iter()
-            .filter(|short| self.front.as_deref() != Some(short.as_str()))
-            .count()
+        (self.shells + self.tabs.len()).saturating_sub(1)
     }
 
     pub fn alert_count(&self) -> usize {
@@ -168,9 +241,9 @@ impl App {
         self.alerted.remove(short);
     }
 
-    /// Re-read from disk, keeping the cursor on the same job where possible.
+    /// Re-read from disk, keeping the cursor on the same row where possible.
     pub fn refresh(&mut self) {
-        let anchor = self.selected_job().map(|j| j.short.clone());
+        let anchor = self.anchor();
 
         match job::load(&self.jobs_dir) {
             Ok(snapshot) => {
@@ -196,8 +269,26 @@ impl App {
         });
     }
 
+    /// What the cursor is on now, in terms that survive the list being rebuilt.
+    fn anchor(&self) -> Option<Anchor> {
+        match self.current_row() {
+            Some(Row::Job(i)) => self
+                .snapshot
+                .jobs
+                .get(i)
+                .map(|j| Anchor::Job(j.short.clone())),
+            Some(Row::Shell(i)) => Some(Anchor::Shell(i)),
+            _ => None,
+        }
+    }
+
     fn rebuild_rows(&mut self) {
         self.rows.clear();
+        // Your own panes first, unheaded: one shell needs no group and several
+        // read as a list on their own.
+        for i in 0..self.shells {
+            self.rows.push(Row::Shell(i));
+        }
         for status in [Status::NeedsInput, Status::Working, Status::Done] {
             let group: Vec<usize> = self
                 .snapshot
@@ -220,28 +311,33 @@ impl App {
 
     /// Put the cursor back on the job it was on. If that job is gone, fall back
     /// to the same position, then to the first job.
-    fn restore_selection(&mut self, anchor: Option<String>) {
+    fn restore_selection(&mut self, anchor: Option<Anchor>) {
         let previous = self.list_state.selected();
 
         let target = anchor
-            .and_then(|short| {
-                self.rows.iter().position(|r| match r {
-                    Row::Job(i) => self.snapshot.jobs[*i].short == short,
+            .and_then(|anchor| {
+                self.rows.iter().position(|r| match (r, &anchor) {
+                    (Row::Job(i), Anchor::Job(short)) => &self.snapshot.jobs[*i].short == short,
+                    (Row::Shell(i), Anchor::Shell(j)) => i == j,
                     _ => false,
                 })
             })
             .or_else(|| previous.filter(|i| *i < self.rows.len()))
-            .or_else(|| self.first_job_row());
+            .or_else(|| self.first_selectable_row());
 
         self.list_state.select(target);
         // The fallback may have landed on a heading or a blank line.
-        if !matches!(self.current_row(), Some(Row::Job(_))) {
+        if !self.on_selectable() {
             self.step(1);
         }
     }
 
-    fn first_job_row(&self) -> Option<usize> {
-        self.rows.iter().position(|r| matches!(r, Row::Job(_)))
+    fn first_selectable_row(&self) -> Option<usize> {
+        self.rows.iter().position(selectable)
+    }
+
+    fn on_selectable(&self) -> bool {
+        self.current_row().as_ref().is_some_and(selectable)
     }
 
     fn current_row(&self) -> Option<Row> {
@@ -258,6 +354,26 @@ impl App {
         }
     }
 
+    /// Which of your own panes the cursor is on, if it is on one at all.
+    pub fn selected_shell(&self) -> Option<usize> {
+        match self.current_row() {
+            Some(Row::Shell(i)) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Put the cursor on one of your own panes, so flipping to it moves the
+    /// highlight with you, exactly as flipping to a session does.
+    pub fn select_shell(&mut self, i: usize) {
+        if let Some(row) = self
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Shell(j) if *j == i))
+        {
+            self.list_state.select(Some(row));
+        }
+    }
+
     /// Move the cursor by `delta` job rows, skipping headings and stopping at
     /// the ends rather than wrapping.
     pub fn step(&mut self, delta: isize) {
@@ -271,7 +387,7 @@ impl App {
             if i < 0 || i as usize >= self.rows.len() {
                 return; // no job that way; leave the cursor where it was
             }
-            if matches!(self.rows[i as usize], Row::Job(_)) {
+            if selectable(&self.rows[i as usize]) {
                 self.list_state.select(Some(i as usize));
                 self.attend();
                 return;
@@ -285,11 +401,11 @@ impl App {
         }
         if to_end {
             self.list_state.select(Some(self.rows.len() - 1));
-            if !matches!(self.current_row(), Some(Row::Job(_))) {
+            if !self.on_selectable() {
                 self.step(-1);
             }
         } else {
-            self.list_state.select(self.first_job_row());
+            self.list_state.select(self.first_selectable_row());
         }
         self.attend();
     }
@@ -472,6 +588,55 @@ mod tests {
         std::fs::remove_dir_all(f.0.join("ccc")).unwrap();
         app.refresh();
         assert_eq!(app.alert_count(), 0);
+    }
+
+    #[test]
+    fn your_own_panes_head_the_list_and_take_the_cursor() {
+        // They are flip stops, so they have to be rows: a stop you cannot see
+        // is one you walk past without knowing where you went.
+        let f = fixture();
+        let mut app = App::new(f.0.clone());
+        app.set_tabs(Front::Shell(1), Vec::new(), 2);
+
+        assert!(matches!(app.rows[0], Row::Shell(0)));
+        assert!(matches!(app.rows[1], Row::Shell(1)));
+        assert_eq!(app.shell_name(0), "shell");
+        assert_eq!(app.shell_name(1), "shell 2");
+        assert_eq!(app.shell_tab(1), Tab::Front);
+        assert_eq!(app.shell_tab(0), Tab::Behind);
+
+        // The cursor lands on them and comes back off.
+        app.jump(false);
+        assert_eq!(app.selected_shell(), Some(0));
+        assert!(app.selected_job().is_none());
+        app.step(1);
+        assert_eq!(app.selected_shell(), Some(1));
+        app.step(1);
+        assert!(app.selected_job().is_some(), "on to the sessions");
+    }
+
+    #[test]
+    fn the_cursor_stays_on_the_pane_it_was_on_across_a_refresh() {
+        // Rows are rebuilt every couple of seconds; a cursor that slid off
+        // your own pane onto a session would make the keys unusable.
+        let f = fixture();
+        let mut app = App::new(f.0.clone());
+        app.set_tabs(Front::Shell(0), Vec::new(), 2);
+        app.select_shell(1);
+        assert_eq!(app.selected_shell(), Some(1));
+        app.refresh();
+        assert_eq!(app.selected_shell(), Some(1));
+    }
+
+    #[test]
+    fn one_shell_needs_no_naming_but_several_do() {
+        // An unnamed pane has meant "the shell" since before there were tabs.
+        let f = fixture();
+        let mut app = App::new(f.0.clone());
+        app.set_tabs(Front::Shell(0), Vec::new(), 1);
+        assert_eq!(app.front_name(), None);
+        app.set_tabs(Front::Shell(1), Vec::new(), 2);
+        assert_eq!(app.front_name().as_deref(), Some("shell 2"));
     }
 
     #[test]

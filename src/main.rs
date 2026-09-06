@@ -74,7 +74,9 @@ keys, with the panel focused:
              as do ctrl-shift-arrows where the terminal sends them
   ↑/↓, k/j   move        enter   open the selected session
   g/G        first/last  esc, q  back to your work
-  x          close the selected session's tab
+  ctrl-t     a tab of your own, running what Savras was started with;
+             n does the same with the panel focused
+  x          close the selected tab, yours or a session's
   a          start a parallel agent under this session's lead
   r          refresh     Q       quit Savras, after asking
   ctrl-l     paint the screen again, if the terminal has scrolled it
@@ -206,12 +208,13 @@ fn control(letter: char) -> Result<u8> {
         anyhow::bail!("--switch takes letters, not {letter}");
     }
     let letter = letter.to_ascii_lowercase();
-    // Letters whose control byte is already something else entirely: g and l
-    // are Savras's own keys, and the rest are enter, tab, backspace and the
+    // Letters whose control byte is already something else entirely: g, l and
+    // t are Savras's own keys, and the rest are enter, tab, backspace and the
     // signals, none of which can be handed to anything.
     if let Some(what) = match letter {
         'g' => Some("ctrl-g, which focuses the panel"),
         'l' => Some("ctrl-l, which repaints the screen"),
+        't' => Some("ctrl-t, which opens a tab"),
         'c' => Some("ctrl-c, which interrupts"),
         'd' => Some("ctrl-d, which is end-of-file"),
         'h' => Some("backspace"),

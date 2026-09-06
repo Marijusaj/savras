@@ -143,7 +143,9 @@ fn count_span(n: usize, label: &str, color: Color) -> Span<'static> {
 }
 
 fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
-    if app.snapshot.is_empty() {
+    // With panes of your own open there is a list even when there are no
+    // sessions in it — those rows are where the flip keys land.
+    if app.snapshot.is_empty() && app.shells() < 2 {
         let msg = Paragraph::new(vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -180,6 +182,11 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             ))),
             Row::Spacer => ListItem::new(Line::from("")),
+            Row::Shell(i) => ListItem::new(shell_line(
+                &app.shell_name(*i),
+                app.shell_tab(*i),
+                name_width,
+            )),
             Row::Job(i) => {
                 let job = &app.snapshot.jobs[*i];
                 ListItem::new(job_line(
@@ -195,6 +202,31 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let list = List::new(items).highlight_style(Style::default().bg(Color::Indexed(236)));
     frame.render_stateful_widget(list, area, &mut app.list_state);
+}
+
+/// One pane of your own: the shell Savras started with, or one you added.
+///
+/// It carries the same markers as a session — filled for the pane you are in,
+/// hollow for one running behind it — because it is the same kind of thing,
+/// and the point of showing it at all is that flipping walks through it.
+fn shell_line(name: &str, tab: Tab, name_width: u16) -> Line<'static> {
+    let mark = if tab == Tab::Front {
+        Span::styled(
+            "▶ ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("▷ ", Style::default().fg(Color::Indexed(245)))
+    };
+    Line::from(vec![
+        mark,
+        Span::styled(
+            pad(name, name_width as usize),
+            Style::default().fg(Color::Indexed(245)),
+        ),
+    ])
 }
 
 /// One session's row. `alerted` means it pinged and you have not been to it —
@@ -355,7 +387,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint) {
                 // A 44-column footer holds about forty characters, so the
                 // arrows and esc — which nobody needs telling — give up their
                 // place to the keys you would otherwise never find.
-                "enter open · a agent · x close · Q quit",
+                "enter open · n tab · a agent · x close · Q quit",
                 area.width as usize,
             ),
             Style::default().fg(Color::DarkGray),
@@ -372,8 +404,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint) {
         (None, Hint::Background) => Span::styled(
             truncate(
                 &match app.switch_hint() {
-                    Some(keys) => format!("ctrl-g focus · {keys} sessions"),
-                    None => "ctrl-g to focus".to_string(),
+                    Some(keys) => format!("ctrl-g focus · {keys} tabs · ctrl-t new"),
+                    None => "ctrl-g focus · ctrl-t new tab".to_string(),
                 },
                 area.width as usize,
             ),
@@ -445,7 +477,7 @@ fn thousands(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::App;
+    use crate::app::{App, Front};
     use crate::testing::Fixture;
     use ratatui::backend::TestBackend;
 
@@ -512,7 +544,11 @@ mod tests {
         // always knows which session it is, so it always says.
         let fixture = three_jobs();
         let mut app = App::new(fixture.0.clone());
-        app.set_tabs(Some("bbb"), vec!["aaa".into(), "bbb".into()]);
+        app.set_tabs(
+            Front::Session("bbb".into()),
+            vec!["aaa".into(), "bbb".into()],
+            1,
+        );
         let mut terminal = Terminal::new(TestBackend::new(44, 24)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let header: String = (0..44)
@@ -536,7 +572,11 @@ mod tests {
         // state worth being able to see: it is live, and it is not on screen.
         let fixture = three_jobs();
         let mut app = App::new(fixture.0.clone());
-        app.set_tabs(Some("bbb"), vec!["aaa".into(), "bbb".into()]);
+        app.set_tabs(
+            Front::Session("bbb".into()),
+            vec!["aaa".into(), "bbb".into()],
+            1,
+        );
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let lines: Vec<String> = (0..24)
@@ -564,8 +604,8 @@ mod tests {
         assert!(closed.contains('✳'), "a session with no tab: {closed}");
 
         assert!(
-            text.contains("▷ 1"),
-            "the header counts the tabs behind you"
+            text.contains("▷ 2"),
+            "the header counts the panes behind you, the shell included"
         );
     }
 
@@ -644,7 +684,7 @@ mod tests {
         let mut app = App::new(three_jobs().0.clone());
         app.set_switch(Some("ctrl-w/s".into()));
         let text = render_background(&mut app);
-        assert!(text.contains("ctrl-w/s sessions"), "{text}");
+        assert!(text.contains("ctrl-w/s tabs"), "{text}");
     }
 
     #[test]

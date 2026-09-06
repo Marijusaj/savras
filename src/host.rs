@@ -22,7 +22,7 @@ use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySyste
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::app::App;
+use crate::app::{App, Front};
 use crate::focus;
 use crate::job::Snapshot;
 use crate::ping::Ping;
@@ -38,6 +38,14 @@ const ESC: u8 = 0x1b;
 /// alternate-screen application, and a scrollbar drag sends no bytes at all —
 /// Savras cannot see it happen, so it needs a way to be told to repaint.
 const REPAINT: u8 = 0x0c; // Ctrl-L
+
+/// A new tab, from either side of the divider.
+///
+/// Ctrl-T because cmd-T is the reflex and no terminal can pass it on: Command
+/// is not in the terminal's modifier encoding at all, so the terminal keeps
+/// every Command chord for its own tabs and the program inside never sees one.
+/// A control byte, on the other hand, arrives unchanged everywhere.
+const NEW_TAB: u8 = 0x14; // Ctrl-T
 
 /// Flipping tabs, one key each way.
 ///
@@ -97,6 +105,13 @@ const TICK: Duration = Duration::from_millis(16);
 /// Repaint at least this often even when nothing changed, so ages keep ticking.
 const REDRAW: Duration = Duration::from_millis(500);
 const REFRESH: Duration = Duration::from_secs(2);
+
+/// How long to wait before jogging a new pane's size to make it repaint.
+///
+/// Long enough for the program to have started and to be handling signals —
+/// `claude attach` takes a moment to come up — and short enough that a screen
+/// which came up wrong is put right before you have read it.
+const REDRAW_AFTER: Duration = Duration::from_millis(1200);
 /// Columns taken by the divider between the panel and the working pane.
 const DIVIDER: u16 = 1;
 /// Turns every mouse reporting mode back off.
@@ -146,6 +161,8 @@ enum Action {
     CloseSelected,
     /// Start a parallel agent under the selected session's lead.
     AddAgent,
+    /// Open another pane of your own, running what Savras was started with.
+    NewTab,
 }
 
 /// The program running beside the panel, and the pseudo-terminal it lives in.
@@ -260,6 +277,17 @@ struct Pane {
     short: Option<String>,
     reopen: Option<(Vec<String>, PathBuf)>,
     work: Work,
+    /// When to jog this pane's size, once, so its program repaints.
+    ///
+    /// `claude attach` replays a session's transcript as it was *drawn* — at
+    /// whatever width the terminal had when the lines were written. Replayed
+    /// into a pane of a different width, the old wrapping and the new overlap
+    /// and the screen comes up scrambled. Nothing in the byte stream says so,
+    /// and the pane is the right size already, so there is no resize to
+    /// notice. A size jog a moment after the child starts sends a SIGWINCH,
+    /// and Claude Code answers it by drawing the whole screen again — this
+    /// time at the size it is actually being shown at.
+    redraw: Option<Instant>,
 }
 
 /// The sessions you have open, and which one is in front.
@@ -284,6 +312,7 @@ impl Tabs {
                 short: None,
                 reopen: None,
                 work,
+                redraw: None,
             }],
             current: 0,
         }
@@ -314,6 +343,37 @@ impl Tabs {
     /// marks.
     fn shorts(&self) -> Vec<String> {
         self.open.iter().filter_map(|t| t.short.clone()).collect()
+    }
+
+    /// How many panes of your own are open. Never zero: Savras starts with
+    /// one and the last tab cannot be closed.
+    fn shells(&self) -> usize {
+        self.open.iter().filter(|t| t.short.is_none()).count()
+    }
+
+    /// Where the nth pane of your own sits in the tab list.
+    fn shell_at(&self, n: usize) -> Option<usize> {
+        self.open
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.short.is_none())
+            .map(|(i, _)| i)
+            .nth(n)
+    }
+
+    /// What the panel should mark as the pane you are in.
+    fn front_ref(&self) -> Front {
+        match self.short() {
+            Some(short) => Front::Session(short.to_string()),
+            // Counted in tab order, which is the order they were opened —
+            // the same order the panel lists them in.
+            None => Front::Shell(
+                self.open[..self.current]
+                    .iter()
+                    .filter(|t| t.short.is_none())
+                    .count(),
+            ),
+        }
     }
 
     fn position(&self, short: &str) -> Option<usize> {
@@ -382,6 +442,7 @@ pub fn run(
         size: (cols, rows),
         input: stdin_thread(),
         tabs: Tabs::new(work),
+        command,
         switch,
         ping,
     };
@@ -408,6 +469,10 @@ struct Session {
     /// front is never pinged for: it is asking you in person, on the other
     /// half of the screen.
     tabs: Tabs,
+    /// What Savras was started with, and so what a new tab runs: your shell
+    /// for plain `svr`, and the command after `--` for anything else. One
+    /// rule, and in the default case it is what cmd-T gives you anyway.
+    command: Vec<String>,
     /// The keys that flip tabs, or given back to the child by `--switch off`.
     switch: Switch,
     ping: Ping,
@@ -427,6 +492,7 @@ fn event_loop(
     // Ctrl-O renders as "ctrl-o": the byte is the letter with its top three
     // bits cleared, so putting them back names the key again.
     app.set_switch(session.switch.label());
+    app.set_shell_label(pane_label(&session.command));
     // Starting an agent runs `claude --bg`, which takes long enough that doing
     // it on this thread would visibly stall the panel. The outcome comes back
     // here, since a session that failed to start must say so rather than
@@ -481,6 +547,14 @@ fn event_loop(
         }
 
         if dirty || last_draw.elapsed() >= REDRAW {
+            // Which tabs exist, and which one you are in, before it is drawn:
+            // opening or closing one has to show up in the same breath as the
+            // key that did it, not on the next two-second refresh.
+            app.set_tabs(
+                session.tabs.front_ref(),
+                session.tabs.shorts(),
+                session.tabs.shells(),
+            );
             terminal.draw(|frame| draw(frame, &mut app, &session, focus, dead, confirming))?;
             last_draw = Instant::now();
             dirty = false;
@@ -502,8 +576,16 @@ fn event_loop(
                 let was_confirming = confirming;
                 let action = if bytes.is_empty() {
                     Action::Nothing // nothing but a focus event
-                } else if let Some(delta) = switch(&bytes, session.switch, !app.snapshot.is_empty())
-                {
+                } else if bytes.contains(&NEW_TAB) {
+                    // From either side of the divider, and without going
+                    // through the panel: this is the key you reach for
+                    // *because* the terminal's own cmd-T is the wrong tab.
+                    Action::NewTab
+                } else if let Some(delta) = switch(
+                    &bytes,
+                    session.switch,
+                    !app.snapshot.is_empty() || session.tabs.shells() > 1,
+                ) {
                     // Flipping tabs works from either side, and without going
                     // through the panel: it is the one thing you do often
                     // enough that three keystrokes is two too many.
@@ -524,24 +606,23 @@ fn event_loop(
                     Action::ConfirmQuit => confirming = true,
                     Action::Focus(next) => focus = next,
                     Action::Cycle(delta) => {
-                        let stop = neighbour(&app.snapshot, session.tabs.short(), delta);
+                        let stop = neighbour(
+                            &app.snapshot,
+                            session.tabs.shells(),
+                            &session.tabs.front_ref(),
+                            delta,
+                        );
                         let moved = match stop {
-                            // Back to the shell you started in, which is
-                            // always the tab Savras opened with.
-                            Some(Stop::Shell) => {
-                                let home = session
-                                    .tabs
-                                    .open
-                                    .iter()
-                                    .position(|pane| pane.short.is_none());
-                                match home {
-                                    Some(index) => {
-                                        session.tabs.go_to(index);
-                                        Ok(true)
-                                    }
-                                    None => Ok(false),
+                            // Back to a pane of your own, in the order you
+                            // opened them.
+                            Some(Stop::Shell(n)) => match session.tabs.shell_at(n) {
+                                Some(index) => {
+                                    session.tabs.go_to(index);
+                                    app.select_shell(n);
+                                    Ok(true)
                                 }
-                            }
+                                None => Ok(false),
+                            },
                             Some(Stop::Session(short)) => {
                                 open_short(&mut session, &mut app, &short)
                             }
@@ -560,12 +641,24 @@ fn event_loop(
                         }
                     }
                     Action::AddAgent => start_agent(&mut app, &starting),
+                    Action::NewTab => match new_tab(&mut session) {
+                        Ok(()) => {
+                            focus = Focus::Work;
+                            terminal.clear()?;
+                        }
+                        Err(e) => app.error = Some(format!("could not open a tab: {e}")),
+                    },
                     Action::CloseFront | Action::CloseSelected => {
                         let target = match action {
                             Action::CloseFront => Some(session.tabs.current),
-                            _ => app
-                                .selected_job()
-                                .and_then(|job| session.tabs.position(&job.short)),
+                            // `x` closes whatever the cursor is on, which is a
+                            // pane of your own as readily as a session's.
+                            _ => match app.selected_shell() {
+                                Some(n) => session.tabs.shell_at(n),
+                                None => app
+                                    .selected_job()
+                                    .and_then(|job| session.tabs.position(&job.short)),
+                            },
                         };
                         match target {
                             Some(index) if session.tabs.close(index) => {
@@ -635,12 +728,15 @@ fn event_loop(
                 .ping
                 .poll(&app.snapshot, watching(window_focused, open.as_deref()));
             app.alert(pinged);
-            app.set_tabs(session.tabs.short(), session.tabs.shorts());
             last_refresh = Instant::now();
             dirty = true;
         }
 
         if resize_if_needed(&mut session)? {
+            dirty = true;
+        }
+
+        if jog_new_panes(&mut session) {
             dirty = true;
         }
     }
@@ -690,6 +786,9 @@ fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool>
         short: Some(short.clone()),
         reopen: Some((command, cwd)),
         work,
+        // An attach replays the session as it was drawn in another terminal,
+        // at another width. Jog it into repainting at this one.
+        redraw: Some(Instant::now() + REDRAW_AFTER),
     });
     // Going to a session is the clearest possible way of saying you saw which
     // one it was.
@@ -698,11 +797,60 @@ fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool>
     Ok(true)
 }
 
+/// Make a freshly opened pane draw itself again, at the size it is really
+/// being shown at.
+///
+/// See [`Pane::redraw`] for why: a replayed transcript is wrapped for the
+/// terminal it was written in, not for this pane, and the two layouts land on
+/// top of each other. The tty signals only on a size that *changed*, so the
+/// jog goes one column narrow and straight back — a wrong width for an instant
+/// is the price of a correct screen after it.
+fn jog_new_panes(session: &mut Session) -> bool {
+    let (cols, rows) = session.work_size();
+    let now = Instant::now();
+    let mut jogged = false;
+    for tab in &mut session.tabs.open {
+        if tab.redraw.is_some_and(|at| now >= at) {
+            tab.redraw = None;
+            let _ = tab.work.resize(cols.saturating_sub(1).max(1), rows);
+            let _ = tab.work.resize(cols, rows);
+            jogged = true;
+        }
+    }
+    jogged
+}
+
+/// Open another pane of your own, running what Savras was started with.
+///
+/// The terminal's own cmd-T is the wrong tab: it gives you a window beside
+/// Savras rather than one inside it, without the panel and without the
+/// sessions you have open. This is the same gesture, one level in.
+///
+/// It runs the command Savras was started with — your shell for plain `svr`,
+/// and whatever followed `--` otherwise — in the directory Savras was started
+/// in. `Origin::Opened`, so leaving it closes the tab rather than Savras: only
+/// the shell you *arrived* in still takes the panel with it.
+fn new_tab(session: &mut Session) -> Result<()> {
+    let (cols, rows) = session.work_size();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let command = session.command.clone();
+    // Spawn before touching the tab list, so a failure changes nothing.
+    let work = Work::spawn(&command, Some(&cwd), cols, rows, Origin::Opened)?;
+    session.tabs.push(Pane {
+        short: None,
+        reopen: Some((command, cwd)),
+        work,
+        redraw: Some(Instant::now() + REDRAW_AFTER),
+    });
+    Ok(())
+}
+
 /// Where one press of a switch key lands.
 #[derive(Debug, PartialEq, Eq)]
 enum Stop {
-    /// The shell Savras started with, which sits in front of the first session.
-    Shell,
+    /// One of your own panes. They sit in front of the first session, in the
+    /// order you opened them, which is the order the panel lists them in.
+    Shell(usize),
     Session(String),
 }
 
@@ -716,19 +864,26 @@ enum Stop {
 ///
 /// Landing on a session opens it if it has no pane yet, so every row is one
 /// press away rather than three.
-fn neighbour(snapshot: &Snapshot, front: Option<&str>, delta: isize) -> Option<Stop> {
-    if snapshot.jobs.is_empty() {
+fn neighbour(snapshot: &Snapshot, shells: usize, front: &Front, delta: isize) -> Option<Stop> {
+    // Your own panes are stops zero upward; the sessions follow them in
+    // display order. One shell and no sessions is one stop, and nowhere to go.
+    let stops = (snapshot.jobs.len() + shells) as isize;
+    if stops < 2 {
         return None;
     }
-    // The shell is stop zero; the sessions follow it in display order.
-    let stops = snapshot.jobs.len() as isize + 1;
-    let here = front
-        .and_then(|short| snapshot.jobs.iter().position(|j| j.short == short))
-        .map_or(0, |i| i as isize + 1);
+    let here = match front {
+        Front::Shell(i) => *i as isize,
+        Front::Session(short) => snapshot
+            .jobs
+            .iter()
+            .position(|j| &j.short == short)
+            .map_or(0, |i| (i + shells) as isize),
+    };
     let next = ((here + delta) % stops + stops) % stops;
-    Some(match next {
-        0 => Stop::Shell,
-        i => Stop::Session(snapshot.jobs[i as usize - 1].short.clone()),
+    Some(if next < shells as isize {
+        Stop::Shell(next as usize)
+    } else {
+        Stop::Session(snapshot.jobs[next as usize - shells].short.clone())
     })
 }
 
@@ -918,6 +1073,9 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: bool) -> Action {
         // can only grow is a leak you cannot see.
         [b'x'] => return Action::CloseSelected,
         [b'a'] => return Action::AddAgent,
+        // A tab of your own, for the shell you wanted without leaving Savras
+        // to get it. Ctrl-T does the same from the working pane.
+        [b'n'] => return Action::NewTab,
         // Quitting closes the working pane as well, so it asks first.
         [b'Q'] => return Action::ConfirmQuit,
         // Esc and q give the terminal back rather than quitting: in a side
@@ -1160,6 +1318,21 @@ fn resize_if_needed(session: &mut Session) -> Result<bool> {
     Ok(true)
 }
 
+/// What to call the panes Savras runs for you, in the panel's list.
+///
+/// The program's own name, so `svr -- claude` lists "claude" and plain `svr`
+/// lists "shell" — the row should say what is in the pane, and with `--` the
+/// user already told us.
+fn pane_label(command: &[String]) -> String {
+    match command.first() {
+        Some(program) => Path::new(program)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| program.clone()),
+        None => "shell".to_string(),
+    }
+}
+
 fn build_command(command: &[String], cwd: Option<&Path>) -> Result<CommandBuilder> {
     let mut builder = match command.split_first() {
         Some((program, args)) => {
@@ -1321,6 +1494,7 @@ mod tests {
             short: short.map(str::to_string),
             reopen: None,
             work,
+            redraw: None,
         }
     }
 
@@ -1437,16 +1611,16 @@ mod tests {
 
         // From the shell, forward is the first row on screen.
         assert_eq!(
-            neighbour(snap, None, 1),
+            neighbour(snap, 1, &Front::Shell(0), 1),
             Some(Stop::Session(rows[0].clone()))
         );
         // ...and on through the list, in the order you can see.
         assert_eq!(
-            neighbour(snap, Some(&rows[0]), 1),
+            neighbour(snap, 1, &Front::Session(rows[0].clone()), 1),
             Some(Stop::Session(rows[1].clone()))
         );
         assert_eq!(
-            neighbour(snap, Some(&rows[1]), -1),
+            neighbour(snap, 1, &Front::Session(rows[1].clone()), -1),
             Some(Stop::Session(rows[0].clone()))
         );
     }
@@ -1460,20 +1634,106 @@ mod tests {
         let rows = order(&app);
         let snap = &app.snapshot;
 
-        assert_eq!(neighbour(snap, Some(&rows[0]), -1), Some(Stop::Shell));
-        // Wrapping the other way: past the last session is the shell again.
-        assert_eq!(neighbour(snap, Some(&rows[2]), 1), Some(Stop::Shell));
         assert_eq!(
-            neighbour(snap, None, -1),
+            neighbour(snap, 1, &Front::Session(rows[0].clone()), -1),
+            Some(Stop::Shell(0))
+        );
+        // Wrapping the other way: past the last session is the shell again.
+        assert_eq!(
+            neighbour(snap, 1, &Front::Session(rows[2].clone()), 1),
+            Some(Stop::Shell(0))
+        );
+        assert_eq!(
+            neighbour(snap, 1, &Front::Shell(0), -1),
             Some(Stop::Session(rows[2].clone()))
         );
+    }
+
+    #[test]
+    fn a_tab_of_your_own_is_a_stop_like_any_other() {
+        // The point of opening one is being able to get back to it, and the
+        // flip keys are how you get anywhere here.
+        let f = three_sessions();
+        let app = App::new(f.0.clone());
+        let rows = order(&app);
+        let snap = &app.snapshot;
+
+        // Two shells at the head, then the sessions, in the panel's order.
+        assert_eq!(
+            neighbour(snap, 2, &Front::Shell(0), 1),
+            Some(Stop::Shell(1))
+        );
+        assert_eq!(
+            neighbour(snap, 2, &Front::Shell(1), 1),
+            Some(Stop::Session(rows[0].clone()))
+        );
+        assert_eq!(
+            neighbour(snap, 2, &Front::Session(rows[0].clone()), -1),
+            Some(Stop::Shell(1))
+        );
+        // Wrapping past the last session lands on the first shell, not the
+        // one you happened to open last.
+        assert_eq!(
+            neighbour(snap, 2, &Front::Session(rows[2].clone()), 1),
+            Some(Stop::Shell(0))
+        );
+    }
+
+    #[test]
+    fn two_shells_and_no_sessions_still_flip() {
+        // Savras with no sessions to watch is still two panes you opened, and
+        // the keys have somewhere to go.
+        let f = Fixture::new("host-two-shells");
+        let app = App::new(f.0.clone());
+        assert_eq!(
+            neighbour(&app.snapshot, 2, &Front::Shell(0), 1),
+            Some(Stop::Shell(1))
+        );
+        assert_eq!(
+            neighbour(&app.snapshot, 2, &Front::Shell(1), 1),
+            Some(Stop::Shell(0))
+        );
+    }
+
+    #[test]
+    fn shells_are_counted_and_found_in_the_order_they_were_opened() {
+        let mut tabs = three_tabs();
+        tabs.push(pane(None));
+        assert_eq!(tabs.shells(), 2);
+        // The shell Savras started with is first, the one you added second,
+        // wherever the sessions between them sit.
+        assert_eq!(tabs.shell_at(0), Some(0));
+        assert_eq!(tabs.shell_at(1), Some(3));
+        assert_eq!(tabs.shell_at(2), None);
+        assert_eq!(tabs.front_ref(), Front::Shell(1));
+        tabs.go_to(1);
+        assert_eq!(tabs.front_ref(), Front::Session("aaa".into()));
+        tabs.go_to(0);
+        assert_eq!(tabs.front_ref(), Front::Shell(0));
+    }
+
+    #[test]
+    fn a_new_tab_is_asked_for_from_either_side_of_the_divider() {
+        // Ctrl-T from the working pane, `n` from the panel: the terminal keeps
+        // cmd-T for itself, so the reflex needs somewhere to land.
+        let f = three_sessions();
+        let mut app = App::new(f.0.clone());
+        assert!(matches!(panel_key(b"n", &mut app, false), Action::NewTab));
+        assert!(b"\x14".contains(&NEW_TAB));
+    }
+
+    #[test]
+    fn a_pane_is_named_after_what_runs_in_it() {
+        assert_eq!(pane_label(&[]), "shell");
+        assert_eq!(pane_label(&["claude".to_string()]), "claude");
+        assert_eq!(pane_label(&["/bin/zsh".to_string()]), "zsh");
     }
 
     #[test]
     fn with_no_sessions_there_is_nowhere_to_flip() {
         let f = Fixture::new("host-nowhere");
         let app = App::new(f.0.clone());
-        assert_eq!(neighbour(&app.snapshot, None, 1), None);
+        assert_eq!(neighbour(&app.snapshot, 1, &Front::Shell(0), 1), None);
         // ...and the keys are left to the child rather than swallowed.
         assert_eq!(switch(&[SWITCH_BACK], Switch::default(), false), None);
     }
@@ -1541,7 +1801,11 @@ mod tests {
             .job("bbb", r#"{"state":"working","name":"B"}"#)
             .job("ccc", r#"{"state":"working","name":"C"}"#);
         let mut app = App::new(f.0.clone());
-        app.set_tabs(Some("bbb"), vec!["aaa".into(), "bbb".into()]);
+        app.set_tabs(
+            Front::Session("bbb".into()),
+            vec!["aaa".into(), "bbb".into()],
+            1,
+        );
 
         let tab_of = |app: &App, short: &str| {
             let job = app
@@ -1556,7 +1820,12 @@ mod tests {
         assert_eq!(tab_of(&app, "bbb"), crate::app::Tab::Front);
         assert_eq!(tab_of(&app, "aaa"), crate::app::Tab::Behind);
         assert_eq!(tab_of(&app, "ccc"), crate::app::Tab::None);
-        assert_eq!(app.behind_count(), 1, "the one in front is not behind you");
+        // Your shell counts: it is a live pane behind you like any other.
+        assert_eq!(
+            app.behind_count(),
+            2,
+            "the shell and the session behind you, but not the one in front"
+        );
     }
 
     #[test]
