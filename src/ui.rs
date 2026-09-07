@@ -199,8 +199,10 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
             ))),
             Row::Shell(i) => ListItem::new(shell_line(
                 &app.shell_name(*i),
+                app.shell_detail(*i),
                 app.shell_tab(*i),
                 name_width,
+                area.width,
             )),
             Row::Job(i) => {
                 let job = &app.snapshot.jobs[*i];
@@ -224,7 +226,13 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
 /// It carries the same markers as a session — filled for the pane you are in,
 /// hollow for one running behind it — because it is the same kind of thing,
 /// and the point of showing it at all is that flipping walks through it.
-fn shell_line(name: &str, tab: Tab, name_width: u16) -> Line<'static> {
+fn shell_line(
+    name: &str,
+    detail: &str,
+    tab: Tab,
+    name_width: u16,
+    total_width: u16,
+) -> Line<'static> {
     let mark = if tab == Tab::Front {
         Span::styled(
             "▶ ",
@@ -235,13 +243,23 @@ fn shell_line(name: &str, tab: Tab, name_width: u16) -> Line<'static> {
     } else {
         Span::styled("▷ ", Style::default().fg(Color::Indexed(245)))
     };
-    Line::from(vec![
+    let mut spans = vec![
         mark,
         Span::styled(
             pad(name, name_width as usize),
             Style::default().fg(Color::Indexed(245)),
         ),
-    ])
+    ];
+    // Whatever room the name left, the way a session's summary uses it. Most
+    // programs set no title at all, and then the row is just the name.
+    let left = (total_width as usize).saturating_sub(name_width as usize + 3);
+    if !detail.is_empty() && left > 0 {
+        spans.push(Span::styled(
+            format!(" {}", truncate(detail, left)),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// One session's row. `alerted` means it pinged and you have not been to it —
@@ -514,7 +532,7 @@ fn thousands(n: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, Front};
+    use crate::app::{App, Front, Shell};
     use crate::testing::Fixture;
     use ratatui::backend::TestBackend;
 
@@ -584,7 +602,10 @@ mod tests {
         app.set_tabs(
             Front::Session("bbb".into()),
             vec!["aaa".into(), "bbb".into()],
-            1,
+            vec![Shell {
+                name: "shell".to_string(),
+                detail: String::new(),
+            }],
         );
         let mut terminal = Terminal::new(TestBackend::new(44, 24)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -612,7 +633,10 @@ mod tests {
         app.set_tabs(
             Front::Session("bbb".into()),
             vec!["aaa".into(), "bbb".into()],
-            1,
+            vec![Shell {
+                name: "shell".to_string(),
+                detail: String::new(),
+            }],
         );
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();

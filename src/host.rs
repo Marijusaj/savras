@@ -12,6 +12,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
@@ -22,7 +23,7 @@ use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySyste
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, Front, GroupBy, Row};
+use crate::app::{App, Front, GroupBy, Row, Shell};
 use crate::focus;
 use crate::ping::Ping;
 use crate::ui::{self, Hint};
@@ -433,6 +434,71 @@ struct Pane {
     /// and Claude Code answers it by drawing the whole screen again — this
     /// time at the size it is actually being shown at.
     redraw: Option<Instant>,
+    /// The foreground process the pane's name was last worked out from, and
+    /// the name. Asking the operating system what a pid is called costs a
+    /// process, so it is asked once per pid rather than once per frame — and
+    /// the pid only changes when you start or leave a program.
+    running: Option<(i32, String)>,
+}
+
+impl Pane {
+    /// What this pane of your own is called, and what it says it is doing.
+    ///
+    /// The name is the program in the foreground — `ssh` while you are ssh'd
+    /// out, `vim` while you are editing — because that is the question the row
+    /// answers: not what Savras started here, which never changes, but what is
+    /// in front of you now. `fallback` is used while the pty cannot say, which
+    /// is mostly the moment between spawning and the shell taking the
+    /// terminal.
+    ///
+    /// The detail is the title the program set, if it set one. For a login
+    /// shell that is usually the host and the directory, which is the whole
+    /// difference between "a shell" and "a shell on the other machine".
+    fn shell(&mut self, fallback: &str) -> Shell {
+        let name = match self.work.master.process_group_leader() {
+            Some(pid) => {
+                if self.running.as_ref().map(|(was, _)| *was) != Some(pid) {
+                    self.running = process_name(pid).map(|name| (pid, name));
+                }
+                self.running.as_ref().map(|(_, name)| name.clone())
+            }
+            None => None,
+        };
+        Shell {
+            name: name.unwrap_or_else(|| fallback.to_string()),
+            detail: self
+                .work
+                .parser
+                .lock()
+                .unwrap()
+                .screen()
+                .title()
+                .trim()
+                .to_string(),
+        }
+    }
+}
+
+/// What the operating system calls the process with this id.
+///
+/// Linux keeps it in a file, which is cheaper than a process; everywhere else
+/// asks `ps`. Either way it is asked once per pid, not once per frame. A login
+/// shell is listed as `-zsh` and a path is listed in full, so both are cut
+/// back to the name you would have typed.
+fn process_name(pid: i32) -> Option<String> {
+    let comm = match std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        Ok(comm) => comm,
+        Err(_) => {
+            let out = Command::new("ps")
+                .args(["-o", "comm=", "-p", &pid.to_string()])
+                .output()
+                .ok()?;
+            String::from_utf8_lossy(&out.stdout).to_string()
+        }
+    };
+    let name = comm.trim().trim_start_matches('-');
+    let name = name.rsplit('/').next().unwrap_or(name);
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// The sessions you have open, and which one is in front.
@@ -458,6 +524,7 @@ impl Tabs {
                 reopen: None,
                 work,
                 redraw: None,
+                running: None,
             }],
             current: 0,
         }
@@ -494,6 +561,25 @@ impl Tabs {
     /// one and the last tab cannot be closed.
     fn shells(&self) -> usize {
         self.open.iter().filter(|t| t.short.is_none()).count()
+    }
+
+    /// Your own panes, named, in the order you opened them.
+    ///
+    /// A number is only added when it is needed to tell two of them apart, so
+    /// two plain shells are `zsh` and `zsh 2` while a shell and an `ssh` are
+    /// just themselves. The number is the pane's place in the list rather than
+    /// a count of collisions, so it does not shift when an unrelated pane
+    /// opens or closes.
+    fn named_shells(&mut self, fallback: &str) -> Vec<Shell> {
+        let mut named: Vec<Shell> = Vec::new();
+        for pane in self.open.iter_mut().filter(|t| t.short.is_none()) {
+            let mut shell = pane.shell(fallback);
+            if named.iter().any(|had| had.name == shell.name) {
+                shell.name = format!("{} {}", shell.name, named.len() + 1);
+            }
+            named.push(shell);
+        }
+        named
     }
 
     /// Where the nth pane of your own sits in the tab list.
@@ -661,7 +747,6 @@ fn event_loop(
     // Ctrl-O renders as "ctrl-o": the byte is the letter with its top three
     // bits cleared, so putting them back names the key again.
     app.set_switch(session.switch.label());
-    app.set_shell_label(pane_label(&session.command));
     // Starting an agent runs `claude --bg`, which takes long enough that doing
     // it on this thread would visibly stall the panel. The outcome comes back
     // here, since a session that failed to start must say so rather than
@@ -720,11 +805,8 @@ fn event_loop(
             // Which tabs exist, and which one you are in, before it is drawn:
             // opening or closing one has to show up in the same breath as the
             // key that did it, not on the next two-second refresh.
-            app.set_tabs(
-                session.tabs.front_ref(),
-                session.tabs.shorts(),
-                session.tabs.shells(),
-            );
+            let named = session.tabs.named_shells(&pane_label(&session.command));
+            app.set_tabs(session.tabs.front_ref(), session.tabs.shorts(), named);
             terminal
                 .draw(|frame| draw(frame, &mut app, &session, focus, dead, confirming.as_ref()))?;
             last_draw = Instant::now();
@@ -994,6 +1076,7 @@ fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool>
         // An attach replays the session as it was drawn in another terminal,
         // at another width. Jog it into repainting at this one.
         redraw: Some(Instant::now() + REDRAW_AFTER),
+        running: None,
     });
     // Going to a session is the clearest possible way of saying you saw which
     // one it was.
@@ -1070,6 +1153,7 @@ fn new_tab(session: &mut Session) -> Result<()> {
         reopen: Some((command, cwd)),
         work,
         redraw: Some(Instant::now() + REDRAW_AFTER),
+        running: None,
     });
     Ok(())
 }
@@ -1813,6 +1897,7 @@ mod tests {
             reopen: None,
             work,
             redraw: None,
+            running: None,
         }
     }
 
@@ -1924,10 +2009,24 @@ mod tests {
             .collect()
     }
 
+    /// `n` panes of your own, named as an untitled shell is named.
+    fn plain_shells(n: usize) -> Vec<Shell> {
+        (0..n)
+            .map(|i| Shell {
+                name: if i == 0 {
+                    "shell".to_string()
+                } else {
+                    format!("shell {}", i + 1)
+                },
+                detail: String::new(),
+            })
+            .collect()
+    }
+
     /// A panel that believes it has `shells` panes of its own open.
     fn with_shells(f: &Fixture, shells: usize) -> App {
         let mut app = App::new(f.0.clone());
-        app.set_tabs(Front::Shell(0), Vec::new(), shells);
+        app.set_tabs(Front::Shell(0), Vec::new(), plain_shells(shells));
         app
     }
 
@@ -2229,7 +2328,7 @@ mod tests {
         app.set_tabs(
             Front::Session("bbb".into()),
             vec!["aaa".into(), "bbb".into()],
-            1,
+            plain_shells(1),
         );
 
         let tab_of = |app: &App, short: &str| {

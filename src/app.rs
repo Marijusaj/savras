@@ -24,6 +24,18 @@ pub enum Row {
     Spacer,
 }
 
+/// A pane of your own, as the panel needs to draw it.
+///
+/// The name is what the pane is *running* rather than what Savras started
+/// there — a shell you have ssh'd out of is not a shell any more, and a row
+/// that still says so is a row that lies to you. The detail is the title the
+/// program set, which for a login shell is usually the host and directory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Shell {
+    pub name: String,
+    pub detail: String,
+}
+
 /// What the panel groups its rows by.
 ///
 /// Status is what the panel has always done and answers "who needs me".
@@ -84,13 +96,9 @@ pub struct App {
     /// and unattended, which is exactly the thing worth being able to see.
     tabs: Vec<String>,
     front: Option<Front>,
-    /// How many panes of your own are open — one at the very least, since
-    /// Savras always starts with a shell. Zero means there is no working pane
-    /// at all, which is the standalone panel.
-    shells: usize,
-    /// What to call them: the program Savras hosts, so `svr` says "shell" and
-    /// `svr -- claude` says "claude". A new tab runs the same thing.
-    shell_label: String,
+    /// The panes of your own, in the order they were opened. Empty means there
+    /// is no working pane at all, which is the standalone panel.
+    shells: Vec<Shell>,
     /// How the rows are grouped, and the headings that grouping produced.
     group_by: GroupBy,
     pub groups: Vec<String>,
@@ -134,8 +142,7 @@ impl App {
             alerted: HashSet::new(),
             tabs: Vec::new(),
             front: None,
-            shells: 0,
-            shell_label: "shell".to_string(),
+            shells: Vec::new(),
             group_by: GroupBy::Status,
             groups: Vec::new(),
             switch_label: None,
@@ -160,12 +167,13 @@ impl App {
     /// Tell the panel which sessions are open in tabs, and which is in front.
     /// The standalone panel has no working pane, so it never calls this and
     /// every session stays [`Tab::None`].
-    pub fn set_tabs(&mut self, front: Front, open: Vec<String>, shells: usize) {
-        let was = self.shells;
+    pub fn set_tabs(&mut self, front: Front, open: Vec<String>, shells: Vec<Shell>) {
+        let was = self.shells.len();
         self.front = Some(front);
         self.tabs = open;
+        let changed = was != shells.len();
         self.shells = shells;
-        if was != shells {
+        if changed {
             // The rows changed shape, and the cursor has to survive it.
             let anchor = self.anchor();
             self.rebuild_rows();
@@ -173,24 +181,23 @@ impl App {
         }
     }
 
-    /// Name the panes of your own, after the program Savras hosts.
-    pub fn set_shell_label(&mut self, label: String) {
-        self.shell_label = label;
-    }
-
-    /// What the nth pane of your own is called. The first is unnumbered: with
-    /// one shell there is no number to tell it from, and with several the
-    /// numbers match the order you opened them.
+    /// What the nth pane of your own is called.
     pub fn shell_name(&self, i: usize) -> String {
-        if i == 0 {
-            self.shell_label.clone()
-        } else {
-            format!("{} {}", self.shell_label, i + 1)
+        match self.shells.get(i) {
+            Some(shell) => shell.name.clone(),
+            None => "shell".to_string(),
         }
     }
 
+    /// What that pane is doing, when it has said so. The empty string when it
+    /// has not: most programs never set a title, and an invented one would be
+    /// worse than a blank.
+    pub fn shell_detail(&self, i: usize) -> &str {
+        self.shells.get(i).map_or("", |shell| shell.detail.as_str())
+    }
+
     pub fn shells(&self) -> usize {
-        self.shells
+        self.shells.len()
     }
 
     /// Name the key that flips tabs, for the footer to offer.
@@ -201,7 +208,7 @@ impl App {
     /// The keys to advertise for flipping sessions — only once there is a
     /// session to flip to.
     pub fn switch_hint(&self) -> Option<&str> {
-        if self.snapshot.is_empty() && self.shells < 2 {
+        if self.snapshot.is_empty() && self.shells.len() < 2 {
             return None;
         }
         self.switch_label.as_deref()
@@ -223,7 +230,7 @@ impl App {
                 .map(|j| j.name.clone()),
             // One shell needs no naming — an unnamed pane *is* the shell, and
             // that has been true since before there were tabs. Several do.
-            Front::Shell(_) if self.shells < 2 => None,
+            Front::Shell(_) if self.shells.len() < 2 => None,
             Front::Shell(i) => Some(self.shell_name(*i)),
         }
     }
@@ -248,7 +255,7 @@ impl App {
 
     /// How many sessions are open behind the one you are looking at.
     pub fn behind_count(&self) -> usize {
-        (self.shells + self.tabs.len()).saturating_sub(1)
+        (self.shells.len() + self.tabs.len()).saturating_sub(1)
     }
 
     pub fn alert_count(&self) -> usize {
@@ -325,7 +332,7 @@ impl App {
         self.rows.clear();
         // Your own panes first, unheaded: one shell needs no group and several
         // read as a list on their own.
-        for i in 0..self.shells {
+        for i in 0..self.shells.len() {
             self.rows.push(Row::Shell(i));
         }
         match self.group_by {
@@ -572,6 +579,20 @@ mod tests {
             .collect()
     }
 
+    /// `n` plain panes of your own, named the way an untitled shell is.
+    fn shells(n: usize) -> Vec<Shell> {
+        (0..n)
+            .map(|i| Shell {
+                name: if i == 0 {
+                    "shell".to_string()
+                } else {
+                    format!("shell {}", i + 1)
+                },
+                detail: String::new(),
+            })
+            .collect()
+    }
+
     #[test]
     fn rows_interleave_headings_with_their_group() {
         let f = fixture();
@@ -729,7 +750,7 @@ mod tests {
         // is one you walk past without knowing where you went.
         let f = fixture();
         let mut app = App::new(f.0.clone());
-        app.set_tabs(Front::Shell(1), Vec::new(), 2);
+        app.set_tabs(Front::Shell(1), Vec::new(), shells(2));
 
         assert!(matches!(app.rows[0], Row::Shell(0)));
         assert!(matches!(app.rows[1], Row::Shell(1)));
@@ -754,7 +775,7 @@ mod tests {
         // your own pane onto a session would make the keys unusable.
         let f = fixture();
         let mut app = App::new(f.0.clone());
-        app.set_tabs(Front::Shell(0), Vec::new(), 2);
+        app.set_tabs(Front::Shell(0), Vec::new(), shells(2));
         app.select_shell(1);
         assert_eq!(app.selected_shell(), Some(1));
         app.refresh();
@@ -848,9 +869,9 @@ mod tests {
         // An unnamed pane has meant "the shell" since before there were tabs.
         let f = fixture();
         let mut app = App::new(f.0.clone());
-        app.set_tabs(Front::Shell(0), Vec::new(), 1);
+        app.set_tabs(Front::Shell(0), Vec::new(), shells(1));
         assert_eq!(app.front_name(), None);
-        app.set_tabs(Front::Shell(1), Vec::new(), 2);
+        app.set_tabs(Front::Shell(1), Vec::new(), shells(2));
         assert_eq!(app.front_name().as_deref(), Some("shell 2"));
     }
 

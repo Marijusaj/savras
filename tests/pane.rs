@@ -93,6 +93,32 @@ fn keys_says_what_arrived_and_what_savras_makes_of_it() {
     assert!(said.contains("flip back a tab"), "what it means: {said}");
 }
 
+#[test]
+fn a_pane_is_named_after_what_it_is_running() {
+    // The row used to say "shell" for the whole life of the pane, whatever you
+    // did in it — so a shell you had ssh'd out of still read as a shell. The
+    // name is now the program in the foreground, and the title it set, if it
+    // set one, follows it across the row.
+    //
+    // `exec` is the point of the script: the pane was started as `sh`, and
+    // what it says a moment later has to be `sleep`, or the name is still
+    // reporting what Savras spawned rather than what is there now.
+    let pane = Pane::start_watching(
+        "named",
+        "printf '\\033]0;on-the-vm\\007'; exec sleep 30",
+        true,
+    );
+    let seen = pane.wait_for("sleep");
+    assert!(
+        seen.contains("sleep"),
+        "the row still names what Savras started, not what is running; the panel drew:\n{seen}"
+    );
+    assert!(
+        seen.contains("on-the-vm"),
+        "the title the pane set never reached the row; the panel drew:\n{seen}"
+    );
+}
+
 /// A real `svr` hosting a command of the test's choosing, in a real pty.
 struct Pane {
     dir: PathBuf,
@@ -102,6 +128,14 @@ struct Pane {
 
 impl Pane {
     fn start(name: &str, script: &str) -> Self {
+        Pane::start_watching(name, script, false)
+    }
+
+    /// `sessions` seeds the jobs directory with one, for the tests that need
+    /// the panel to draw its list: with nothing to watch the panel says so
+    /// instead, and your own panes are not listed either — one shell and no
+    /// sessions is a list with nothing in it to tell apart.
+    fn start_watching(name: &str, script: &str, sessions: bool) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "savras-pane-e2e-{}-{name}-{}",
             std::process::id(),
@@ -109,6 +143,14 @@ impl Pane {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
+        if sessions {
+            std::fs::create_dir_all(dir.join("aaaaaaaa")).unwrap();
+            std::fs::write(
+                dir.join("aaaaaaaa/state.json"),
+                r#"{"state":"working","name":"OTHER","cwd":"/tmp"}"#,
+            )
+            .unwrap();
+        }
 
         let pty = NativePtySystem::default()
             .openpty(PtySize {
