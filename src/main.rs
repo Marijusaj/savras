@@ -56,6 +56,7 @@ options:
   --ping <when>       ping on needs (default), done, or off
   --no-sound          notify without a sound
   --quiet <seconds>   silence after a ping, news held until it ends (default 20)
+  --group <what>      group rows by repo (the default) or status; s flips it
   --switch <keys>     ctrl-<back><forward> flips tabs (default ws), or off
   --open <what>       what the working pane starts on: top, the first session
                       in the panel (the default), a session name, or shell
@@ -84,6 +85,7 @@ keys, with the panel focused:
              n does the same with the panel focused
   x          close the selected tab, yours or a session's
   a          start a parallel agent under this session's lead
+  s          group by repository or by status
   d          delete the selected session for good, after asking:
              `claude stop` then `claude rm`, which x does not do
   r          refresh     Q       quit Savras, after asking
@@ -133,6 +135,8 @@ struct Options {
     switch: Switch,
     /// What the working pane starts on, once the default is worked out.
     open: host::Open,
+    /// Whether the panel groups its rows by repository or by status.
+    group_by: app::GroupBy,
 }
 
 fn main() -> Result<()> {
@@ -170,15 +174,16 @@ fn main() -> Result<()> {
         if tmux || dry_run {
             return panel::run(width, side, command, dry_run);
         }
-        return host::run(
+        return host::run(host::Setup {
             width,
             side,
             command,
-            jobs_dir(options.jobs_dir)?,
-            options.switch,
-            options.open,
-            Ping::new(options.ping, options.sound, options.quiet),
-        );
+            jobs_dir: jobs_dir(options.jobs_dir)?,
+            switch: options.switch,
+            open: options.open,
+            group_by: options.group_by,
+            ping: Ping::new(options.ping, options.sound, options.quiet),
+        });
     }
 
     let jobs_dir = jobs_dir(options.jobs_dir)?;
@@ -188,6 +193,7 @@ fn main() -> Result<()> {
         Mode::Once => print_once(&jobs_dir),
         _ => run_tui(
             jobs_dir,
+            options.group_by,
             Ping::new(options.ping, options.sound, options.quiet),
         ),
     }
@@ -278,6 +284,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
         // Filled in below: what the pane starts on depends on whether you
         // named a command for it.
         open: host::Open::Shell,
+        group_by: app::GroupBy::Repo,
     };
     let mut open: Option<host::Open> = None;
     let mut width = panel::DEFAULT_WIDTH;
@@ -332,6 +339,11 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
                     .next()
                     .context("--open needs shell, top, or a session name")?;
                 open = Some(host::Open::parse(&raw));
+            }
+            "--group" => {
+                let raw = args.next().context("--group needs repo or status")?;
+                options.group_by = app::GroupBy::parse(&raw)
+                    .with_context(|| format!("--group must be repo or status, not {raw}"))?;
             }
             "--switch" => {
                 let raw = args.next().context("--switch needs a letter, or off")?;
@@ -438,9 +450,9 @@ fn print_once(jobs_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn run_tui(jobs_dir: PathBuf, ping: Ping) -> Result<()> {
+fn run_tui(jobs_dir: PathBuf, group_by: app::GroupBy, ping: Ping) -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let result = event_loop(&mut terminal, jobs_dir, ping);
+    let result = event_loop(&mut terminal, jobs_dir, group_by, ping);
     restore_terminal(&mut terminal)?;
     result
 }
@@ -448,9 +460,11 @@ fn run_tui(jobs_dir: PathBuf, ping: Ping) -> Result<()> {
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     jobs_dir: PathBuf,
+    group_by: app::GroupBy,
     mut ping: Ping,
 ) -> Result<()> {
     let mut app = App::new(jobs_dir.clone());
+    app.set_group_by(group_by);
     // The panel App::new already loaded is the state of the world, not news.
     ping.poll(&app.snapshot, None);
 
@@ -500,6 +514,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('g') | KeyCode::Home => app.jump(false),
         KeyCode::Char('G') | KeyCode::End => app.jump(true),
         KeyCode::Char('r') => app.refresh(),
+        KeyCode::Char('s') => {
+            app.regroup();
+        }
         _ => {}
     }
 }

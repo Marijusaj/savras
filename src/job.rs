@@ -83,6 +83,29 @@ impl Job {
         self.open_command().join(" ")
     }
 
+    /// Whether this session is in a worktree rather than the repository's own
+    /// checkout — worth saying, because the same repository name then covers
+    /// two different working copies.
+    pub fn in_worktree(&self) -> bool {
+        git_dir(&self.cwd).is_some_and(|d| d.contains("/.git/worktrees/"))
+    }
+
+    /// Which repository this session is working in, by name.
+    ///
+    /// The nearest ancestor of `cwd` holding a `.git`, named after its own
+    /// directory. Worktrees are followed home: a `.git` *file* says
+    /// `gitdir: /path/to/repo/.git/worktrees/<name>`, and the repository is
+    /// the path before that `.git` — otherwise every worktree would sort as a
+    /// repository of its own, which is exactly wrong for the parallel agents
+    /// that live in them.
+    ///
+    /// A `cwd` with no git anywhere above it is its own directory's name;
+    /// there is nothing better to call it, and a session running outside a
+    /// repository is still somewhere.
+    pub fn repo(&self) -> String {
+        repo_of(&self.cwd)
+    }
+
     /// `cwd` with the home directory folded back to `~`.
     pub fn short_cwd(&self) -> String {
         let path = self.cwd.to_string_lossy().to_string();
@@ -98,6 +121,58 @@ impl Job {
             None => path,
         }
     }
+}
+
+/// The name of the repository a directory belongs to.
+///
+/// Walking up for a `.git` is what git itself does, and it is the only way to
+/// get the same answer from a session started three directories inside a
+/// checkout as from one started at its root.
+fn repo_of(cwd: &Path) -> String {
+    let root = match git_dir(cwd).as_deref().and_then(repo_root) {
+        Some(root) => PathBuf::from(root),
+        // Not in a repository at all: the directory is all there is to go on,
+        // and home is worth spelling the way the rest of the panel spells it.
+        None => match directories::BaseDirs::new() {
+            Some(dirs) if dirs.home_dir() == cwd => return "~".to_string(),
+            _ => cwd.to_path_buf(),
+        },
+    };
+    root.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| root.to_string_lossy().to_string())
+}
+
+/// The repository a git directory belongs to.
+///
+/// `<repo>/.git` in a checkout, and `<repo>/.git/worktrees/<name>` in a
+/// worktree — which is why worktrees come home rather than sorting as
+/// repositories of their own, and that matters here: parallel agents live in
+/// them, and three agents on one repository are three rows under one heading.
+fn repo_root(git_dir: &str) -> Option<&str> {
+    if let Some(root) = git_dir.strip_suffix("/.git") {
+        return Some(root).filter(|r| !r.is_empty());
+    }
+    let cut = git_dir.find("/.git/worktrees/")?;
+    Some(&git_dir[..cut]).filter(|r| !r.is_empty())
+}
+
+/// Where this directory's git data lives, as a path, if it is in a repository
+/// at all. `.git` is a directory in a checkout and a file in a worktree — the
+/// file holds `gitdir: <path>`, which is how a worktree names its parent.
+fn git_dir(cwd: &Path) -> Option<String> {
+    for dir in cwd.ancestors() {
+        let dot = dir.join(".git");
+        if dot.is_dir() {
+            return Some(dot.to_string_lossy().to_string());
+        }
+        if dot.is_file() {
+            let said = std::fs::read_to_string(&dot).ok()?;
+            let path = said.trim().strip_prefix("gitdir:")?.trim().to_string();
+            return Some(path);
+        }
+    }
+    None
 }
 
 /// Everything the panel renders, in display order.
@@ -307,6 +382,38 @@ mod tests {
     use super::*;
 
     use crate::testing::Fixture;
+
+    #[test]
+    fn a_worktree_belongs_to_the_repository_it_was_cut_from() {
+        // Parallel agents live in worktrees. Sorting each one as a repository
+        // of its own would scatter three agents on one codebase across three
+        // headings named after their branches.
+        let tmp = std::env::temp_dir().join(format!("savras-repo-{}", std::process::id()));
+        let repo = tmp.join("myrepo");
+        let inside = repo.join("src").join("deep");
+        let tree = repo.join(".claude").join("worktrees").join("fix-thing");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(
+            tree.join(".git"),
+            format!("gitdir: {}/.git/worktrees/fix-thing\n", repo.display()),
+        )
+        .unwrap();
+
+        assert_eq!(repo_of(&repo), "myrepo");
+        // From anywhere inside it, which is where sessions actually run.
+        assert_eq!(repo_of(&inside), "myrepo");
+        // And from a worktree of it, whatever the worktree is called.
+        assert_eq!(repo_of(&tree), "myrepo");
+
+        // Outside any repository there is only the directory's own name.
+        let loose = tmp.join("nowhere");
+        std::fs::create_dir_all(&loose).unwrap();
+        assert_eq!(repo_of(&loose), "nowhere");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     fn the_order_does_not_move_when_a_session_merely_works() {

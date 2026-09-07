@@ -11,6 +11,9 @@ use crate::job::{self, Job, Snapshot, Status};
 #[derive(Debug, Clone, Copy)]
 pub enum Row {
     Heading(Status),
+    /// A repository heading, indexing [`App::groups`]. Not a `String`, so a
+    /// row stays a `Copy` handle to somewhere rather than a piece of text.
+    Repo(usize),
     Job(usize),
     /// A pane of your own — the shell Savras started with, and any you have
     /// added since. They sit at the head of the list because that is where
@@ -19,6 +22,37 @@ pub enum Row {
     Shell(usize),
     /// A blank line between groups. Drawn, never selected.
     Spacer,
+}
+
+/// What the panel groups its rows by.
+///
+/// Status is what the panel has always done and answers "who needs me".
+/// Repository answers "what is happening in this codebase", which is the
+/// question you ask when several are in play at once — and with a session in
+/// every repository you own, the status groups interleave them all and neither
+/// question is easy to read off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupBy {
+    Status,
+    Repo,
+}
+
+impl GroupBy {
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "status" | "state" => Some(GroupBy::Status),
+            "repo" | "repository" => Some(GroupBy::Repo),
+            _ => None,
+        }
+    }
+
+    /// The other one, for the key that flips between them.
+    pub fn other(self) -> Self {
+        match self {
+            GroupBy::Status => GroupBy::Repo,
+            GroupBy::Repo => GroupBy::Status,
+        }
+    }
 }
 
 /// What the working pane is showing. The panel is told, so it can mark the
@@ -57,6 +91,9 @@ pub struct App {
     /// What to call them: the program Savras hosts, so `svr` says "shell" and
     /// `svr -- claude` says "claude". A new tab runs the same thing.
     shell_label: String,
+    /// How the rows are grouped, and the headings that grouping produced.
+    group_by: GroupBy,
+    pub groups: Vec<String>,
     /// What to call the keys that flip between sessions. Only ever shown once
     /// there is a session to flip to: a key that would do nothing is worse
     /// than no key at all, because you try it and conclude it is broken.
@@ -99,6 +136,8 @@ impl App {
             front: None,
             shells: 0,
             shell_label: "shell".to_string(),
+            group_by: GroupBy::Status,
+            groups: Vec::new(),
             switch_label: None,
             should_quit: false,
         };
@@ -289,6 +328,14 @@ impl App {
         for i in 0..self.shells {
             self.rows.push(Row::Shell(i));
         }
+        match self.group_by {
+            GroupBy::Status => self.rows_by_status(),
+            GroupBy::Repo => self.rows_by_repo(),
+        }
+    }
+
+    fn rows_by_status(&mut self) {
+        self.groups.clear();
         for status in [Status::NeedsInput, Status::Working, Status::Done] {
             let group: Vec<usize> = self
                 .snapshot
@@ -307,6 +354,74 @@ impl App {
             self.rows.push(Row::Heading(status));
             self.rows.extend(group.into_iter().map(Row::Job));
         }
+    }
+
+    /// One group per repository, the sessions inside it ordered exactly as the
+    /// status grouping orders them: waiting first, then working, then done,
+    /// and by name within each.
+    ///
+    /// **A repository with a session waiting on you sorts to the top.** The
+    /// panel's job is to surface what is waiting, and grouping must not bury
+    /// it — a repository is a place, and a question does not stop being a
+    /// question because of where it was asked. Repositories with nothing but
+    /// finished sessions sink, and ties are broken by name, so the list only
+    /// moves when a session changes status.
+    fn rows_by_repo(&mut self) {
+        self.groups = self.repos_in_order();
+        // Indices are into the snapshot, which is already sorted by status and
+        // then name — so filtering preserves that order and nothing else has
+        // to sort anything.
+        for (g, repo) in self.groups.clone().into_iter().enumerate() {
+            let group: Vec<usize> = self
+                .snapshot
+                .jobs
+                .iter()
+                .enumerate()
+                .filter(|(_, j)| j.repo() == repo)
+                .map(|(i, _)| i)
+                .collect();
+            if group.is_empty() {
+                continue;
+            }
+            if !self.rows.is_empty() {
+                self.rows.push(Row::Spacer);
+            }
+            self.rows.push(Row::Repo(g));
+            self.rows.extend(group.into_iter().map(Row::Job));
+        }
+    }
+
+    /// The repositories in play, most-waiting first and then by name.
+    fn repos_in_order(&self) -> Vec<String> {
+        let mut repos: Vec<(Status, String)> = Vec::new();
+        for job in &self.snapshot.jobs {
+            let repo = job.repo();
+            match repos.iter_mut().find(|(_, name)| name == &repo) {
+                // The most demanding status in the repository is what it sorts
+                // by: one session asking is enough to bring its repository up.
+                Some((best, _)) if job.status < *best => *best = job.status,
+                Some(_) => {}
+                None => repos.push((job.status, repo)),
+            }
+        }
+        repos.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        repos.into_iter().map(|(_, name)| name).collect()
+    }
+
+    /// Group by repository or by status, and say which it is now.
+    pub fn regroup(&mut self) -> GroupBy {
+        self.group_by = self.group_by.other();
+        let anchor = self.anchor();
+        self.rebuild_rows();
+        self.restore_selection(anchor);
+        self.group_by
+    }
+
+    pub fn set_group_by(&mut self, how: GroupBy) {
+        self.group_by = how;
+        let anchor = self.anchor();
+        self.rebuild_rows();
+        self.restore_selection(anchor);
     }
 
     /// Put the cursor back on the job it was on. If that job is gone, fall back
@@ -644,6 +759,77 @@ mod tests {
         assert_eq!(app.selected_shell(), Some(1));
         app.refresh();
         assert_eq!(app.selected_shell(), Some(1));
+    }
+
+    /// Sessions in three directories, so grouping has something to group.
+    /// The `cwd`s are outside any repository, so each is its own name.
+    fn across_repos() -> Fixture {
+        Fixture::new("app-repos")
+            .job(
+                "aaa",
+                r#"{"state":"working","name":"RUN","cwd":"/tmp/savras-test-repos/beta"}"#,
+            )
+            .job(
+                "bbb",
+                r#"{"state":"working","name":"ASK","needs":"answer: ?","cwd":"/tmp/savras-test-repos/gamma"}"#,
+            )
+            .job(
+                "ccc",
+                r#"{"state":"done","name":"FIN","output":{"result":"ok"},"cwd":"/tmp/savras-test-repos/beta"}"#,
+            )
+            .job(
+                "ddd",
+                r#"{"state":"done","name":"OLD","output":{"result":"ok"},"cwd":"/tmp/savras-test-repos/alpha"}"#,
+            )
+    }
+
+    #[test]
+    fn grouping_by_repository_puts_the_one_that_needs_you_first() {
+        // A repository is a place, and a question does not stop being a
+        // question because of where it was asked — so grouping must not bury
+        // it. `alpha` sorts last despite its name: nothing there is waiting.
+        let f = across_repos();
+        let mut app = App::new(f.0.clone());
+        app.set_group_by(GroupBy::Repo);
+
+        assert_eq!(app.groups, ["gamma", "beta", "alpha"]);
+        // Inside a repository, the panel's own order holds: waiting, then
+        // working, then done, and by name within each.
+        assert_eq!(
+            names_in_order(&app),
+            ["ASK", "RUN", "FIN", "OLD"],
+            "sessions are ordered within their repository, not shuffled"
+        );
+    }
+
+    #[test]
+    fn regrouping_keeps_the_cursor_on_the_session_it_was_on() {
+        // The list is rebuilt underneath you; landing somewhere else would
+        // make the key useless for comparing the two views.
+        let f = across_repos();
+        let mut app = App::new(f.0.clone());
+        app.select("ccc");
+        assert_eq!(app.selected_job().map(|j| j.short.as_str()), Some("ccc"));
+
+        assert_eq!(app.regroup(), GroupBy::Repo);
+        assert_eq!(app.selected_job().map(|j| j.short.as_str()), Some("ccc"));
+        assert_eq!(app.regroup(), GroupBy::Status);
+        assert_eq!(app.selected_job().map(|j| j.short.as_str()), Some("ccc"));
+    }
+
+    #[test]
+    fn a_repository_heading_is_drawn_but_never_landed_on() {
+        let f = across_repos();
+        let mut app = App::new(f.0.clone());
+        app.set_group_by(GroupBy::Repo);
+        app.jump(false);
+        for _ in 0..10 {
+            assert!(
+                app.selected_job().is_some(),
+                "the cursor stopped on a heading"
+            );
+            app.step(1);
+        }
     }
 
     #[test]

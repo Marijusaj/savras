@@ -176,6 +176,11 @@ impl Panel {
             seen.contains("\x1b]9;"),
             "no OSC 9 notification reached the terminal"
         );
+        // The sound and the mark are not the same event: the notification goes
+        // out as the job is read, and the mark appears in the frame drawn
+        // after it. On a cold binary that frame is late enough to miss, which
+        // made this look flaky when it was only early.
+        seen.push_str(&self.drain(Duration::from_millis(400)));
         seen
     }
 }

@@ -256,6 +256,45 @@ nothing. Leaving the shell you started with still closes Savras — but only
 while you are looking at it; exiting it in a background tab leaves a dead tab
 rather than taking your other sessions down from somewhere you cannot see.
 
+### Repositories
+
+The panel groups by repository, because with several in play at once the status
+groups interleave them all and neither "who needs me" nor "what is happening in
+this codebase" reads off the screen:
+
+```
+SAVRAS  ◦ live  ● 1
+1 needs input · 3 working · 2 done
+
+savras
+● SAVRAS-4    approve Bash: cargo…     #382 5m
+▶ SAVRAS      grouping by repository…        2s
+
+autodad-assistant
+✳ BOOKS       Four of the 24 bookkeeping…   10m
+✳ NEXT        29 open tier-A items…         19h
+
+processore
+✳ PLAN        Transcripts and the review…  #28 1d
+```
+
+**A repository with a session waiting on you sorts to the top**, and inside a
+repository the old order holds: waiting, then working, then done, and by name
+within each. A question does not stop being a question because of where it was
+asked, and grouping must not bury it.
+
+The name comes from the repository root — the nearest directory above the
+session's `cwd` with a `.git` in it. **Worktrees come home**: a worktree's
+`.git` is a file saying `gitdir: <repo>/.git/worktrees/<name>`, so three
+parallel agents each in their own worktree are three rows under one heading
+rather than three headings named after branches. The detail footer says
+`worktree` when the session you are on is in one. A session outside any
+repository is filed under its own directory, and one in your home directory
+under `~`.
+
+`s` flips between grouping by repository and by status, and `--group status`
+starts that way for good.
+
 ### Parallel agents
 
 A **parallel agent** is a session of its own that takes its work from another
@@ -459,15 +498,15 @@ footer goes, to keep sessions visible.
 ## Roadmap
 
 Shipped: the panel (M0), the column (M0.5), hosting the working pane (M1),
-opening a session from the panel (M1.5), and the ping (M2).
+opening a session from the panel (M1.5), the ping (M2), and repositories (M3).
 
-Next up is **M3 · Repos** — group and sort the panel by repository. Then
-**M4 · Vitals**. See [docs/ROADMAP.md](docs/ROADMAP.md).
+Next up is **M4 · Vitals** — make the session line say more in the same width.
+See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## Development
 
 ```sh
-cargo test        # 94 tests: parsing, grouping, navigation, ping
+cargo test        # 155 tests: parsing, grouping, navigation, ping
                   # transitions and marks, focus reporting, argument
                   # handling, tmux layout, and render buffers
 cargo build --release

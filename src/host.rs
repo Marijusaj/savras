@@ -22,7 +22,7 @@ use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySyste
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, Front};
+use crate::app::{App, Front, GroupBy};
 use crate::focus;
 use crate::job::Snapshot;
 use crate::ping::Ping;
@@ -279,6 +279,8 @@ enum Action {
     AddAgent,
     /// Open another pane of your own, running what Savras was started with.
     NewTab,
+    /// `s` in the panel: group by repository instead of status, or back.
+    Regroup,
     /// `d` in the panel: ask whether the selected session should be deleted.
     ConfirmDelete,
     /// The second `d`: delete it.
@@ -560,15 +562,32 @@ impl Tabs {
     }
 }
 
-pub fn run(
-    width: u16,
-    side: Side,
-    command: Vec<String>,
-    jobs_dir: PathBuf,
-    switch: Switch,
-    open: Open,
-    ping: Ping,
-) -> Result<()> {
+/// Everything the side panel needs to start. One struct rather than eight
+/// arguments: they are all "how this run was asked for", and a caller passing
+/// eight positional values gets two of them the wrong way round eventually.
+pub struct Setup {
+    pub width: u16,
+    pub side: Side,
+    /// What runs in the pane, and what a new tab runs. Empty is your shell.
+    pub command: Vec<String>,
+    pub jobs_dir: PathBuf,
+    pub switch: Switch,
+    pub open: Open,
+    pub group_by: GroupBy,
+    pub ping: Ping,
+}
+
+pub fn run(setup: Setup) -> Result<()> {
+    let Setup {
+        width,
+        side,
+        command,
+        jobs_dir,
+        switch,
+        open,
+        group_by,
+        ping,
+    } = setup;
     let (cols, rows) = crossterm::terminal::size().context("reading the terminal size")?;
     let cols_for_work = work_cols(cols, width);
     if cols_for_work < 20 {
@@ -596,7 +615,7 @@ pub fn run(
     // Ask the terminal to say when it gains and loses focus, so the panel can
     // tell "you are looking at that session" from "you are in another app".
     let _ = std::io::stdout().write_all(focus::ENABLE.as_bytes());
-    let result = event_loop(&mut terminal, session, open);
+    let result = event_loop(&mut terminal, session, open, group_by);
     // Leave the terminal's mouse and focus handling as we found it.
     let _ = std::io::stdout().write_all(MOUSE_OFF.as_bytes());
     let _ = std::io::stdout().write_all(focus::DISABLE.as_bytes());
@@ -633,8 +652,10 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     mut session: Session,
     open: Open,
+    group_by: GroupBy,
 ) -> Result<()> {
     let mut app = App::new(session.jobs_dir.clone());
+    app.set_group_by(group_by);
     // The shell Savras opened with stays as the first tab either way, so
     // whatever this lands on, ctrl-w takes you back to a prompt.
     open_at_startup(&mut session, &mut app, &open);
@@ -825,6 +846,16 @@ fn event_loop(
                         }
                     }
                     Action::AddAgent => start_agent(&mut app, &starting),
+                    Action::Regroup => {
+                        // Say which it is now: the headings change, but the
+                        // panel may be showing one repository and one status
+                        // group, which look alike.
+                        let how = app.regroup();
+                        app.error = Some(match how {
+                            GroupBy::Repo => "grouped by repository".to_string(),
+                            GroupBy::Status => "grouped by status".to_string(),
+                        });
+                    }
                     Action::NewTab => match new_tab(&mut session) {
                         Ok(()) => {
                             focus = Focus::Work;
@@ -1351,6 +1382,7 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: Option<&Confirm>) -> Actio
         // can only grow is a leak you cannot see.
         [b'x'] => return Action::CloseSelected,
         [b'a'] => return Action::AddAgent,
+        [b's'] => return Action::Regroup,
         // Closing a tab leaves the session running, which is the point of
         // tabs — and why finished sessions pile up in `claude agents` with
         // nothing here to get rid of them. This is that.

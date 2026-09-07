@@ -181,21 +181,7 @@ release.
 
 ## Next
 
-### M3 · Repos  ← next build
-**Group and sort the panel by repository.**
-
-Every job already carries its `cwd`, and the set of distinct `cwd`s across all
-jobs *is* the set of repositories in play — no configuration to maintain.
-
-- Group by repository, with the status groups nested inside, or sort flat by
-  repository with the name as a dim prefix. Worth trying both before choosing.
-- Repository name from the git remote where there is one, falling back to the
-  directory name.
-- Collapse a repository you are not working in today.
-- A repository with a session needing input sorts to the top: the panel's job is
-  to surface what is waiting, and grouping must not bury it.
-
-### M4 · Vitals
+### M4 · Vitals  ← next build
 **Make the session line say more in the same width.**
 
 Today: name, summary, PR number, age. Wanted: name, a one-word status, how much

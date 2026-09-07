@@ -185,6 +185,18 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             ))),
             Row::Spacer => ListItem::new(Line::from("")),
+            // A repository is a place rather than a state, so it is drawn as
+            // one: the same weight as a status heading, in the blue the detail
+            // footer already uses for a path.
+            Row::Repo(i) => ListItem::new(Line::from(Span::styled(
+                app.groups
+                    .get(*i)
+                    .cloned()
+                    .unwrap_or_else(|| "elsewhere".to_string()),
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ))),
             Row::Shell(i) => ListItem::new(shell_line(
                 &app.shell_name(*i),
                 app.shell_tab(*i),
@@ -329,6 +341,14 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
 
     let mut lines = vec![Line::from(vec![
         Span::styled(job.short_cwd(), Style::default().fg(Color::Blue)),
+        // Grouping puts every session in a repository under one heading, and
+        // two of them may be different working copies of it. The path above
+        // says which, but only if you read all of it; this says it at a
+        // glance, where the question comes up.
+        Span::styled(
+            if job.in_worktree() { "  worktree" } else { "" },
+            Style::default().fg(Color::Indexed(140)),
+        ),
         Span::styled(
             format!("  {} tokens", thousands(job.tokens)),
             Style::default().fg(Color::DarkGray),
