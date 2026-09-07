@@ -2,5 +2,7 @@
 # Agent worktrees: whole checkouts of this repository, which git would
 # otherwise record as embedded repositories nobody can clone.
 /.claude/worktrees/
-# Local state written by the SessionEnd hook, and its lock.
+# Local state written by the SessionEnd hook, and its lock: what this
+# machine last touched, which is not a fact about the repository.
+/docs/STATE.md
 /docs/STATE.md.lock
