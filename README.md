@@ -154,9 +154,14 @@ Needs input
 They are rows because they are stops: the flip keys walk them like anything
 else, and a stop you cannot see is one you go to without knowing where you
 went. One shell is drawn unnumbered and unnamed in the header, which is what an
-unnamed pane has always meant here. `x` closes the one under the cursor, and
-leaving it — `exit`, `ctrl-d` — leaves a dead tab rather than closing Savras;
-only the shell you *arrived* in still takes the panel with it.
+unnamed pane has always meant here.
+
+**`exit` closes a tab you opened**, the way it closes a tab in any terminal —
+there is nothing on a finished shell's screen worth keeping you there. `x` in
+the panel closes the one under the cursor without waiting for that. A
+*session's* pane is the opposite case and keeps its last screen, because that
+screen is usually the reason it stopped. And the shell you *arrived* in is
+neither: leaving that one is leaving Savras, which asks first.
 
 **The order holds still.** Rows are grouped by status and then sorted by name,
 never by how recently a session did something. Freshest-first was the first cut

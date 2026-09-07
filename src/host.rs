@@ -925,6 +925,11 @@ fn event_loop(
         if jog_new_panes(&mut session) {
             dirty = true;
         }
+
+        if close_finished_shells(&mut session) {
+            terminal.clear()?;
+            dirty = true;
+        }
     }
 }
 
@@ -981,6 +986,30 @@ fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool>
     app.attend_to(&short);
     app.select(&short);
     Ok(true)
+}
+
+/// Close a tab of your own whose shell has exited.
+///
+/// `exit` closes the tab, the way it closes a tab in any terminal — there is
+/// nothing on a finished shell's screen worth keeping you there. A *session's*
+/// pane is the opposite case and keeps its last screen, because that screen is
+/// usually the reason it stopped. And the shell Savras arrived in is neither:
+/// leaving that one is leaving Savras, which is handled where the quit is.
+fn close_finished_shells(session: &mut Session) -> bool {
+    let done: Vec<usize> = (0..session.tabs.open.len())
+        .filter(|i| {
+            let tab = &mut session.tabs.open[*i];
+            tab.short.is_none()
+                && tab.work.origin == Origin::Opened
+                && tab.work.exit_code().is_some()
+        })
+        .collect();
+    // Back to front, so the indices ahead of each one stay where they were.
+    let mut closed = false;
+    for i in done.into_iter().rev() {
+        closed |= session.tabs.close(i);
+    }
+    closed
 }
 
 /// Make a freshly opened pane draw itself again, at the size it is really
@@ -2004,6 +2033,49 @@ mod tests {
         assert_eq!(tabs.front_ref(), Front::Session("aaa".into()));
         tabs.go_to(0);
         assert_eq!(tabs.front_ref(), Front::Shell(0));
+    }
+
+    #[test]
+    fn a_shell_you_opened_closes_itself_when_you_exit_it() {
+        // `exit` closes the tab, as it does in any terminal. A session's pane
+        // keeps its last screen — that screen is why it stopped — and the
+        // shell Savras arrived in is a quit, handled elsewhere.
+        let mut tabs = three_tabs();
+        let mut opened = pane(None);
+        opened.work.origin = Origin::Opened;
+        tabs.push(opened);
+        let mut session = session_with(tabs);
+        assert_eq!(session.tabs.shells(), 2);
+
+        // Still running: nothing closes.
+        assert!(!close_finished_shells(&mut session));
+
+        // The shell exits, and its tab goes with it.
+        let _ = session.tabs.open[3].work.child.kill();
+        let _ = session.tabs.open[3].work.child.wait();
+        assert!(close_finished_shells(&mut session));
+        assert_eq!(session.tabs.shells(), 1);
+        // The session panes are untouched, dead or alive.
+        assert_eq!(session.tabs.shorts(), ["aaa", "bbb"]);
+    }
+
+    /// A `Session` around a set of tabs, for the bookkeeping that needs one.
+    fn session_with(tabs: Tabs) -> Session {
+        Session {
+            jobs_dir: PathBuf::from("/nonexistent"),
+            width: 44,
+            side: Side::Right,
+            size: (100, 40),
+            input: std::sync::mpsc::channel().1,
+            tabs,
+            command: Vec::new(),
+            switch: Switch::default(),
+            ping: crate::ping::Ping::new(
+                crate::ping::When::default(),
+                false,
+                std::time::Duration::from_secs(0),
+            ),
+        }
     }
 
     #[test]
