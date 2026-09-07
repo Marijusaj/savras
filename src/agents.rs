@@ -18,9 +18,11 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 
 use anyhow::{Context, Result};
 
+use crate::app::App;
 use crate::job::{Job, Snapshot};
 
 /// The lead a session name belongs to, and its number within that lead.
@@ -241,6 +243,64 @@ pub fn delete(short: &str) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Start a parallel agent under the panel's selected session, off the main
+/// thread, and say so on the panel while it happens.
+///
+/// The lead is the selected session's, so pressing this on `AGENT-3` adds a
+/// fourth agent under `AGENT` rather than starting a group beneath a group. It
+/// runs in the lead's own repository, because an agent that cannot see the
+/// code is no use.
+///
+/// This is the one thing Savras does that is not looking: it *starts*
+/// sessions. It still never writes to `~/.claude/`, and it still never
+/// interrupts a session that is already running — the new agent introduces
+/// itself to its lead, through Claude Code's own messaging, as its first act.
+///
+/// Both panels press this key — the side panel and `svr solo` — so it lives
+/// here rather than in either of their loops.
+pub fn add(app: &mut App, outcome: &mpsc::Sender<Result<String>>) {
+    let Some(job) = app.selected_job() else {
+        return;
+    };
+    // The lead has to be a session that is actually running, because the new
+    // agent is told to message it by name. The numbering follows the *lead*,
+    // not the selected session and not the bare base name: a group led by
+    // `SAVRAS-4` adds `SAVRAS-6` next, leaving the free `2` alone rather than
+    // handing the newcomer a number that would make it the lead.
+    let leader = lead_of(&app.snapshot, job);
+    let lead = leader.name.clone();
+    // Its own repository: an agent that cannot see the code is no use.
+    let cwd = leader.cwd.clone();
+    let name = next_name(&app.snapshot, &lead);
+
+    app.error = Some(format!("starting {name}…"));
+    let outcome = outcome.clone();
+    std::thread::spawn(move || {
+        let briefing = briefing(&lead, &name);
+        let _ = outcome.send(start(&name, &briefing, &cwd).context("could not start an agent"));
+    });
+}
+
+/// Take whatever the errand threads have finished with, and say only what went
+/// wrong. `true` when the screen needs redrawing.
+///
+/// Success is silent on purpose: a session that started writes its own
+/// `state.json` within a moment and the panel is watching that directory, so
+/// the row appears by itself — and a deleted one disappears the same way.
+pub fn settle(app: &mut App, outcome: &mpsc::Receiver<Result<String>>) -> bool {
+    let mut news = false;
+    while let Ok(done) = outcome.try_recv() {
+        match done {
+            Ok(_) => app.error = None,
+            // Already worded where it was raised: one channel carries more
+            // than one kind of errand.
+            Err(e) => app.error = Some(format!("{e:#}")),
+        }
+        news = true;
+    }
+    news
 }
 
 fn first_line(s: &str) -> &str {

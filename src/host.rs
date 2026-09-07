@@ -22,9 +22,8 @@ use portable_pty::{CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySyste
 use ratatui::prelude::*;
 use ratatui::widgets::Paragraph;
 
-use crate::app::{App, Front, GroupBy};
+use crate::app::{App, Front, GroupBy, Row};
 use crate::focus;
-use crate::job::Snapshot;
 use crate::ping::Ping;
 use crate::ui::{self, Hint};
 use crate::watch::Watch;
@@ -811,12 +810,7 @@ fn event_loop(
                     }
                     Action::Focus(next) => focus = next,
                     Action::Cycle(delta) => {
-                        let stop = neighbour(
-                            &app.snapshot,
-                            session.tabs.shells(),
-                            &session.tabs.front_ref(),
-                            delta,
-                        );
+                        let stop = neighbour(&app, &session.tabs.front_ref(), delta);
                         let moved = match stop {
                             // Back to a pane of your own, in the order you
                             // opened them.
@@ -845,7 +839,7 @@ fn event_loop(
                             Err(e) => app.error = Some(format!("could not open: {e}")),
                         }
                     }
-                    Action::AddAgent => start_agent(&mut app, &starting),
+                    Action::AddAgent => crate::agents::add(&mut app, &starting),
                     Action::Regroup => {
                         // Say which it is now: the headings change, but the
                         // panel may be showing one repository and one status
@@ -921,18 +915,7 @@ fn event_loop(
             }
         }
 
-        while let Ok(outcome) = started.try_recv() {
-            match outcome {
-                // The new session writes its own state.json within a moment,
-                // and the panel is watching that directory — so the row
-                // appears on its own, and there is nothing to announce.
-                Ok(_) => app.error = None,
-                // Already worded where it was raised: one channel now carries
-                // more than one kind of errand.
-                Err(e) => app.error = Some(format!("{e:#}")),
-            }
-            dirty = true;
-        }
+        dirty |= crate::agents::settle(&mut app, &started);
 
         if watch.changed() || last_refresh.elapsed() >= REFRESH {
             app.refresh();
@@ -1092,7 +1075,7 @@ fn new_tab(session: &mut Session) -> Result<()> {
 }
 
 /// Where one press of a switch key lands.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Stop {
     /// One of your own panes. They sit in front of the first session, in the
     /// order you opened them, which is the order the panel lists them in.
@@ -1102,35 +1085,49 @@ enum Stop {
 
 /// The stop one step from where you are, in the order the panel shows.
 ///
-/// The cycle is the panel's own list, with your shell at the head of it. That
-/// is the whole correction over the first cut, which cycled the *panes that
-/// happened to be alive*: flipping has to walk the rows you can see, or it
-/// takes you somewhere the screen never mentioned — an empty shell and the one
-/// session you had opened, while five more sat in the list untouched.
+/// The cycle is the panel's own rows — the ones you can select, headings and
+/// blank lines skipped — with your shells at the head of it, where the panel
+/// draws them. That is the whole correction over the first cut, which cycled
+/// the *panes that happened to be alive*: flipping has to walk the rows you
+/// can see, or it takes you somewhere the screen never mentioned.
+///
+/// It walks the rows and not the snapshot because the two disagree the moment
+/// you press `s`. Grouped by repository the panel reorders the sessions and
+/// puts a heading between them, while the snapshot stays in status order — so
+/// a cycle built from the snapshot goes down the screen, jumps back up into a
+/// repository you have already passed, and looks broken from the outside.
 ///
 /// Landing on a session opens it if it has no pane yet, so every row is one
 /// press away rather than three.
-fn neighbour(snapshot: &Snapshot, shells: usize, front: &Front, delta: isize) -> Option<Stop> {
-    // Your own panes are stops zero upward; the sessions follow them in
-    // display order. One shell and no sessions is one stop, and nowhere to go.
-    let stops = (snapshot.jobs.len() + shells) as isize;
-    if stops < 2 {
+fn neighbour(app: &App, front: &Front, delta: isize) -> Option<Stop> {
+    let stops: Vec<Stop> = app
+        .rows
+        .iter()
+        .filter_map(|row| match row {
+            Row::Shell(i) => Some(Stop::Shell(*i)),
+            Row::Job(i) => app
+                .snapshot
+                .jobs
+                .get(*i)
+                .map(|j| Stop::Session(j.short.clone())),
+            _ => None,
+        })
+        .collect();
+    // One shell and no sessions is one stop, and nowhere to go.
+    if stops.len() < 2 {
         return None;
     }
-    let here = match front {
-        Front::Shell(i) => *i as isize,
-        Front::Session(short) => snapshot
-            .jobs
-            .iter()
-            .position(|j| &j.short == short)
-            .map_or(0, |i| (i + shells) as isize),
-    };
-    let next = ((here + delta) % stops + stops) % stops;
-    Some(if next < shells as isize {
-        Stop::Shell(next as usize)
-    } else {
-        Stop::Session(snapshot.jobs[next as usize - shells].short.clone())
-    })
+    let here = stops
+        .iter()
+        .position(|stop| match (stop, front) {
+            (Stop::Shell(i), Front::Shell(j)) => i == j,
+            (Stop::Session(short), Front::Session(theirs)) => short == theirs,
+            _ => false,
+        })
+        .unwrap_or(0) as isize;
+    let len = stops.len() as isize;
+    let next = ((here + delta) % len + len) % len;
+    Some(stops[next as usize].clone())
 }
 
 /// Run the front tab's session again, in place, after it exited.
@@ -1194,41 +1191,6 @@ fn delete_session(
         let _ = outcome.send(
             crate::agents::delete(&short).with_context(|| format!("could not delete {name}")),
         );
-    });
-}
-
-/// Start a parallel agent under the selected session's lead.
-///
-/// The lead is the selected session's *base* name, so pressing this on
-/// `AGENT-3` adds a fourth agent under `AGENT` rather than starting a group
-/// beneath a group. It runs in the lead's own repository, because an agent
-/// that cannot see the code is no use.
-///
-/// This is the one thing Savras does that is not looking: it *starts*
-/// sessions. It still never writes to `~/.claude/`, and it still never
-/// interrupts a session that is already running — the new agent introduces
-/// itself to its lead, through Claude Code's own messaging, as its first act.
-fn start_agent(app: &mut App, outcome: &mpsc::Sender<Result<String>>) {
-    let Some(job) = app.selected_job() else {
-        return;
-    };
-    // The lead has to be a session that is actually running, because the new
-    // agent is told to message it by name. The numbering follows the *lead*,
-    // not the selected session and not the bare base name: a group led by
-    // `SAVRAS-4` adds `SAVRAS-6` next, leaving the free `2` alone rather than
-    // handing the newcomer a number that would make it the lead.
-    let leader = crate::agents::lead_of(&app.snapshot, job);
-    let lead = leader.name.clone();
-    // Its own repository: an agent that cannot see the code is no use.
-    let cwd = leader.cwd.clone();
-    let name = crate::agents::next_name(&app.snapshot, &lead);
-
-    app.error = Some(format!("starting {name}…"));
-    let outcome = outcome.clone();
-    std::thread::spawn(move || {
-        let briefing = crate::agents::briefing(&lead, &name);
-        let _ = outcome
-            .send(crate::agents::start(&name, &briefing, &cwd).context("could not start an agent"));
     });
 }
 
@@ -1950,9 +1912,23 @@ mod tests {
             .job("ccc", r#"{"state":"working","name":"C"}"#)
     }
 
-    /// The panel's own order, which is what flipping has to follow.
+    /// The panel's own order, which is what flipping has to follow: the rows
+    /// on screen, headings skipped, not the order the jobs were loaded in.
     fn order(app: &App) -> Vec<String> {
-        app.snapshot.jobs.iter().map(|j| j.short.clone()).collect()
+        app.rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Job(i) => Some(app.snapshot.jobs[*i].short.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A panel that believes it has `shells` panes of its own open.
+    fn with_shells(f: &Fixture, shells: usize) -> App {
+        let mut app = App::new(f.0.clone());
+        app.set_tabs(Front::Shell(0), Vec::new(), shells);
+        app
     }
 
     #[test]
@@ -1961,22 +1937,21 @@ mod tests {
         // one session opened meant flipping between an empty shell and that
         // one session while every other row sat there untouched.
         let f = three_sessions();
-        let app = App::new(f.0.clone());
+        let app = with_shells(&f, 1);
         let rows = order(&app);
-        let snap = &app.snapshot;
 
         // From the shell, forward is the first row on screen.
         assert_eq!(
-            neighbour(snap, 1, &Front::Shell(0), 1),
+            neighbour(&app, &Front::Shell(0), 1),
             Some(Stop::Session(rows[0].clone()))
         );
         // ...and on through the list, in the order you can see.
         assert_eq!(
-            neighbour(snap, 1, &Front::Session(rows[0].clone()), 1),
+            neighbour(&app, &Front::Session(rows[0].clone()), 1),
             Some(Stop::Session(rows[1].clone()))
         );
         assert_eq!(
-            neighbour(snap, 1, &Front::Session(rows[1].clone()), -1),
+            neighbour(&app, &Front::Session(rows[1].clone()), -1),
             Some(Stop::Session(rows[0].clone()))
         );
     }
@@ -1986,21 +1961,20 @@ mod tests {
         // It must stay reachable: it is where you started, and often where the
         // command you actually wanted to run lives.
         let f = three_sessions();
-        let app = App::new(f.0.clone());
+        let app = with_shells(&f, 1);
         let rows = order(&app);
-        let snap = &app.snapshot;
 
         assert_eq!(
-            neighbour(snap, 1, &Front::Session(rows[0].clone()), -1),
+            neighbour(&app, &Front::Session(rows[0].clone()), -1),
             Some(Stop::Shell(0))
         );
         // Wrapping the other way: past the last session is the shell again.
         assert_eq!(
-            neighbour(snap, 1, &Front::Session(rows[2].clone()), 1),
+            neighbour(&app, &Front::Session(rows[2].clone()), 1),
             Some(Stop::Shell(0))
         );
         assert_eq!(
-            neighbour(snap, 1, &Front::Shell(0), -1),
+            neighbour(&app, &Front::Shell(0), -1),
             Some(Stop::Session(rows[2].clone()))
         );
     }
@@ -2010,29 +1984,79 @@ mod tests {
         // The point of opening one is being able to get back to it, and the
         // flip keys are how you get anywhere here.
         let f = three_sessions();
-        let app = App::new(f.0.clone());
+        let app = with_shells(&f, 2);
         let rows = order(&app);
-        let snap = &app.snapshot;
 
         // Two shells at the head, then the sessions, in the panel's order.
+        assert_eq!(neighbour(&app, &Front::Shell(0), 1), Some(Stop::Shell(1)));
         assert_eq!(
-            neighbour(snap, 2, &Front::Shell(0), 1),
-            Some(Stop::Shell(1))
-        );
-        assert_eq!(
-            neighbour(snap, 2, &Front::Shell(1), 1),
+            neighbour(&app, &Front::Shell(1), 1),
             Some(Stop::Session(rows[0].clone()))
         );
         assert_eq!(
-            neighbour(snap, 2, &Front::Session(rows[0].clone()), -1),
+            neighbour(&app, &Front::Session(rows[0].clone()), -1),
             Some(Stop::Shell(1))
         );
         // Wrapping past the last session lands on the first shell, not the
         // one you happened to open last.
         assert_eq!(
-            neighbour(snap, 2, &Front::Session(rows[2].clone()), 1),
+            neighbour(&app, &Front::Session(rows[2].clone()), 1),
             Some(Stop::Shell(0))
         );
+    }
+
+    #[test]
+    fn flipping_follows_the_grouping_you_are_looking_at() {
+        // The bug this closes: the cycle was built from the snapshot, which
+        // stays in status order whatever the panel is showing. Pressing `s`
+        // regrouped the screen and not the flip keys, so one press went down
+        // the visible list and the next jumped back up into a repository you
+        // had already walked past — chaotic from the outside, and correct
+        // only by accident in the one grouping the two orders agree on.
+        let f = Fixture::new("host-flip-grouped")
+            .job(
+                "aaa",
+                r#"{"state":"working","name":"A","cwd":"/tmp/savras-flip/beta"}"#,
+            )
+            .job(
+                "bbb",
+                r#"{"state":"done","name":"B","output":{"result":"ok"},"cwd":"/tmp/savras-flip/alpha"}"#,
+            )
+            .job(
+                "ccc",
+                r#"{"state":"working","name":"C","cwd":"/tmp/savras-flip/alpha"}"#,
+            );
+
+        let mut app = with_shells(&f, 1);
+        // By status the two working sessions come first, `alpha`'s finished
+        // one last; by repository `alpha` holds two of the three rows.
+        let by_status = order(&app);
+        app.set_group_by(GroupBy::Repo);
+        let by_repo = order(&app);
+        assert_ne!(by_status, by_repo, "the two orders have to differ to test");
+
+        // Every step is the row below the one you are on, on the screen in
+        // front of you — not the row below it in some other order.
+        let mut at = Stop::Shell(0);
+        for want in &by_repo {
+            let next = neighbour(&app, &front_of(&at), 1).unwrap();
+            assert_eq!(next, Stop::Session(want.clone()));
+            at = next;
+        }
+        // ...and past the last row, back to the shell at the head.
+        assert_eq!(
+            neighbour(&app, &front_of(&at), 1),
+            Some(Stop::Shell(0)),
+            "the cycle has to close"
+        );
+    }
+
+    /// The front tab a stop becomes once you have flipped to it.
+    fn front_of(stop: &Stop) -> Front {
+        match stop {
+            Stop::Shell(i) => Front::Shell(*i),
+            Stop::Session(short) => Front::Session(short.clone()),
+        }
     }
 
     #[test]
@@ -2040,15 +2064,9 @@ mod tests {
         // Savras with no sessions to watch is still two panes you opened, and
         // the keys have somewhere to go.
         let f = Fixture::new("host-two-shells");
-        let app = App::new(f.0.clone());
-        assert_eq!(
-            neighbour(&app.snapshot, 2, &Front::Shell(0), 1),
-            Some(Stop::Shell(1))
-        );
-        assert_eq!(
-            neighbour(&app.snapshot, 2, &Front::Shell(1), 1),
-            Some(Stop::Shell(0))
-        );
+        let app = with_shells(&f, 2);
+        assert_eq!(neighbour(&app, &Front::Shell(0), 1), Some(Stop::Shell(1)));
+        assert_eq!(neighbour(&app, &Front::Shell(1), 1), Some(Stop::Shell(0)));
     }
 
     #[test]
@@ -2140,7 +2158,7 @@ mod tests {
     fn with_no_sessions_there_is_nowhere_to_flip() {
         let f = Fixture::new("host-nowhere");
         let app = App::new(f.0.clone());
-        assert_eq!(neighbour(&app.snapshot, 1, &Front::Shell(0), 1), None);
+        assert_eq!(neighbour(&app, &Front::Shell(0), 1), None);
         // ...and the keys are left to the child rather than swallowed.
         assert_eq!(switch(&[SWITCH_BACK], Switch::default(), false), None);
     }

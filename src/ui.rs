@@ -402,7 +402,17 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
             Style::default().fg(Color::Red),
         ),
         (None, Hint::Standalone) => Span::styled(
-            "↑↓ move · r refresh · q quit",
+            // Solo has no working pane, so nothing here opens or closes one.
+            // `a` is the exception worth the width: starting an agent needs no
+            // pane, and a key nobody is told about is a key nobody presses.
+            truncate(
+                if area.width >= ROOMY {
+                    "↑↓ move · s group · a agent · r refresh · q quit"
+                } else {
+                    "↑↓ move · a agent · q quit"
+                },
+                area.width as usize,
+            ),
             Style::default().fg(Color::DarkGray),
         ),
         (None, Hint::Focused) => Span::styled(

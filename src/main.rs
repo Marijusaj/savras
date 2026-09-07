@@ -474,16 +474,25 @@ fn event_loop(
     let mut dirty_since: Option<Instant> = None;
     let mut last_load = Instant::now();
 
+    // Starting an agent takes long enough to stall a panel that redraws on a
+    // tick, so it happens on a thread and reports back here — the same
+    // arrangement the side panel uses.
+    let (starting, started) = std::sync::mpsc::channel::<Result<String>>();
+
     while !app.should_quit {
         terminal.draw(|frame| ui::draw(frame, &mut app))?;
 
         if event::poll(TICK)? {
             match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => handle_key(&mut app, key),
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    handle_key(&mut app, key, &starting)
+                }
                 Event::Resize(_, _) => {}
                 _ => {}
             }
         }
+
+        agents::settle(&mut app, &started);
 
         if watch.changed() {
             dirty_since.get_or_insert_with(Instant::now);
@@ -503,7 +512,13 @@ fn event_loop(
     Ok(())
 }
 
-fn handle_key(app: &mut App, key: KeyEvent) {
+/// The keys `svr solo` answers to.
+///
+/// Fewer than the side panel's, and the difference is not arbitrary: opening a
+/// session, closing a tab and flipping between tabs all need a working pane,
+/// and solo is the panel with nothing beside it. Starting an agent needs no
+/// pane, so `a` belongs in both.
+fn handle_key(app: &mut App, key: KeyEvent, starting: &std::sync::mpsc::Sender<Result<String>>) {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -517,6 +532,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('s') => {
             app.regroup();
         }
+        KeyCode::Char('a') => agents::add(app, starting),
         _ => {}
     }
 }

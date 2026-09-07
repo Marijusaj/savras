@@ -156,6 +156,12 @@ else, and a stop you cannot see is one you go to without knowing where you
 went. One shell is drawn unnumbered and unnamed in the header, which is what an
 unnamed pane has always meant here.
 
+The cycle is the list **as you are looking at it**, so `s` regroups the flip
+keys along with the screen. Grouped by repository, flipping goes down one
+repository and on to the next, in the order the headings are drawn — not down
+some other order that only agrees with the screen while you are grouped by
+status.
+
 **`exit` closes a tab you opened**, the way it closes a tab in any terminal —
 there is nothing on a finished shell's screen worth keeping you there. `x` in
 the panel closes the one under the cursor without waiting for that. A
@@ -480,11 +486,12 @@ Press keys to see what this terminal sends. Ctrl-C to stop.
 | `↑` `↓` / `k` `j` | move | move |
 | `g` / `G` | first / last | first / last |
 | `r` | refresh now | refresh now |
+| `s` | group by repository, or by status | group by repository, or by status |
 | `enter` | open the selected session | — |
 | `n` / `ctrl-t` | a tab of your own | — |
 | `x` | close the selected tab | — |
 | `d` | delete the selected session, after asking | — |
-| `a` | start a parallel agent under its lead | — |
+| `a` | start a parallel agent under its lead | start a parallel agent under its lead |
 | `q` / `Esc` | back to your work | quit |
 | `Q` | quit Savras, after asking | quit |
 | `ctrl-l` | paint the screen again | paint the screen again |
