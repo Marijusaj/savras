@@ -367,11 +367,16 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
             if job.in_worktree() { "  worktree" } else { "" },
             Style::default().fg(Color::Indexed(140)),
         ),
-        Span::styled(
+    ])];
+    // A session on another machine reports no token count — the file it comes
+    // from has none. "0 tokens" would read as a session that has spent
+    // nothing, which is a different and untrue thing.
+    if job.tokens > 0 {
+        lines[0].spans.push(Span::styled(
             format!("  {} tokens", thousands(job.tokens)),
             Style::default().fg(Color::DarkGray),
-        ),
-    ])];
+        ));
+    }
 
     // Where this session sits in its group. The detail footer is the right
     // place for it: the rows have no width to spare, and "who commands whom"

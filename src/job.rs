@@ -151,6 +151,16 @@ impl Job {
 
     /// The same command, as one line for the panel to show.
     pub fn open_command_line(&self) -> String {
+        // The real command for a session on another machine is four ssh
+        // options and a tmux script, and a 46-column footer would show the
+        // options and none of the point. Said short, it is still the two
+        // things you would want to know: which box, and which window.
+        if let Some(remote) = &self.machine {
+            return match &remote.tmux {
+                Some(target) => format!("ssh {} · tmux {target}", remote.host),
+                None => format!("ssh {}", remote.host),
+            };
+        }
         self.open_command().join(" ")
     }
 
@@ -656,6 +666,26 @@ mod tests {
             r#"{"state":"working","name":"X","detail":"d","brandNewField":{"a":1}}"#,
         );
         assert_eq!(load(&f.0).unwrap().jobs[0].name, "X");
+    }
+
+    #[test]
+    fn the_footer_says_the_machine_and_the_window_rather_than_the_whole_ssh() {
+        let mut job = load(
+            &Fixture::new("remote-footer")
+                .job("aaa", r#"{"state":"working","name":"A"}"#)
+                .0,
+        )
+        .unwrap()
+        .jobs
+        .remove(0);
+        job.machine = Some(Remote {
+            host: "claude-box".to_string(),
+            tmux: Some("autodad:@2.%2".to_string()),
+        });
+        assert_eq!(
+            job.open_command_line(),
+            "ssh claude-box · tmux autodad:@2.%2"
+        );
     }
 
     #[test]
