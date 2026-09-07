@@ -99,6 +99,12 @@ pub struct App {
     /// The panes of your own, in the order they were opened. Empty means there
     /// is no working pane at all, which is the standalone panel.
     shells: Vec<Shell>,
+    /// The local jobs, as last read. Kept apart from `snapshot` because the
+    /// snapshot is the two sources *merged*, and a refresh of one must not
+    /// drop the other.
+    local: Vec<Job>,
+    /// The last batch each machine sent, by ssh host.
+    remote: std::collections::BTreeMap<String, Vec<Job>>,
     /// How the rows are grouped, and the headings that grouping produced.
     group_by: GroupBy,
     pub groups: Vec<String>,
@@ -143,6 +149,8 @@ impl App {
             tabs: Vec::new(),
             front: None,
             shells: Vec::new(),
+            local: Vec::new(),
+            remote: std::collections::BTreeMap::new(),
             group_by: GroupBy::Status,
             groups: Vec::new(),
             switch_label: None,
@@ -289,16 +297,34 @@ impl App {
 
     /// Re-read from disk, keeping the cursor on the same row where possible.
     pub fn refresh(&mut self) {
-        let anchor = self.anchor();
-
         match job::load(&self.jobs_dir) {
             Ok(snapshot) => {
-                self.snapshot = snapshot;
+                self.local = snapshot.jobs;
                 self.error = None;
             }
             Err(e) => self.error = Some(format!("{e}")),
         }
+        self.merge();
+    }
 
+    /// What a machine last said it was running.
+    ///
+    /// A batch replaces that machine's rows wholesale, which is what makes a
+    /// session disappearing over there a row disappearing over here.
+    pub fn set_remote(&mut self, host: String, jobs: Vec<Job>) {
+        self.remote.insert(host, jobs);
+        self.merge();
+    }
+
+    /// The two sources as one list, in the panel's own order.
+    fn merge(&mut self) {
+        let anchor = self.anchor();
+        let mut jobs = self.local.clone();
+        for machine in self.remote.values() {
+            jobs.extend(machine.iter().cloned());
+        }
+        job::sort(&mut jobs);
+        self.snapshot = Snapshot { jobs };
         self.rebuild_rows();
         self.restore_selection(anchor);
         self.forget_stale_alerts();

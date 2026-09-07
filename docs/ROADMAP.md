@@ -181,6 +181,28 @@ running session at all would mean speaking the private socket protocol under
 `/tmp/cc-socks/`, which is undocumented and would break on any Claude Code
 release.
 
+### M3.5 · Machines
+`--machine <ssh-host>` watches another box's sessions and lists them beside
+your own, with the machine in the repository heading so two checkouts of the
+same repo on two machines do not read as one place.
+
+The far side has no jobs directory — nothing runs the daemon on a box you ssh
+into and drive by hand — so the source is `~/.claude/sessions/<pid>.json`, a
+different file with a different shape: `status` where the jobs file says
+`state`, no summary, no token count, and one field the jobs file has never
+had, `tmux`. That field is what makes opening one possible at all.
+
+`enter` therefore joins the tmux window rather than attaching to a daemon, and
+it joins it as a *grouped* session: the user is already attached from their own
+terminal, and a second client would force both to the smaller size. Grouped
+gives the pane its own size and its own selected window, and
+`destroy-unattached` removes it when the tab closes.
+
+`idle` on the far side is read as "needs input" here — an interactive session
+that has stopped thinking is one waiting for you, and that transition is
+exactly what the ping exists to announce. Liveness is decided over there, with
+`kill -0`, because nothing removes a session's json when it exits.
+
 ---
 
 ## Next

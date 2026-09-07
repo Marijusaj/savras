@@ -660,6 +660,8 @@ pub struct Setup {
     pub open: Open,
     pub group_by: GroupBy,
     pub ping: Ping,
+    /// Other machines to watch, as ssh targets.
+    pub machines: Vec<String>,
 }
 
 pub fn run(setup: Setup) -> Result<()> {
@@ -672,6 +674,7 @@ pub fn run(setup: Setup) -> Result<()> {
         open,
         group_by,
         ping,
+        machines,
     } = setup;
     let (cols, rows) = crossterm::terminal::size().context("reading the terminal size")?;
     let cols_for_work = work_cols(cols, width);
@@ -700,7 +703,7 @@ pub fn run(setup: Setup) -> Result<()> {
     // Ask the terminal to say when it gains and loses focus, so the panel can
     // tell "you are looking at that session" from "you are in another app".
     let _ = std::io::stdout().write_all(focus::ENABLE.as_bytes());
-    let result = event_loop(&mut terminal, session, open, group_by);
+    let result = event_loop(&mut terminal, session, open, group_by, machines);
     // Leave the terminal's mouse and focus handling as we found it.
     let _ = std::io::stdout().write_all(MOUSE_OFF.as_bytes());
     let _ = std::io::stdout().write_all(focus::DISABLE.as_bytes());
@@ -738,6 +741,7 @@ fn event_loop(
     mut session: Session,
     open: Open,
     group_by: GroupBy,
+    machines: Vec<String>,
 ) -> Result<()> {
     let mut app = App::new(session.jobs_dir.clone());
     app.set_group_by(group_by);
@@ -752,6 +756,8 @@ fn event_loop(
     // here, since a session that failed to start must say so rather than
     // silently never appearing.
     let (starting, started) = mpsc::channel::<Result<String>>();
+    // One ssh per machine, held open, streaming what is running over there.
+    let machines = crate::remote::watch(&machines);
     let watch = Watch::start(&session.jobs_dir);
     app.watching = watch.live;
     // What is already on screen when Savras opens is not news.
@@ -998,6 +1004,11 @@ fn event_loop(
         }
 
         dirty |= crate::agents::settle(&mut app, &started);
+
+        while let Ok((host, jobs)) = machines.try_recv() {
+            app.set_remote(host, jobs);
+            dirty = true;
+        }
 
         if watch.changed() || last_refresh.elapsed() >= REFRESH {
             app.refresh();

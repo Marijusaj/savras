@@ -353,6 +353,56 @@ This is the one thing Savras does that is not looking. It still never writes to
 `~/.claude/`, and it still cannot disturb a session that is running — but it
 can now *start* one, with `claude --bg`, in that group's own repository.
 
+### Other machines
+
+`--machine <ssh-host>` puts the sessions running on another box in the same
+list as yours. Repeat it for more than one.
+
+```
+svr --machine claude-box
+```
+
+```
+claude-box:autodad-assistant          ← the machine is part of the heading
+● autodad-assistant-9c  waiting at the prompt   2m
+▷ AGENT                 working                 7m
+```
+
+The far side is read from `~/.claude/sessions/<pid>.json`, not from
+`~/.claude/jobs/`. That is not a detail: **a machine you ssh into and work in
+by hand has no jobs directory at all**, because nothing there runs Claude
+Code's daemon. What the sessions file has instead is the one thing the jobs
+directory does not — `tmux`, naming the window the session is running in.
+
+So `enter` on one of those rows does not run `claude attach`; there is nothing
+to attach to. It opens the tmux window, in a **grouped** session:
+
+```
+ssh -t <host> tmux new-session -t <session> \; set destroy-unattached on \; \
+                               select-window -t <window>
+```
+
+Grouped rather than attached, because you are already attached to that session
+from your own terminal, and a second client forces both terminals to the
+smaller of the two sizes — the panel would silently shrink the window you are
+working in. A grouped session shares the windows but keeps its own size and its
+own selected window, and `destroy-unattached` takes it away the moment you
+close the tab, so nothing is left behind on the machine.
+
+Two more things worth knowing:
+
+- **`idle` over there is "needs input" over here.** A session you drive by hand
+  has no question flag to read; it is either thinking or it is not, and "not"
+  means it is your turn. So the ping fires when a remote session stops working,
+  which is exactly the moment you wanted to know about.
+- **One ssh per machine, held open.** A round trip is most of a second and
+  sshd allows ten sessions, so a poll per refresh would be both slow and
+  wasteful. One connection runs a loop on the far side and streams a batch
+  every two seconds, multiplexed so that opening a session costs no second
+  handshake. The loop asks `kill -0` before sending a row, because nothing
+  cleans those files up when a session exits — without it the panel would show
+  ghosts for as long as the box stayed up.
+
 ### Ping
 
 When a session arrives in **Needs input**, Savras says so: a desktop

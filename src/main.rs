@@ -11,6 +11,7 @@ mod host;
 mod job;
 mod panel;
 mod ping;
+mod remote;
 #[cfg(test)]
 mod testing;
 mod ui;
@@ -63,6 +64,9 @@ options:
   --once              print the current sessions as plain text and exit
   --keys              print what this terminal sends for each key, and what
                       Savras makes of it, when a chord seems to do nothing
+  --machine <host>    also watch the Claude Code sessions on an ssh host, and
+                      open them in the tmux window they are running in. Repeat
+                      it, or separate hosts with commas
   --jobs-dir <path>   read jobs from somewhere other than ~/.claude/jobs
   -h, --help          show this help
   -V, --version       show the version
@@ -74,6 +78,7 @@ examples:
   svr --open shell             start on a prompt instead of a session
   svr solo                     the panel on its own
   svr --once                   plain text, for scripts and status lines
+  svr --machine claude-box     your machine's sessions and the box's, one list
 
 keys, with the panel focused:
   ctrl-g     move the keyboard between your work and the panel
@@ -137,6 +142,8 @@ struct Options {
     open: host::Open,
     /// Whether the panel groups its rows by repository or by status.
     group_by: app::GroupBy,
+    /// Other machines to watch, as ssh targets.
+    machines: Vec<String>,
 }
 
 fn main() -> Result<()> {
@@ -183,6 +190,7 @@ fn main() -> Result<()> {
             open: options.open,
             group_by: options.group_by,
             ping: Ping::new(options.ping, options.sound, options.quiet),
+            machines: options.machines,
         });
     }
 
@@ -195,6 +203,7 @@ fn main() -> Result<()> {
             jobs_dir,
             options.group_by,
             Ping::new(options.ping, options.sound, options.quiet),
+            options.machines,
         ),
     }
 }
@@ -275,6 +284,7 @@ fn parse_args() -> Result<Option<Options>> {
 
 fn parse(args: Vec<String>) -> Result<Option<Options>> {
     let mut options = Options {
+        machines: Vec::new(),
         mode: Mode::Tui,
         jobs_dir: None,
         ping: When::default(),
@@ -339,6 +349,12 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
                     .next()
                     .context("--open needs shell, top, or a session name")?;
                 open = Some(host::Open::parse(&raw));
+            }
+            "--machine" => {
+                let host = args.next().context("--machine needs an ssh host")?;
+                for host in host.split(',').map(str::trim).filter(|h| !h.is_empty()) {
+                    options.machines.push(host.to_string());
+                }
             }
             "--group" => {
                 let raw = args.next().context("--group needs repo or status")?;
@@ -450,9 +466,14 @@ fn print_once(jobs_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn run_tui(jobs_dir: PathBuf, group_by: app::GroupBy, ping: Ping) -> Result<()> {
+fn run_tui(
+    jobs_dir: PathBuf,
+    group_by: app::GroupBy,
+    ping: Ping,
+    machines: Vec<String>,
+) -> Result<()> {
     let mut terminal = setup_terminal()?;
-    let result = event_loop(&mut terminal, jobs_dir, group_by, ping);
+    let result = event_loop(&mut terminal, jobs_dir, group_by, ping, machines);
     restore_terminal(&mut terminal)?;
     result
 }
@@ -462,6 +483,7 @@ fn event_loop(
     jobs_dir: PathBuf,
     group_by: app::GroupBy,
     mut ping: Ping,
+    machines: Vec<String>,
 ) -> Result<()> {
     let mut app = App::new(jobs_dir.clone());
     app.set_group_by(group_by);
@@ -470,6 +492,7 @@ fn event_loop(
 
     let watch = Watch::start(&jobs_dir);
     app.watching = watch.live;
+    let machines = remote::watch(&machines);
 
     let mut dirty_since: Option<Instant> = None;
     let mut last_load = Instant::now();
@@ -493,6 +516,9 @@ fn event_loop(
         }
 
         agents::settle(&mut app, &started);
+        while let Ok((host, jobs)) = machines.try_recv() {
+            app.set_remote(host, jobs);
+        }
 
         if watch.changed() {
             dirty_since.get_or_insert_with(Instant::now);

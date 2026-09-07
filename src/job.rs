@@ -60,6 +60,72 @@ pub struct Job {
     /// The short id the daemon knows the session by, which is what `claude
     /// attach` takes.
     pub daemon_short: Option<String>,
+    /// The machine it is running on, when that is not this one.
+    pub machine: Option<Remote>,
+}
+
+/// A session on another machine, and how to get to it.
+///
+/// A box you ssh into and work in by hand has no daemon to attach to, so
+/// "open this session" means "put me in the tmux window it is running in".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Remote {
+    /// The ssh target — a host alias from your ssh config, usually.
+    pub host: String,
+    /// Where tmux has it: `session:@window.%pane`, in tmux's own ids.
+    pub tmux: Option<String>,
+}
+
+impl Remote {
+    /// How to put this session in front of you.
+    ///
+    /// Not a plain `tmux attach`. The user is already attached to that session
+    /// from their own terminal, and a second client forces both to the smaller
+    /// of the two sizes — the panel would silently shrink the window they are
+    /// working in. A *grouped* session shares the windows but keeps its own
+    /// size and its own idea of which window is selected, and
+    /// `destroy-unattached` takes it away again the moment the tab closes, so
+    /// nothing is left behind on the machine.
+    ///
+    /// With no tmux to go to, this is a plain login shell on the box, which is
+    /// still the useful thing to be given.
+    pub fn open_command(&self) -> Vec<String> {
+        let mut ssh = vec!["ssh".to_string(), "-t".to_string()];
+        // The watcher holds a multiplexed connection open; reusing it means
+        // opening a session costs no handshake, and one of sshd's ten
+        // channels rather than a new one.
+        ssh.push("-o".into());
+        ssh.push("ControlMaster=auto".into());
+        ssh.push("-o".into());
+        ssh.push("ControlPath=~/.ssh/savras-%r@%h:%p".into());
+        ssh.push("-o".into());
+        ssh.push("ControlPersist=10m".into());
+        ssh.push(self.host.clone());
+        ssh.push(match self.tmux.as_deref().and_then(split_target) {
+            // `\;` and not `;`: the remote shell has to hand tmux a literal
+            // semicolon as an argument rather than end the command there.
+            Some((session, window)) => {
+                let joined = [
+                    format!("tmux new-session -t '{session}'"),
+                    "set destroy-unattached on".to_string(),
+                    "set -w aggressive-resize on".to_string(),
+                    format!("select-window -t '{window}'"),
+                ]
+                .join(" \\; ");
+                joined
+            }
+            None => "exec ${SHELL:-sh} -l".to_string(),
+        });
+        ssh
+    }
+}
+
+/// `session:@window.%pane` split into the session to group with and the window
+/// to select. Anything that is not that shape names nothing we can steer to.
+fn split_target(tmux: &str) -> Option<(&str, &str)> {
+    let (session, rest) = tmux.split_once(':')?;
+    let window = rest.split('.').next().filter(|w| !w.is_empty())?;
+    (!session.is_empty()).then_some((session, window))
 }
 
 impl Job {
@@ -70,6 +136,11 @@ impl Job {
     /// `claude attach` to open it". Attaching is also the gentler of the two —
     /// the session keeps running whether you attach to it or not.
     pub fn open_command(&self) -> Vec<String> {
+        // A session on another machine is reached by ssh, whatever this one
+        // would have done with it.
+        if let Some(remote) = &self.machine {
+            return remote.open_command();
+        }
         match (&self.backend, &self.daemon_short) {
             (Some(backend), Some(short)) if backend == "daemon" => {
                 vec!["claude".into(), "attach".into(), short.clone()]
@@ -103,7 +174,12 @@ impl Job {
     /// there is nothing better to call it, and a session running outside a
     /// repository is still somewhere.
     pub fn repo(&self) -> String {
-        repo_of(&self.cwd)
+        match &self.machine {
+            // Named for the machine as well: the same checkout exists on both,
+            // and one heading over two boxes says the work is in one place.
+            Some(remote) => format!("{}:{}", remote.host, repo_of(&self.cwd)),
+            None => repo_of(&self.cwd),
+        }
     }
 
     /// `cwd` with the home directory folded back to `~`.
@@ -261,9 +337,23 @@ pub fn load(jobs_dir: &Path) -> Result<Snapshot> {
     // muscle memory at all. A name is the one thing about a session that
     // stands still, so the list only moves when a session changes *status* —
     // which is a change worth seeing.
-    jobs.sort_by(|a, b| a.status.cmp(&b.status).then(a.name.cmp(&b.name)));
+    sort(&mut jobs);
 
     Ok(Snapshot { jobs })
+}
+
+/// The panel's order, applied wherever jobs are put together: local ones as
+/// they are read, and again once the machines' rows are mixed in.
+pub fn sort(jobs: &mut [Job]) {
+    // The id breaks ties last: two machines can hold sessions with the same
+    // derived name, and a list that reordered itself between batches would be
+    // the "slot machine" all over again.
+    jobs.sort_by(|a, b| {
+        a.status
+            .cmp(&b.status)
+            .then(a.name.cmp(&b.name))
+            .then(a.short.cmp(&b.short))
+    });
 }
 
 /// The file, parsed — with one retry.
@@ -352,6 +442,7 @@ fn read_one(dir: &Path, short: &str) -> Option<Job> {
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|d| d.with_timezone(&Utc)),
         links,
+        machine: None,
         backend: raw.backend,
         daemon_short: raw.daemon_short,
     })
@@ -565,6 +656,45 @@ mod tests {
             r#"{"state":"working","name":"X","detail":"d","brandNewField":{"a":1}}"#,
         );
         assert_eq!(load(&f.0).unwrap().jobs[0].name, "X");
+    }
+
+    #[test]
+    fn a_session_on_another_machine_is_opened_through_tmux() {
+        // The box has no daemon and no jobs directory — `claude attach` has
+        // nothing to attach to there. What it has is tmux, and the session's
+        // own json says which window.
+        let remote = Remote {
+            host: "claude-box".to_string(),
+            tmux: Some("autodad:@2.%2".to_string()),
+        };
+        let command = remote.open_command();
+
+        assert_eq!(command[0], "ssh");
+        // A tty, or tmux refuses to attach at all.
+        assert!(command.contains(&"-t".to_string()), "{command:?}");
+        assert!(command.contains(&"claude-box".to_string()), "{command:?}");
+
+        let script = command.last().unwrap();
+        // Grouped, not attached: the user is already attached from their own
+        // terminal, and a second client would force both to the smaller size.
+        assert!(script.contains("new-session -t 'autodad'"), "{script}");
+        assert!(script.contains("select-window -t '@2'"), "{script}");
+        // And it takes itself away when the tab closes, so the panel does not
+        // litter the machine with view sessions.
+        assert!(script.contains("destroy-unattached on"), "{script}");
+        // Escaped, because the remote shell would otherwise end the command
+        // at the semicolon instead of handing tmux one.
+        assert!(script.contains("\\;"), "{script}");
+    }
+
+    #[test]
+    fn a_machine_with_no_tmux_window_is_still_worth_opening() {
+        let remote = Remote {
+            host: "claude-box".to_string(),
+            tmux: None,
+        };
+        let script = remote.open_command().last().unwrap().clone();
+        assert!(script.contains("SHELL"), "{script}");
     }
 
     #[test]
