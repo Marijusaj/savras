@@ -40,11 +40,12 @@ savras — see every Claude Code session you have running
 usage: svr [options] [-- <command>...]
        svr solo [options]
 
-By default Savras opens the panel as a column beside your work, and runs your
-shell — or the command after `--` — in the pane next to it.
+By default Savras opens the panel as a column beside your work, with the
+session at the top of the list in the pane next to it — or the command after
+`--`, if you name one. Your shell is always the first tab, one ctrl-w away.
 
 commands:
-  (none)              the side panel, with your shell beside it
+  (none)              the side panel, with the top session beside it
   solo                just the panel, with no working pane, for its own tab
 
 options:
@@ -56,8 +57,8 @@ options:
   --no-sound          notify without a sound
   --quiet <seconds>   silence after a ping, news held until it ends (default 20)
   --switch <keys>     ctrl-<back><forward> flips tabs (default ws), or off
-  --open <what>       what the working pane starts on: shell (the default),
-                      top for the first session in the panel, or a name
+  --open <what>       what the working pane starts on: top, the first session
+                      in the panel (the default), a session name, or shell
   --once              print the current sessions as plain text and exit
   --keys              print what this terminal sends for each key, and what
                       Savras makes of it, when a chord seems to do nothing
@@ -69,7 +70,7 @@ examples:
   svr                          panel on the right, a shell beside it
   svr -- claude                panel on the right, Claude Code beside it
   svr --side left --width 52
-  svr --open top               open on the session at the top of the list
+  svr --open shell             start on a prompt instead of a session
   svr solo                     the panel on its own
   svr --once                   plain text, for scripts and status lines
 
@@ -130,7 +131,7 @@ struct Options {
     quiet: Duration,
     /// The keys that flip between tabs.
     switch: Switch,
-    /// What the working pane starts on.
+    /// What the working pane starts on, once the default is worked out.
     open: host::Open,
 }
 
@@ -274,8 +275,11 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
         sound: true,
         quiet: ping::QUIET,
         switch: Switch::default(),
+        // Filled in below: what the pane starts on depends on whether you
+        // named a command for it.
         open: host::Open::Shell,
     };
+    let mut open: Option<host::Open> = None;
     let mut width = panel::DEFAULT_WIDTH;
     let mut command = Vec::new();
     // The side panel is the point of the tool, so it is what you get by
@@ -327,7 +331,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
                 let raw = args
                     .next()
                     .context("--open needs shell, top, or a session name")?;
-                options.open = host::Open::parse(&raw);
+                open = Some(host::Open::parse(&raw));
             }
             "--switch" => {
                 let raw = args.next().context("--switch needs a letter, or off")?;
@@ -374,6 +378,16 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
             other => anyhow::bail!("unknown option {other}"),
         }
     }
+
+    // The session at the top of the list is what you came for; an empty shell
+    // beside a panel full of sessions is a prompt you have to do something
+    // with before anything happens. But a command after `--` is you saying
+    // what the pane is for, and Savras does not know better.
+    options.open = open.unwrap_or(if command.is_empty() {
+        host::Open::Top
+    } else {
+        host::Open::Shell
+    });
 
     if is_panel {
         options.mode = Mode::Panel {
@@ -556,6 +570,21 @@ mod tests {
             }
             _ => panic!("expected panel mode"),
         }
+    }
+
+    #[test]
+    fn the_pane_starts_on_the_top_session_unless_you_said_otherwise() {
+        // An empty shell beside a panel full of sessions is a prompt you have
+        // to do something with before anything happens.
+        assert_eq!(parse_ok(&[]).open, host::Open::Top);
+        // ...but a command after `--` is you saying what the pane is for.
+        assert_eq!(parse_ok(&["--", "claude"]).open, host::Open::Shell);
+        // And either way it can be said outright.
+        assert_eq!(parse_ok(&["--open", "shell"]).open, host::Open::Shell);
+        assert_eq!(
+            parse_ok(&["--open", "PLAN", "--", "claude"]).open,
+            host::Open::Named("PLAN".into())
+        );
     }
 
     #[test]

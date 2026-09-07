@@ -65,11 +65,11 @@ The point is a narrow column down the side of the terminal you are already
 working in, with your session beside it:
 
 ```sh
-svr                # panel on the right, a shell beside it
+svr                # panel on the right, the top session beside it
 svr -- claude      # panel on the right, Claude Code beside it
 svr --side left    # the other way round
 svr --width 52
-svr --open top     # start on the session at the top of the list
+svr --open shell   # start on a prompt instead of a session
 svr solo           # just the panel, no working pane, for its own tab
 ```
 
@@ -386,7 +386,7 @@ front of you. `--dry-run` prints the tmux commands instead of running them.
 ## Usage
 
 ```
-svr                    the side panel, with your shell beside it
+svr                    the side panel, with the top session beside it
 svr -- claude          ... with Claude Code beside it
 svr --side left        put the panel on the left instead of the right
 svr --tmux             use tmux, so the session survives a crash
@@ -395,7 +395,7 @@ svr --ping <when>      ping on needs (the default), done, or off
 svr --no-sound         notify without a sound
 svr --quiet <seconds>  silence after a ping; news is held, not lost (default 20)
 svr --switch <keys>    ctrl-<back><forward> flips tabs (default ws), or off
-svr --open <what>      what the pane starts on: shell, top, or a session name
+svr --open <what>      what the pane starts on: top (default), a name, or shell
 svr --once             print the current sessions as plain text and exit
 svr --keys             print what this terminal sends for each key
 svr --jobs-dir <path>  read jobs from somewhere other than ~/.claude/jobs
@@ -403,11 +403,14 @@ svr --jobs-dir <path>  read jobs from somewhere other than ~/.claude/jobs
 
 `--once` is for status lines, scripts, and anywhere without a TTY.
 
-**An empty shell is not always what you came for.** `svr --open top` puts the
-session at the top of the panel in the pane at startup — Needs input before
-Working before Completed, so it is the one most likely to be the reason you
-opened Savras. `--open <NAME>` opens that session by name. The shell is still
-the first tab either way, so ctrl-w takes you back to a prompt.
+**An empty shell is not what you came for.** Savras starts on the session at
+the top of the panel — Needs input before Working before Completed, so it is
+the one most likely to be the reason you opened Savras at all. `--open <NAME>`
+opens a particular session instead, and `--open shell` gives you the prompt
+that used to be the default. A command after `--` overrides all of it: naming
+one is saying what the pane is for. Your shell is the first tab either way, so
+ctrl-w is always a prompt away, and with no sessions to open it is what you
+get.
 
 **When a chord seems to do nothing**, `svr --keys` says what your terminal
 actually sent and what Savras would make of it. There are only two possible
