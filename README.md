@@ -69,6 +69,7 @@ svr                # panel on the right, a shell beside it
 svr -- claude      # panel on the right, Claude Code beside it
 svr --side left    # the other way round
 svr --width 52
+svr --open top     # start on the session at the top of the list
 svr solo           # just the panel, no working pane, for its own tab
 ```
 
@@ -389,11 +390,35 @@ svr --ping <when>      ping on needs (the default), done, or off
 svr --no-sound         notify without a sound
 svr --quiet <seconds>  silence after a ping; news is held, not lost (default 20)
 svr --switch <keys>    ctrl-<back><forward> flips tabs (default ws), or off
+svr --open <what>      what the pane starts on: shell, top, or a session name
 svr --once             print the current sessions as plain text and exit
+svr --keys             print what this terminal sends for each key
 svr --jobs-dir <path>  read jobs from somewhere other than ~/.claude/jobs
 ```
 
 `--once` is for status lines, scripts, and anywhere without a TTY.
+
+**An empty shell is not always what you came for.** `svr --open top` puts the
+session at the top of the panel in the pane at startup — Needs input before
+Working before Completed, so it is the one most likely to be the reason you
+opened Savras. `--open <NAME>` opens that session by name. The shell is still
+the first tab either way, so ctrl-w takes you back to a prompt.
+
+**When a chord seems to do nothing**, `svr --keys` says what your terminal
+actually sent and what Savras would make of it. There are only two possible
+answers and no way to tell them apart by staring: the terminal never sent the
+chord — which is most of them, since Command chords and unmodified arrows are
+indistinguishable from plain arrows in the byte stream — or it sent something
+Savras does not read. This says which:
+
+```
+$ svr --keys
+Press keys to see what this terminal sends. Ctrl-C to stop.
+
+\e[1;6A                  the chord — flip back a tab
+\x17                     the switch key — flip back a tab
+\e[A                     passed to the program in the pane
+```
 
 | key | with the panel focused | in `svr solo` |
 |---|---|---|
@@ -401,6 +426,10 @@ svr --jobs-dir <path>  read jobs from somewhere other than ~/.claude/jobs
 | `g` / `G` | first / last | first / last |
 | `r` | refresh now | refresh now |
 | `enter` | open the selected session | — |
+| `n` / `ctrl-t` | a tab of your own | — |
+| `x` | close the selected tab | — |
+| `d` | delete the selected session, after asking | — |
+| `a` | start a parallel agent under its lead | — |
 | `q` / `Esc` | back to your work | quit |
 | `Q` | quit Savras, after asking | quit |
 | `ctrl-l` | paint the screen again | paint the screen again |

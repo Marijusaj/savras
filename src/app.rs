@@ -354,6 +354,24 @@ impl App {
         }
     }
 
+    /// The session at the top of the list — Needs input before Working before
+    /// Completed, so it is the one most likely to be why you opened Savras.
+    pub fn first_job(&self) -> Option<&Job> {
+        self.rows.iter().find_map(|r| match r {
+            Row::Job(i) => self.snapshot.jobs.get(*i),
+            _ => None,
+        })
+    }
+
+    /// A session by name, as the panel spells it. Case-insensitive, because
+    /// the names are shouted and nobody wants to hold shift to say so.
+    pub fn job_named(&self, name: &str) -> Option<&Job> {
+        self.snapshot
+            .jobs
+            .iter()
+            .find(|j| j.name.eq_ignore_ascii_case(name))
+    }
+
     /// Which of your own panes the cursor is on, if it is on one at all.
     pub fn selected_shell(&self) -> Option<usize> {
         match self.current_row() {
@@ -626,6 +644,17 @@ mod tests {
         assert_eq!(app.selected_shell(), Some(1));
         app.refresh();
         assert_eq!(app.selected_shell(), Some(1));
+    }
+
+    #[test]
+    fn the_top_of_the_list_is_the_session_that_wants_you_most() {
+        // `--open top` is only worth having if "top" means what the panel
+        // shows: Needs input first, whatever the ages say.
+        let f = fixture();
+        let app = App::new(f.0.clone());
+        assert_eq!(app.first_job().map(|j| j.name.as_str()), Some("ASK"));
+        assert_eq!(app.job_named("fin").map(|j| j.short.as_str()), Some("ccc"));
+        assert!(app.job_named("nobody").is_none());
     }
 
     #[test]

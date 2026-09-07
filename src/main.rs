@@ -56,7 +56,11 @@ options:
   --no-sound          notify without a sound
   --quiet <seconds>   silence after a ping, news held until it ends (default 20)
   --switch <keys>     ctrl-<back><forward> flips tabs (default ws), or off
+  --open <what>       what the working pane starts on: shell (the default),
+                      top for the first session in the panel, or a name
   --once              print the current sessions as plain text and exit
+  --keys              print what this terminal sends for each key, and what
+                      Savras makes of it, when a chord seems to do nothing
   --jobs-dir <path>   read jobs from somewhere other than ~/.claude/jobs
   -h, --help          show this help
   -V, --version       show the version
@@ -65,6 +69,7 @@ examples:
   svr                          panel on the right, a shell beside it
   svr -- claude                panel on the right, Claude Code beside it
   svr --side left --width 52
+  svr --open top               open on the session at the top of the list
   svr solo                     the panel on its own
   svr --once                   plain text, for scripts and status lines
 
@@ -105,6 +110,8 @@ const MAX_STALE: Duration = Duration::from_secs(3);
 enum Mode {
     Tui,
     Once,
+    /// Print what the terminal sends for each key, and stop.
+    Keys,
     Panel {
         width: u16,
         command: Vec<String>,
@@ -123,6 +130,8 @@ struct Options {
     quiet: Duration,
     /// The keys that flip between tabs.
     switch: Switch,
+    /// What the working pane starts on.
+    open: host::Open,
 }
 
 fn main() -> Result<()> {
@@ -141,7 +150,7 @@ fn main() -> Result<()> {
     // wanted, and the way to another pane is ctrl-t rather than a second copy.
     // `--once` is exempt: it is plain text, and a status line inside a pane is
     // a perfectly good place to want it.
-    if host::nested() && !matches!(options.mode, Mode::Once) {
+    if host::nested() && !matches!(options.mode, Mode::Once | Mode::Keys) {
         eprintln!(
             "svr: Savras is already running in this terminal.\n\
              Press ctrl-t for a tab of your own, and ctrl-w/ctrl-s to flip between them."
@@ -166,6 +175,7 @@ fn main() -> Result<()> {
             command,
             jobs_dir(options.jobs_dir)?,
             options.switch,
+            options.open,
             Ping::new(options.ping, options.sound, options.quiet),
         );
     }
@@ -173,6 +183,7 @@ fn main() -> Result<()> {
     let jobs_dir = jobs_dir(options.jobs_dir)?;
 
     match options.mode {
+        Mode::Keys => host::keys(options.switch),
         Mode::Once => print_once(&jobs_dir),
         _ => run_tui(
             jobs_dir,
@@ -263,6 +274,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
         sound: true,
         quiet: ping::QUIET,
         switch: Switch::default(),
+        open: host::Open::Shell,
     };
     let mut width = panel::DEFAULT_WIDTH;
     let mut command = Vec::new();
@@ -306,7 +318,17 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
                 options.mode = Mode::Once;
                 is_panel = false;
             }
+            "--keys" => {
+                options.mode = Mode::Keys;
+                is_panel = false;
+            }
             "--no-sound" => options.sound = false,
+            "--open" => {
+                let raw = args
+                    .next()
+                    .context("--open needs shell, top, or a session name")?;
+                options.open = host::Open::parse(&raw);
+            }
             "--switch" => {
                 let raw = args.next().context("--switch needs a letter, or off")?;
                 options.switch = parse_switch(&raw)?;

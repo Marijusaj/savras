@@ -67,6 +67,32 @@ fn the_marker_is_set_in_the_pane_so_the_second_one_can_tell() {
     );
 }
 
+#[test]
+fn keys_says_what_arrived_and_what_savras_makes_of_it() {
+    // The question "does my terminal send this chord" has no answer you can
+    // reach by staring at the screen, so there is a mode that answers it.
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_svr"))
+        .arg("--keys")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"\x1b[1;6A\x03")
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let said = String::from_utf8_lossy(&out.stdout);
+
+    assert!(said.contains("\\e[1;6A"), "the bytes as sent: {said}");
+    assert!(said.contains("flip back a tab"), "what it means: {said}");
+}
+
 /// A real `svr` hosting a command of the test's choosing, in a real pty.
 struct Pane {
     dir: PathBuf,

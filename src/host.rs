@@ -51,6 +51,107 @@ const NEW_TAB: u8 = 0x14; // Ctrl-T
 /// that it would be the second panel in the same terminal.
 const NESTED: &str = "SAVRAS_PANE";
 
+/// Print what the terminal sends for each key, and what Savras makes of it.
+///
+/// "The chord does nothing in my terminal" has exactly two causes and no way
+/// to tell them apart by staring: either the terminal never sent it — which is
+/// most of them, since Command chords and unmodified arrows are indistinguish-
+/// able from plain arrows in the byte stream — or it sent something Savras
+/// does not read. This says which, in the terminal you are actually using.
+pub fn keys(switch: Switch) -> Result<()> {
+    println!("Press keys to see what this terminal sends. Ctrl-C to stop.\n");
+    // Best effort: raw mode is what makes a bare `esc` or a ctrl chord reach
+    // us at all, but a pipe has no terminal to put into it and reading the
+    // bytes still works — which is how this is tested.
+    let raw = crossterm::terminal::enable_raw_mode().is_ok();
+    let mut input = std::io::stdin();
+    let mut buffer = [0u8; 64];
+    loop {
+        let n = input.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        let bytes = &buffer[..n];
+        // Raw mode means nothing moves the cursor for us.
+        print!("{:<24} {}\r\n", escaped(bytes), meaning(bytes, switch));
+        let _ = std::io::stdout().flush();
+        // Said after it is shown, so the key that stops this is reported like
+        // any other — and a pipe, which arrives all at once, still says
+        // everything it was given.
+        if bytes.contains(&0x03) {
+            break;
+        }
+    }
+    if raw {
+        crossterm::terminal::disable_raw_mode()?;
+    }
+    Ok(())
+}
+
+/// Bytes as you would write them in a string, which is how they appear in
+/// every other document about terminals.
+fn escaped(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| match b {
+            0x1b => "\\e".to_string(),
+            0x20..=0x7e => (*b as char).to_string(),
+            other => format!("\\x{other:02x}"),
+        })
+        .collect()
+}
+
+/// What Savras would do with those bytes, said in the words the footer uses.
+fn meaning(bytes: &[u8], switch: Switch) -> &'static str {
+    if bytes.contains(&FOCUS_TOGGLE) {
+        "ctrl-g — move the keyboard between the panel and your work"
+    } else if bytes.contains(&NEW_TAB) {
+        "ctrl-t — open a tab of your own"
+    } else if switch.back.is_some_and(|k| bytes.contains(&k)) {
+        "the switch key — flip back a tab"
+    } else if switch.forward.is_some_and(|k| bytes.contains(&k)) {
+        "the switch key — flip forward a tab"
+    } else if let Some(delta) = tab_chord(bytes) {
+        if delta < 0 {
+            "the chord — flip back a tab"
+        } else {
+            "the chord — flip forward a tab"
+        }
+    } else if bytes.contains(&REPAINT) {
+        "ctrl-l — paint the screen again"
+    } else {
+        "passed to the program in the pane"
+    }
+}
+
+/// What the working pane starts on.
+///
+/// A shell by default, because that is what you get when you open a terminal
+/// and Savras has no business deciding otherwise. But an empty shell is rarely
+/// what you came for when there are sessions waiting, so `top` opens the first
+/// row in the panel — Needs input before Working before Completed, so it is
+/// the session most likely to be the reason you started Savras at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Open {
+    Shell,
+    Top,
+    /// A session by name, for the one you always come back to.
+    Named(String),
+}
+
+impl Open {
+    /// Anything that is not `shell` or `top` is a session name. Names are what
+    /// you see in the panel, so a name is the obvious thing to type, and there
+    /// is nothing else a bare word here could sensibly mean.
+    pub fn parse(raw: &str) -> Self {
+        match raw {
+            "shell" | "none" => Open::Shell,
+            "top" | "first" => Open::Top,
+            name => Open::Named(name.to_string()),
+        }
+    }
+}
+
 /// Whether this process is running inside a pane of another Savras.
 ///
 /// An environment variable rather than anything cleverer because it is what a
@@ -465,6 +566,7 @@ pub fn run(
     command: Vec<String>,
     jobs_dir: PathBuf,
     switch: Switch,
+    open: Open,
     ping: Ping,
 ) -> Result<()> {
     let (cols, rows) = crossterm::terminal::size().context("reading the terminal size")?;
@@ -494,7 +596,7 @@ pub fn run(
     // Ask the terminal to say when it gains and loses focus, so the panel can
     // tell "you are looking at that session" from "you are in another app".
     let _ = std::io::stdout().write_all(focus::ENABLE.as_bytes());
-    let result = event_loop(&mut terminal, session);
+    let result = event_loop(&mut terminal, session, open);
     // Leave the terminal's mouse and focus handling as we found it.
     let _ = std::io::stdout().write_all(MOUSE_OFF.as_bytes());
     let _ = std::io::stdout().write_all(focus::DISABLE.as_bytes());
@@ -530,8 +632,12 @@ impl Session {
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     mut session: Session,
+    open: Open,
 ) -> Result<()> {
     let mut app = App::new(session.jobs_dir.clone());
+    // The shell Savras opened with stays as the first tab either way, so
+    // whatever this lands on, ctrl-w takes you back to a prompt.
+    open_at_startup(&mut session, &mut app, &open);
     // Ctrl-O renders as "ctrl-o": the byte is the letter with its top three
     // bits cleared, so putting them back names the key again.
     app.set_switch(session.switch.label());
@@ -978,6 +1084,31 @@ fn reopen(session: &mut Session) -> Result<bool> {
     let work = Work::spawn(&command, Some(&cwd), cols, rows, Origin::Opened)?;
     session.tabs.front_mut().work = work;
     Ok(true)
+}
+
+/// Put the session asked for in the pane before the first frame is drawn.
+///
+/// Failure is not fatal and barely even an error: you asked to start on a
+/// session, and if it is not there you start on the shell with the panel
+/// saying why. Nothing else about Savras depends on it.
+fn open_at_startup(session: &mut Session, app: &mut App, open: &Open) {
+    let short = match open {
+        Open::Shell => return,
+        Open::Top => match app.first_job() {
+            Some(job) => job.short.clone(),
+            None => return, // no sessions at all; the shell is all there is
+        },
+        Open::Named(name) => match app.job_named(name) {
+            Some(job) => job.short.clone(),
+            None => {
+                app.error = Some(format!("no session called {name}"));
+                return;
+            }
+        },
+    };
+    if let Err(e) = open_short(session, app, &short) {
+        app.error = Some(format!("could not open: {e}"));
+    }
 }
 
 /// Delete a session, having asked. Its tab goes with it: an `attach` to a
@@ -1883,6 +2014,14 @@ mod tests {
         let mut app = App::new(f.0.clone());
         assert!(matches!(panel_key(b"n", &mut app, None), Action::NewTab));
         assert!(b"\x14".contains(&NEW_TAB));
+    }
+
+    #[test]
+    fn what_the_pane_opens_on_is_a_name_unless_it_is_one_of_two_words() {
+        assert_eq!(Open::parse("shell"), Open::Shell);
+        assert_eq!(Open::parse("top"), Open::Top);
+        // Anything else is a session, including words that look like options.
+        assert_eq!(Open::parse("SAVRAS"), Open::Named("SAVRAS".into()));
     }
 
     #[test]
