@@ -110,25 +110,32 @@ pub fn group_of<'a>(snapshot: &'a Snapshot, job: &Job) -> Option<Group<'a>> {
     })
 }
 
-/// The name for the next parallel agent under `lead`.
+/// The name for the next parallel agent under `lead`, which is the lead's own
+/// *name* — `AGENT` or `AGENT-4` — not its base.
 ///
-/// The lowest free number, so closing `AGENT-2` and starting another gives you
-/// `AGENT-2` again rather than climbing forever. Numbering starts at 2 because
-/// the lead is 1: it is the session you already had.
+/// The lowest free number above the lead's, so closing `AGENT-2` and starting
+/// another gives you `AGENT-2` again rather than climbing forever. Numbering
+/// starts one above the lead because [`lead_of`] hands the group to its lowest
+/// number: an agent numbered below the lead would be told to report to a
+/// session that the panel no longer calls the lead. With `SAVRAS-4` leading
+/// `SAVRAS-5`, the free `2` is left alone and the next agent is `SAVRAS-6`.
+///
+/// A bare lead counts as 1 — it is the session you already had.
 pub fn next_name(snapshot: &Snapshot, lead: &str) -> String {
+    let (base, number) = split(lead);
     let taken: Vec<u32> = snapshot
         .jobs
         .iter()
         .filter_map(|j| match split(&j.name) {
-            (theirs, Some(n)) if theirs == lead => Some(n),
+            (theirs, Some(n)) if theirs == base => Some(n),
             _ => None,
         })
         .collect();
-    let mut n = 2;
+    let mut n = number.unwrap_or(1) + 1;
     while taken.contains(&n) {
         n += 1;
     }
-    format!("{lead}-{n}")
+    format!("{base}-{n}")
 }
 
 /// What a new parallel agent is told, as its opening prompt.
@@ -343,6 +350,38 @@ mod tests {
         // Numbering starts at 2: the lead is the one you already had.
         assert_eq!(next_name(&s, "AGENT"), "AGENT-3");
         assert_eq!(next_name(&s, "FRESH"), "FRESH-2");
+    }
+
+    #[test]
+    fn a_numbered_lead_keeps_its_lead() {
+        // `SAVRAS-4` leading `SAVRAS-5`, with no bare `SAVRAS` running: the
+        // free `2` is tempting and wrong. An agent called `SAVRAS-2` would be
+        // briefed to report to `SAVRAS-4` and then, being the lowest number,
+        // be shown by the panel as the lead of the session that briefed it.
+        let f = Fixture::new("agents-numbered-lead")
+            .job("a", &named("SAVRAS-4"))
+            .job("b", &named("SAVRAS-5"));
+        let s = snap(&f);
+
+        let lead = lead_of(&s, job(&s, "SAVRAS-5"));
+        assert_eq!(lead.name, "SAVRAS-4");
+        assert_eq!(next_name(&s, &lead.name), "SAVRAS-6");
+
+        // And the group the new name would join still has the same lead.
+        let f = f.job("c", &named("SAVRAS-6"));
+        let s = snap(&f);
+        assert_eq!(lead_of(&s, job(&s, "SAVRAS-6")).name, "SAVRAS-4");
+    }
+
+    #[test]
+    fn a_number_is_reused_when_the_agent_that_had_it_is_gone() {
+        // Reuse still holds above the lead: closing `AGENT-2` and starting
+        // another gives `AGENT-2` back rather than climbing forever.
+        let f = Fixture::new("agents-reuse")
+            .job("a", &named("AGENT"))
+            .job("b", &named("AGENT-3"));
+        let s = snap(&f);
+        assert_eq!(next_name(&s, "AGENT"), "AGENT-2");
     }
 
     #[test]

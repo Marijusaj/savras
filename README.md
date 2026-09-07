@@ -331,6 +331,14 @@ else's agent. If the session a group was named after exits, the lowest-numbered
 agent leads — a lead has to be a session you can actually message, or every new
 agent is handed an address that goes nowhere.
 
+Which is why numbering starts above the lead, not at the lowest free number
+anywhere. With `SAVRAS-4` leading `SAVRAS-5` and no bare `SAVRAS` running, the
+free `2` is left alone and the next agent is `SAVRAS-6`: an agent called
+`SAVRAS-2` would have been briefed to report to `SAVRAS-4` and then, being the
+lowest number, been read as the lead of the session that briefed it. Numbers
+are still reused above the lead — close `AGENT-2` under a bare `AGENT` and the
+next agent is `AGENT-2` again, rather than the numbers climbing forever.
+
 The panel says where each session sits in its group, in the detail footer:
 `leads AGENT-2, AGENT-3` under the lead, `parallel agent under AGENT` under a
 member.

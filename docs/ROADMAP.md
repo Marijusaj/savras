@@ -163,7 +163,11 @@ ones follow. Two sessions sharing a base name are a group; one is not, which is
 what keeps a lone `PR-357` from being read as somebody's agent. The lead falls
 back to the lowest-numbered agent when the bare name is not running — a lead
 has to be a session that can actually be messaged, or the address handed to
-every new agent goes nowhere.
+every new agent goes nowhere. Numbering follows the lead rather than the base
+name: the next agent takes the lowest free number *above* the lead's own. A
+group led by `SAVRAS-4` leaves the free `2` alone and adds `SAVRAS-6`, because
+`SAVRAS-2` would have been briefed to report to `SAVRAS-4` and then, being the
+lowest number, been shown as the lead of the session that briefed it.
 
 The panel shows the relationship in the detail footer rather than the rows: a
 44-column row has no width for it, and "who commands whom" is a question you

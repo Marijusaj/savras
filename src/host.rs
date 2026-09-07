@@ -1213,14 +1213,15 @@ fn start_agent(app: &mut App, outcome: &mpsc::Sender<Result<String>>) {
         return;
     };
     // The lead has to be a session that is actually running, because the new
-    // agent is told to message it by name. The *numbering* follows the base
-    // name, so a group led by `SAVRAS-2` still adds `SAVRAS-4` next.
+    // agent is told to message it by name. The numbering follows the *lead*,
+    // not the selected session and not the bare base name: a group led by
+    // `SAVRAS-4` adds `SAVRAS-6` next, leaving the free `2` alone rather than
+    // handing the newcomer a number that would make it the lead.
     let leader = crate::agents::lead_of(&app.snapshot, job);
     let lead = leader.name.clone();
     // Its own repository: an agent that cannot see the code is no use.
     let cwd = leader.cwd.clone();
-    let (base, _) = crate::agents::split(&job.name);
-    let name = crate::agents::next_name(&app.snapshot, base);
+    let name = crate::agents::next_name(&app.snapshot, &lead);
 
     app.error = Some(format!("starting {name}…"));
     let outcome = outcome.clone();
