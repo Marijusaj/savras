@@ -308,6 +308,34 @@ mod tests {
     }
 
     #[test]
+    fn a_remote_path_is_never_looked_up_on_this_filesystem() {
+        // `/home/ubuntu/...` is a directory on the *other* machine. Walking it
+        // for a `.git` can only fail here — and failing is expensive: `/home`
+        // on macOS is an autofs mount resolved through directory services, so
+        // each probe wakes automountd and costs about 10ms against 2µs for an
+        // ordinary missing path. Six of those ran on every frame, which made
+        // one remote session enough to make the whole terminal feel slow.
+        //
+        // Timed rather than mocked, because the thing being asserted is that
+        // no lookup happens at all, and a lookup that happened would show up
+        // here as milliseconds.
+        let job = read_one("claude-box", SAMPLE).unwrap();
+        assert!(job.cwd.starts_with("/home/"), "cwd: {:?}", job.cwd);
+
+        let start = std::time::Instant::now();
+        for _ in 0..200 {
+            let _ = job.repo();
+            let _ = job.in_worktree();
+        }
+        let each = start.elapsed() / 200;
+        assert!(
+            each < std::time::Duration::from_millis(1),
+            "a remote row cost {each:?} per look; it is asking the filesystem"
+        );
+        assert!(!job.in_worktree(), "nothing here can know that");
+    }
+
+    #[test]
     fn the_machines_file_is_a_list_of_hosts_with_comments() {
         let text = "# the box\nclaude-box\n\n  other-box  # a spare\n#all-commented\n";
         let hosts: Vec<String> = text

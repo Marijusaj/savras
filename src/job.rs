@@ -168,7 +168,8 @@ impl Job {
     /// checkout — worth saying, because the same repository name then covers
     /// two different working copies.
     pub fn in_worktree(&self) -> bool {
-        git_dir(&self.cwd).is_some_and(|d| d.contains("/.git/worktrees/"))
+        // Only ever asked of a path on *this* machine. See `repo`.
+        self.machine.is_none() && git_dir(&self.cwd).is_some_and(|d| d.contains("/.git/worktrees/"))
     }
 
     /// Which repository this session is working in, by name.
@@ -187,7 +188,19 @@ impl Job {
         match &self.machine {
             // Named for the machine as well: the same checkout exists on both,
             // and one heading over two boxes says the work is in one place.
-            Some(remote) => format!("{}:{}", remote.host, repo_of(&self.cwd)),
+            //
+            // The name is taken from the path itself, and the local filesystem
+            // is never asked about it — `/home/ubuntu/x` is a directory on the
+            // *other* machine, so walking up it for a `.git` can only fail.
+            // Failing is not free: `/home` on macOS is an autofs mount
+            // resolved through directory services, so each probe of a path
+            // under it wakes `automountd` and `opendirectoryd` and costs about
+            // **10ms**, against 2µs for a local path that merely does not
+            // exist. One walk is six of those. It ran on every frame through
+            // `in_worktree`, and once per job per repository on every refresh
+            // — which is why one session on a remote box made the whole
+            // terminal, not just Savras, feel slow.
+            Some(remote) => format!("{}:{}", remote.host, named(&self.cwd)),
             None => repo_of(&self.cwd),
         }
     }
@@ -214,6 +227,14 @@ impl Job {
 /// Walking up for a `.git` is what git itself does, and it is the only way to
 /// get the same answer from a session started three directories inside a
 /// checkout as from one started at its root.
+/// The last component of a path, as a name — what a directory is called, with
+/// nothing asked of any filesystem.
+fn named(cwd: &Path) -> String {
+    cwd.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| cwd.to_string_lossy().to_string())
+}
+
 fn repo_of(cwd: &Path) -> String {
     let root = match git_dir(cwd).as_deref().and_then(repo_root) {
         Some(root) => PathBuf::from(root),

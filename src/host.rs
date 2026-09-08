@@ -1439,8 +1439,18 @@ fn tab_chord(bytes: &[u8]) -> Option<isize> {
 }
 
 /// How to reopen a session: the command, and where to run it.
+///
+/// A session on another machine is reached by ssh, and its `cwd` is a
+/// directory on *that* machine — handing it to a local spawn asks this
+/// filesystem about a path it cannot have, which fails slowly under an autofs
+/// mount like `/home` (see `Job::repo`). ssh does not care where it is run
+/// from, so it is run from here.
 fn resume(job: &crate::job::Job) -> (Vec<String>, PathBuf) {
-    (job.open_command(), job.cwd.clone())
+    let cwd = match job.machine {
+        Some(_) => std::env::current_dir().unwrap_or_default(),
+        None => job.cwd.clone(),
+    };
+    (job.open_command(), cwd)
 }
 
 /// Send keystrokes where they belong.
