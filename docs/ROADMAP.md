@@ -203,13 +203,7 @@ that has stopped thinking is one waiting for you, and that transition is
 exactly what the ping exists to announce. Liveness is decided over there, with
 `kill -0`, because nothing removes a session's json when it exits.
 
-### M3.6 · Watching, and remembering which machines
-`v` opens a machine's session read-only — tmux's `-r`, so the pane cannot type
-into work being driven from another terminal — offered only while the selected
-row is on another machine. It tidies up through a `client-attached` hook that
-sets `destroy-unattached`, because closing a tab kills the ssh and anything
-written after `tmux attach` never runs.
-
+### M3.6 · Remembering which machines
 The hosts to watch now live in `<config>/savras/machines`, so plain `svr`
 keeps them. A flag that has to be retyped is a flag that gets forgotten, and a
 forgotten one looked exactly like a box with nothing on it — which is how the
@@ -222,13 +216,8 @@ And a pane you start a session in is now that session's tab, found through
 sitting beside a row for the same session, with `enter` on the row attaching a
 second time to what was already in front of you.
 
-### M3.7 · Take control, and stop repainting the world
-`c` turns the pane you are watching in into one you can work in, in place, so
-the read-only tab is not left behind. `enter` does it too while the pane is in
-front: a read-only tmux client discards every key anyway, so one of them may
-as well mean something.
-
-And the flip keys no longer erase the screen. Every tab change called
+### M3.7 · Stop repainting the world
+The flip keys no longer erase the screen. Every tab change called
 `terminal.clear()`, which blanks the terminal *now* and leaves it blank until
 the next draw lands — a black flash on every ctrl-shift-arrow, which in
 Ghostty reads as the whole window reloading. Nothing needed it: ratatui resets
@@ -240,6 +229,36 @@ What is left after that is honest waiting: `claude attach` takes a second or
 two to say anything, and the pane is genuinely empty until it does. It now
 says `opening NAME…` in the middle of the pane rather than showing a black
 rectangle that looks like a crash.
+
+### M3.8 · Watching taken back out, and a floor under the frame rate
+`v` and `c` are gone, four days after they shipped. Read-only watching answers
+"someone else is at that keyboard", and on a box you ssh into alone there is
+nobody else — so the whole mechanism (a second ssh, a read-only tmux client the
+far server has to render for, a `client-attached` hook to tidy it, a key to
+undo it, a footer state, and an `enter` that meant something different inside
+one) served a case that does not arise. `ctrl-t` and typing `ssh <host>` is the
+thing it was standing in for, and it was already there. `enter` on a remote row
+still joins the tmux window, which is the part typing cannot do quickly.
+
+The cost was not only conceptual. A tmux client is a *push* stream with no
+rate limit, and Savras coupled it straight to the screen: bytes arrived, the
+frame was marked dirty, and the loop drew — at the 16ms tick, indefinitely, for
+a pane that could not be typed into. **Frames now have a floor of 33ms**, about
+thirty a second. `dirty` is not cleared by a frame that comes too soon, so
+nothing is dropped, only coalesced; a session printing a spinner no longer
+pins the terminal to sixty full repaints a second.
+
+The same loop was asking an expensive question on every frame. `adopt_sessions`
+— which notices that a pane of yours has become a session's tab — costs a
+`process_group_leader()` and a read of `sessions/<pid>.json` per pane, and it
+ran inside `terminal.draw`, up to sixty times a second, to learn something that
+changes when you start a session. It now runs on the two-second refresh, beside
+the job scan, which is the cadence the session's own row appears at anyway.
+
+Worth naming for whoever meets this next: the defect was never the remote
+feature. It was that **"output arrived" was wired directly to "repaint
+everything"**, and a remote view was simply the loudest thing ever plugged into
+it. A local session that prints fast did the same, more quietly.
 
 ---
 

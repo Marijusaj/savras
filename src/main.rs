@@ -93,9 +93,6 @@ keys, with the panel focused:
              n does the same with the panel focused
   x          close the selected tab, yours or a session's
   a          start a parallel agent under this session's lead
-  v          watch a session on another machine without typing into it
-  c          take control of what you are watching; enter does it too,
-             from inside the pane, where no other key does anything
   s          group by repository or by status
   d          delete the selected session for good, after asking:
              `claude stop` then `claude rm`, which x does not do

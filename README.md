@@ -403,32 +403,15 @@ working in. A grouped session shares the windows but keeps its own size and its
 own selected window, and `destroy-unattached` takes it away the moment you
 close the tab, so nothing is left behind on the machine.
 
-**`v` watches without touching.** `enter` gives you a session you can type
-in; `v` opens the same window with tmux's `-r`, so the pane cannot send a
-keystroke into work someone else is driving. It is offered in the footer only
-while the selected row is on another machine, since there is nobody else at
-the keyboard for one of your own. Both are grouped sessions, so watching does
-not resize what it watches — with a view open, `tmux list-clients` shows the
-two sizes side by side:
-
-```
-session=autodad             readonly=no   size=158x35   ← your own terminal
-session=savras-view-856221  readonly=yes  size=83x44    ← the panel's pane
-```
-
-**`c` takes control**, turning the pane you are watching in into one you can
-type in — in place, so you keep your place in the tab list and the read-only
-one is not left behind to close by hand. While you are watching, `enter` does
-it too: the tmux client is read-only, so every key sent into that pane is
-already discarded on the far side, and one of them may as well mean the thing
-you are most likely to want next. The footer says so rather than making you
-guess: `watching · enter to take control`.
-
-The view tidies itself up through a tmux hook rather than a command after the
-attach, because closing the tab kills the ssh outright and anything written
-after `tmux attach` in that script never runs. `set-hook client-attached 'set
-destroy-unattached on'` arms once someone is watching and fires however the
-client leaves, including a connection dropped mid-air.
+**Watching read-only was built and removed.** `v` opened the same window with
+tmux's `-r` so the pane could not type into it, and `c` turned that pane back
+into one you could work in. Both are gone. The case they served — somebody
+*else* at the keyboard of that session — is not one that happens on a box you
+ssh into alone, and the cost was not free: a read-only view is still a live
+tmux client, which means a second ssh, a client the far tmux server has to
+render for, and a screen streamed across the internet for a pane you were only
+looking at. To open a shell on another machine, `ctrl-t` and type `ssh` — the
+thing you would have typed anyway.
 
 Two more things worth knowing:
 
@@ -597,8 +580,6 @@ Press keys to see what this terminal sends. Ctrl-C to stop.
 | `x` | close the selected tab | — |
 | `d` | delete the selected session, after asking | — |
 | `a` | start a parallel agent under its lead | start a parallel agent under its lead |
-| `v` | watch a machine's session, read-only | — |
-| `c` | take control of what you are watching | — |
 | `q` / `Esc` | back to your work | quit |
 | `Q` | quit Savras, after asking | quit |
 | `ctrl-l` | paint the screen again | paint the screen again |

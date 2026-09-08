@@ -219,6 +219,16 @@ impl Switch {
 }
 
 const TICK: Duration = Duration::from_millis(16);
+/// The shortest gap between two frames — about thirty a second.
+///
+/// Output arriving is what makes the screen dirty, and a session that is
+/// working produces it continuously: a spinner, a token count, a line of a
+/// file. Without a floor, every arrival drew, so a chatty pane pinned Savras
+/// to one full frame per tick and the terminal to redrawing at that rate for
+/// as long as the session ran. Thirty a second is faster than the eye and a
+/// half of what it was; the delay a keystroke can meet is 33ms, which is
+/// under what anyone perceives as lag.
+const FRAME: Duration = Duration::from_millis(33);
 /// Repaint at least this often even when nothing changed, so ages keep ticking.
 const REDRAW: Duration = Duration::from_millis(500);
 const REFRESH: Duration = Duration::from_secs(2);
@@ -278,10 +288,6 @@ enum Action {
     CloseSelected,
     /// Start a parallel agent under the selected session's lead.
     AddAgent,
-    /// `v`: watch the selected session on another machine, read-only.
-    View,
-    /// `c`: take control of the session you are watching.
-    Control,
     /// Open another pane of your own, running what Savras was started with.
     NewTab,
     /// `s` in the panel: group by repository instead of status, or back.
@@ -455,10 +461,6 @@ struct Pane {
     /// genuinely empty — so without this, opening a session shows a black
     /// rectangle and looks like something broke rather than like waiting.
     drew: bool,
-    /// A pane that is *watching* a session rather than working in it. It is
-    /// the same session as the tab beside it, so it cannot be found by id
-    /// alone: press enter on the row and you want the one you can type in.
-    view: bool,
 }
 
 impl Pane {
@@ -547,7 +549,6 @@ impl Tabs {
                 running: None,
                 drew: false,
                 opened: false,
-                view: false,
             }],
             current: 0,
         }
@@ -655,16 +656,11 @@ impl Tabs {
         }
     }
 
+    /// The tab holding this session, if one does.
     fn position(&self, short: &str) -> Option<usize> {
-        self.find(short, false)
-    }
-
-    /// The tab holding this session, of the kind asked for: the one you work
-    /// in, or the one that is only watching.
-    fn find(&self, short: &str, view: bool) -> Option<usize> {
         self.open
             .iter()
-            .position(|t| t.short.as_deref() == Some(short) && t.view == view)
+            .position(|t| t.short.as_deref() == Some(short))
     }
 
     fn go_to(&mut self, index: usize) {
@@ -861,15 +857,12 @@ fn event_loop(
             return Ok(());
         }
 
-        if dirty || last_draw.elapsed() >= REDRAW {
+        // `dirty` is not cleared by a frame that is too soon: it stays until
+        // one is drawn, so nothing is lost by waiting — only coalesced.
+        if (dirty && last_draw.elapsed() >= FRAME) || last_draw.elapsed() >= REDRAW {
             // Which tabs exist, and which one you are in, before it is drawn:
             // opening or closing one has to show up in the same breath as the
             // key that did it, not on the next two-second refresh.
-            // Before the tabs are described: a pane you started a session in
-            // is that session's tab, and stops being one when you leave it.
-            session
-                .tabs
-                .adopt_sessions(&app.snapshot.jobs, &session.jobs_dir);
             let named = session.tabs.named_shells(&pane_label(&session.command));
             app.set_tabs(session.tabs.front_ref(), session.tabs.shorts(), named);
             terminal
@@ -918,16 +911,6 @@ fn event_loop(
                     Action::Cycle(delta)
                 } else if dead.is_some() && focus == Focus::Work {
                     dead_pane_key(&bytes)
-                } else if focus == Focus::Work
-                    && session.tabs.front().view
-                    && matches!(bytes.as_slice(), [b'\r'] | [b'\n'])
-                {
-                    // Enter, in a pane that is only watching. Nothing is being
-                    // taken from the child by reading it: the tmux client is
-                    // read-only, so every key sent into this pane is already
-                    // discarded on the far side. One of them may as well mean
-                    // the thing you are most likely to want next.
-                    Action::Control
                 } else {
                     route(
                         &bytes,
@@ -996,22 +979,6 @@ fn event_loop(
                         }
                     }
                     Action::AddAgent => crate::agents::add(&mut app, &starting),
-                    Action::View => match view_selected(&mut session, &mut app) {
-                        Ok(true) => {
-                            attend_front(&mut session, &mut app);
-                            focus = Focus::Work;
-                        }
-                        Ok(false) => {}
-                        Err(e) => app.error = Some(format!("could not watch: {e}")),
-                    },
-                    Action::Control => match take_control(&mut session, &mut app) {
-                        Ok(true) => {
-                            attend_front(&mut session, &mut app);
-                            focus = Focus::Work;
-                        }
-                        Ok(false) => {}
-                        Err(e) => app.error = Some(format!("could not take control: {e}")),
-                    },
                     Action::Regroup => {
                         // Say which it is now: the headings change, but the
                         // panel may be showing one repository and one status
@@ -1103,6 +1070,17 @@ fn event_loop(
 
         if watch.changed() || last_refresh.elapsed() >= REFRESH {
             app.refresh();
+            // A pane you started a session in is that session's tab, and stops
+            // being one when you leave it. Asked here rather than before each
+            // frame: it costs a `process_group_leader()` and a read of
+            // `sessions/<pid>.json` for every pane of your own, and the answer
+            // can only change when a session starts or ends — which is what
+            // this refresh is for, and the cadence the session's own row
+            // appears at anyway. On the draw path it ran up to sixty times a
+            // second to learn something that changes once an hour.
+            session
+                .tabs
+                .adopt_sessions(&app.snapshot.jobs, &session.jobs_dir);
             // The session in the pane is only "in front of you" while the
             // terminal has focus; in another application it is as invisible
             // as any other, and must ping like one. A session open in a tab
@@ -1153,94 +1131,6 @@ fn open_selected(session: &mut Session, app: &mut App) -> Result<bool> {
     open_short(session, app, &short)
 }
 
-/// Watch the selected session without being able to type into it.
-///
-/// Only means anything for a session on another machine. Locally there is
-/// nobody else at the keyboard: the session is either yours to open or it is
-/// running in the daemon, and `claude attach` is already the gentle way in.
-fn view_selected(session: &mut Session, app: &mut App) -> Result<bool> {
-    let Some(job) = app.selected_job() else {
-        return Ok(false);
-    };
-    let Some(remote) = job.machine.clone() else {
-        app.error = Some("v watches a session on another machine".to_string());
-        return Ok(false);
-    };
-    let short = job.short.clone();
-
-    // Already watching it: go there rather than opening a second window onto
-    // the same session.
-    if let Some(index) = session.tabs.find(&short, true) {
-        session.tabs.go_to(index);
-        app.select(&short);
-        return Ok(true);
-    }
-
-    let command = remote.open_command(crate::job::Reach::ReadOnly);
-    let (cols, rows) = session.work_size();
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let work = Work::spawn(&command, Some(&cwd), cols, rows, Origin::Opened)?;
-    session.tabs.push(Pane {
-        short: Some(short.clone()),
-        reopen: Some((command, cwd)),
-        work,
-        redraw: Some(Instant::now() + REDRAW_AFTER),
-        running: None,
-        drew: false,
-        opened: true,
-        view: true,
-    });
-    app.attend_to(&short);
-    app.select(&short);
-    Ok(true)
-}
-
-/// Stop watching and start working: the tab you are watching in becomes one
-/// you can type in.
-///
-/// In place, rather than opening a second tab beside it. Watching and working
-/// are the same window on the same session, and the tab you are looking at is
-/// the one you decided about — a new tab somewhere else in the list would make
-/// you find it again, and leave the read-only one behind to be closed by hand.
-///
-/// Dropping the old pane kills its ssh, and the view session on the far side
-/// goes with it: `destroy-unattached` was armed when it attached.
-fn take_control(session: &mut Session, app: &mut App) -> Result<bool> {
-    // The one in front if that is a view — enter, while watching — and
-    // otherwise the one the panel's cursor is on.
-    let watching = session.tabs.front();
-    let short = match (watching.view, &watching.short) {
-        (true, Some(short)) => short.clone(),
-        _ => match app.selected_job() {
-            Some(job) => job.short.clone(),
-            None => return Ok(false),
-        },
-    };
-    let Some(index) = session.tabs.find(&short, true) else {
-        app.error = Some("c takes control of a session you are watching".to_string());
-        return Ok(false);
-    };
-    let Some(job) = app.snapshot.jobs.iter().find(|job| job.short == short) else {
-        return Ok(false);
-    };
-    let (command, cwd) = resume(job);
-    let (cols, rows) = session.work_size();
-    // Spawn before touching the tab, so a failure leaves you watching rather
-    // than looking at nothing.
-    let work = Work::spawn(&command, Some(&cwd), cols, rows, Origin::Opened)?;
-
-    let pane = &mut session.tabs.open[index];
-    pane.work = work;
-    pane.reopen = Some((command, cwd));
-    pane.redraw = Some(Instant::now() + REDRAW_AFTER);
-    pane.drew = false;
-    pane.view = false;
-    session.tabs.go_to(index);
-    app.attend_to(&short);
-    app.select(&short);
-    Ok(true)
-}
-
 /// Bring a session to the front by id, opening it if it has no pane yet.
 fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool> {
     if let Some(index) = session.tabs.position(short) {
@@ -1268,7 +1158,6 @@ fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool>
         running: None,
         drew: false,
         opened: true,
-        view: false,
     });
     // Going to a session is the clearest possible way of saying you saw which
     // one it was.
@@ -1348,7 +1237,6 @@ fn new_tab(session: &mut Session) -> Result<()> {
         running: None,
         drew: false,
         opened: true,
-        view: false,
     });
     Ok(())
 }
@@ -1624,8 +1512,6 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: Option<&Confirm>) -> Actio
         // can only grow is a leak you cannot see.
         [b'x'] => return Action::CloseSelected,
         [b'a'] => return Action::AddAgent,
-        [b'v'] => return Action::View,
-        [b'c'] => return Action::Control,
         [b's'] => return Action::Regroup,
         // Closing a tab leaves the session running, which is the point of
         // tabs — and why finished sessions pile up in `claude agents` with
@@ -1676,7 +1562,6 @@ fn draw(
     let hint = match (focus, &question) {
         (Focus::Panel, Some(what)) => Hint::Confirming(what),
         (Focus::Panel, None) => Hint::Focused,
-        (Focus::Work, _) if session.tabs.front().view => Hint::Watching,
         (Focus::Work, _) => Hint::Background,
     };
     ui::draw_in(frame, panel_area, app, hint);
@@ -2132,7 +2017,6 @@ mod tests {
             running: None,
             drew: false,
             opened: true,
-            view: false,
         }
     }
 
@@ -2551,8 +2435,6 @@ mod tests {
         let f = Fixture::new("host-agent").job("aaa", r#"{"state":"working","name":"X"}"#);
         let mut app = App::new(f.0.clone());
         assert!(matches!(panel_key(b"a", &mut app, None), Action::AddAgent));
-        assert!(matches!(panel_key(b"v", &mut app, None), Action::View));
-        assert!(matches!(panel_key(b"c", &mut app, None), Action::Control));
     }
 
     #[test]
