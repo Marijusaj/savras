@@ -263,6 +263,12 @@ The line reads left to right in the order you ask the questions:
   a session open for six hours is a session that has lost the plot, and that is
   the one fact the panel can tell you and the pane cannot.
 
+- **Which machine, if not this one.** A remote session is told apart today only
+  by its `claude-box:` heading prefix, and `machine` is now read in three
+  places — `repo()`, the row, and the footer's `v` arm. One accessor
+  (`Job::machine_tag()`) before a fourth appears, and if the tag earns a place
+  on the row it earns it inside this budget rather than beside it.
+
 The constraint is width. A 44-column sidebar cannot hold all five columns and a
 summary, so this build is as much about what to *drop* at each width as what to
 add.
@@ -305,6 +311,51 @@ list has to hold still under the flip keys (M2.2), and grouping by lead has to
 inherit that: the order of a group must not change when an agent starts
 working. And the group is only a group when the lead is running — a lone
 `PR-357` is still one row, not an orphan indented under nothing.
+
+The repository headings get their cheapest fix in the same pass: `claude-box:`
+is repeated on every heading of a machine that has more than one repo, in a
+panel 44 columns wide.
+
+### M4.3 · A tab on the box
+**`n` can open a shell on another machine, and a session started in it is one
+row, not two.**
+
+M3.5 lists another machine's sessions and `enter` joins them; what is missing is
+starting something there. The ssh invocation already exists — `Remote { host,
+tmux: None }.open_command()` builds it, ControlMaster and all, and falls through
+to `exec ${SHELL:-sh} -l` — so this is one argument, not a subsystem: `new_tab`
+takes a *place*, and the only thing that differs is which command is spawned. A
+parallel `new_remote_tab` would duplicate the spawn, the push, the reopen and
+the redraw, and would have to be edited again for every future field on a tab.
+
+`n` opens a chooser when there are machines to choose between, and behaves
+exactly as it does today when there are none — an unconfigured `machines` file
+is the common case, and it must not pay for the rare one. A second key was the
+other sketch and does not scale past one machine.
+
+**The tab is a named tmux window on the box, not a bare login shell**, and that
+is the whole decision. Adoption (M3.6) makes a pane you start a session in that
+session's tab by matching the pane's process group leader against a local
+`sessions/<pid>.json` — a pid, which is local by nature. An ssh pane's leader is
+the local ssh client, which owns no session, so a `claude` started in a bare
+remote shell would sit there as an unadopted `ssh` row while the far-side tick
+adds the session's own row beside it: the double row that M3.6 just removed,
+back again, for remote sessions only. The far side already publishes an
+identifier that crosses the hop — `tmux`, `session:@window.%pane`, which
+`open_command` already steers by — so the window is remembered on the pane and
+adoption joins on it. Same rule, keyed on the identifier that is valid on both
+machines.
+
+It stays a fact throughout: **savras must not remember that it started something
+remotely.** Where a session runs is owned by the machine running it and arrives
+on that host's ssh stream; a creation record would drift on the first reboot,
+the first hand-started session, and every savras restart. The price of that is
+visible and correct — a session started on the box appears when the far side has
+written its json and the 2s tick has carried it, not instantly.
+
+Deliberately not in v1: picking a repository and launching `claude` there. A
+shell on the box guesses nothing, and the owner's own path (`cb <repo>`, then
+`claude`) is two words once the shell is open.
 
 ---
 
