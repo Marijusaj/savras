@@ -264,6 +264,19 @@ pub fn add(app: &mut App, outcome: &mpsc::Sender<Result<String>>) {
     let Some(job) = app.selected_job() else {
         return;
     };
+    // An agent is a `claude --bg` started *here*, in the lead's own directory.
+    // For a session on another machine that directory is on that machine, so
+    // there is nothing to start it in and nothing for it to read — it would
+    // come up somewhere arbitrary on this box and be told to report to a
+    // session it cannot reach. Refusing is the honest answer, and saying which
+    // machine is what makes it obvious rather than mysterious.
+    if let Some(remote) = &job.machine {
+        app.error = Some(format!(
+            "{} is on {}; an agent starts on this machine",
+            job.name, remote.host
+        ));
+        return;
+    }
     // The lead has to be a session that is actually running, because the new
     // agent is told to message it by name. The numbering follows the *lead*,
     // not the selected session and not the bare base name: a group led by
@@ -472,5 +485,45 @@ mod tests {
         );
         assert!(text.contains("ListAgents"), "it must be able to find peers");
         assert!(text.contains("wait for AGENT"));
+    }
+
+    #[test]
+    fn an_agent_is_refused_for_a_session_on_another_machine() {
+        // `a` starts `claude --bg` on *this* machine, in the lead's own
+        // directory. That directory is on the other box, so the agent would
+        // come up somewhere arbitrary here, with none of the code it was
+        // briefed about, and be told to report to a session it cannot reach.
+        let f = Fixture::new("agent-remote");
+        let mut app = App::new(f.0.clone());
+        let job = Job {
+            short: "claude-box:4242".to_string(),
+            name: "BOX".to_string(),
+            color: None,
+            status: crate::job::Status::Working,
+            summary: String::new(),
+            cwd: std::path::PathBuf::from("/home/ubuntu/Code/thing"),
+            session_id: "s".to_string(),
+            tokens: 0,
+            updated_at: None,
+            links: Vec::new(),
+            backend: None,
+            daemon_short: None,
+            machine: Some(crate::job::Remote {
+                host: "claude-box".to_string(),
+                tmux: Some("a:@1.%1".to_string()),
+            }),
+        };
+        let short = job.short.clone();
+        app.set_remote("claude-box".to_string(), vec![job]);
+        app.select(&short);
+
+        let (tx, rx) = mpsc::channel();
+        add(&mut app, &tx);
+
+        let said = app.error.clone().unwrap_or_default();
+        assert!(said.contains("claude-box"), "say which machine: {said}");
+        assert!(!said.contains("starting"), "nothing was started: {said}");
+        // And nothing was handed to the errand thread to do.
+        assert!(rx.try_recv().is_err(), "an errand was queued anyway");
     }
 }

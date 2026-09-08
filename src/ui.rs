@@ -446,10 +446,18 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
                 // there is room for the two rarer ones; `n` is also offered in
                 // the other footer, as ctrl-t, which is where you are standing
                 // when you want it.
-                if area.width >= ROOMY {
-                    "enter open · n tab · d delete · x close · a agent · Q quit"
-                } else {
-                    "enter open · d delete · x close · Q quit"
+                //
+                // `a` is offered only where it would do something: an agent is
+                // started on this machine, in the lead's own directory, so
+                // there is none to start for a session on another box. A key
+                // you press to no effect reads as a broken key.
+                match (
+                    area.width >= ROOMY,
+                    app.selected_job().is_some_and(|job| job.machine.is_some()),
+                ) {
+                    (true, false) => "enter open · n tab · d delete · x close · a agent · Q quit",
+                    (true, true) => "enter open · n tab · d delete · x close · Q quit",
+                    (false, _) => "enter open · d delete · x close · Q quit",
                 },
                 area.width as usize,
             ),
