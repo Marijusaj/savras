@@ -232,21 +232,79 @@ second time to what was already in front of you.
 Today: name, summary, PR number, age. Wanted: name, a one-word status, how much
 context is spent, and where the change actually is.
 
-- **One-word status** — `asking`, `working`, `done`, `failed`. Derived from
-  `state`, `needs` and `tempo` (`blocked` is already in the file).
+The line reads left to right in the order you ask the questions:
+
+```
+▶ BOOKS-LEG3   WORKING    #411 PR READY   38%   2h
+  └ name       └ status   └ deploy        └ ctx └ open for
+```
+
+- **The session in the pane is white.** Its name is the one you are typing
+  into, and the row for it should say so without being decoded — the coloured
+  name badge every row carries makes the `▶` marker easy to miss. White, plain,
+  against the colour the others wear.
+- **One-word status** — `WORKING`, `WAITING`, `DONE`, `FAILED`. Derived from
+  `state`, `needs` and `tempo` (`blocked` is already in the file). It replaces
+  the summary in the narrow layout: what the session is *doing* is a longer
+  answer than what it *is*, and the second one fits.
+- **Deploy status** — `PR READY` with the number, then `MERGED`, and `CHECKS` /
+  `ERROR` while they run. Two sources already on disk: `children[]` on the job
+  carries the pull request link, and `~/.claude/gh-pr-status-cache.json` carries
+  `{state, checks:{passed, failed, pending}, review}` for it, refreshed by
+  Claude Code itself. Anything beyond that — a real deployment state from Vercel
+  or Actions — needs the background poller from M2 of the original plan, and
+  should wait for it.
 - **Token percentage** — `tokens` is in `state.json`. The denominator comes from
   the model in `respawnFlags` (`opus[1m]` is a 1M context), so `21k/1M` renders
   as `2%`. A session at 85% is about to compact, which is worth seeing coming.
-- **Deploy status** — `PR`, `MERGED`, `CHECKS`, `ERROR`. Two sources already on
-  disk: `children[]` on the job carries the pull request link, and
-  `~/.claude/gh-pr-status-cache.json` carries `{state, checks:{passed, failed,
-  pending}, review}` for it, refreshed by Claude Code itself. Anything beyond
-  that — a real deployment state from Vercel or GitHub Actions — needs the
-  background poller from M2 of the original plan, and should wait for it.
+- **Age from the session's start, not its last word.** Today the column is time
+  since `updatedAt`, which is freshness — a busy session reads `8s` forever. The
+  number wanted is how long this session has been open, `18m` then `2h`, because
+  a session open for six hours is a session that has lost the plot, and that is
+  the one fact the panel can tell you and the pane cannot.
 
-The constraint is width. A 44-column sidebar cannot hold all four columns and a
+The constraint is width. A 44-column sidebar cannot hold all five columns and a
 summary, so this build is as much about what to *drop* at each width as what to
 add.
+
+### M4.1 · Geometry
+**Move and resize the panel from the keyboard, while it is running.**
+
+`--side left|right` and `--width <cols>` are start-up flags today; the layout
+they feed is one `Layout::horizontal` in the host, recomputed every draw. So
+both are already variables — they are simply set once. Wanted: a key that
+widens, a key that narrows, and a key that flips the panel to the other side,
+each taking effect on the next frame.
+
+What makes it more than a variable: the working pane is a real pty, and a pty
+that changes width must be told (`SIGWINCH` and a resize on the `portable-pty`
+handle) or the program inside keeps drawing to the old size. Flipping sides is
+the same resize with the columns swapped.
+
+Open: which keys. The chord budget is spent — `ctrl-g`, `ctrl-l`, `ctrl-w`/`s`
+— and M2.2 established that Command never reaches us. Likely a mode: `ctrl-g`
+to the panel, then plain `<`/`>` and `[`/`]` while the panel has focus, where
+single letters are free because the pane is not listening.
+
+### M4.2 · Under the lead
+**Agents sit beneath the session that started them, and look subordinate.**
+
+M2.3 made the group knowable from the names alone — `BOOKS` leads, `BOOKS-2`,
+`BOOKS-3`, `BOOKS-4` follow — and then showed it only in the detail footer, one
+session at a time. In the list they are five peers sorted alphabetically, so the
+lead is not visibly the lead and an agent can sort above it.
+
+Wanted, inside each repository group: the lead's row, then its agents directly
+under it in number order, indented and drawn smaller — the mark and the name
+dimmed, or a `└` gutter — so the shape is read before the names are. An agent
+should never appear away from its lead, and a session with no group keeps
+today's row exactly.
+
+Two things this must not break. Sorting is by name inside a group *because* the
+list has to hold still under the flip keys (M2.2), and grouping by lead has to
+inherit that: the order of a group must not change when an agent starts
+working. And the group is only a group when the lead is running — a lone
+`PR-357` is still one row, not an orphan indented under nothing.
 
 ---
 
