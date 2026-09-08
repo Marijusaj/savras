@@ -312,9 +312,12 @@ inherit that: the order of a group must not change when an agent starts
 working. And the group is only a group when the lead is running — a lone
 `PR-357` is still one row, not an orphan indented under nothing.
 
-The repository headings get their cheapest fix in the same pass: `claude-box:`
-is repeated on every heading of a machine that has more than one repo, in a
-panel 44 columns wide.
+The repository headings are **not** part of this pass. `claude-box:` repeats on
+every heading of a machine with more than one repo, and that repetition was
+raised as waste to trim — but the prefix is the thing that says where the work
+is, and it reads well. It stays as it is. Revisit only if a real box with four
+repos on it makes the column genuinely unreadable, and then by shortening the
+host, never by dropping it.
 
 ### M4.3 · A tab on the box
 **`n` can open a shell on another machine, and a session started in it is one
