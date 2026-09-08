@@ -118,7 +118,10 @@ impl Panel {
             .unwrap();
 
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_svr"));
-        command.args(["solo", "--no-sound"]);
+        // Nothing but this fixture: not the machines the developer watches,
+        // whose sessions would be counted alongside these and change what the
+        // ping says.
+        command.args(["solo", "--no-sound", "--machine", "off"]);
         command.args(extra);
         command.arg("--jobs-dir");
         command.arg(&dir);

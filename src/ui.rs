@@ -446,10 +446,18 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
                 // there is room for the two rarer ones; `n` is also offered in
                 // the other footer, as ctrl-t, which is where you are standing
                 // when you want it.
-                if area.width >= ROOMY {
-                    "enter open · n tab · d delete · x close · a agent · Q quit"
-                } else {
-                    "enter open · d delete · x close · Q quit"
+                // `v` is offered only while it would do something. It watches
+                // a session on another machine, and there is nothing to watch
+                // in one of your own — the same rule the switch key follows,
+                // because a key you press to no effect reads as a broken key.
+                match (
+                    app.selected_job().is_some_and(|job| job.machine.is_some()),
+                    area.width >= ROOMY,
+                ) {
+                    (true, true) => "enter open · v watch · n tab · d delete · a agent · Q quit",
+                    (true, false) => "enter open · v watch · d delete · Q quit",
+                    (false, true) => "enter open · n tab · d delete · x close · a agent · Q quit",
+                    (false, false) => "enter open · d delete · x close · Q quit",
                 },
                 area.width as usize,
             ),

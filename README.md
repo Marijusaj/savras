@@ -362,6 +362,20 @@ list as yours. Repeat it for more than one.
 svr --machine claude-box
 ```
 
+With no `--machine` at all, Savras watches the hosts written in
+`<config>/savras/machines` — one per line, `#` for comments:
+
+```
+# ~/Library/Application Support/savras/machines, or ~/.config/savras/machines
+claude-box
+```
+
+This is the one thing Savras has to be *told*. Everything else it reads off
+the disk, but no file anywhere says which of the hosts in your ssh config you
+want watched — and a flag you retype every time is a flag you forget, which
+looks exactly like a box with nothing running on it. `--machine off` watches
+none of them for a run.
+
 ```
 claude-box:autodad-assistant          ← the machine is part of the heading
 ● autodad-assistant-9c  waiting at the prompt   2m
@@ -389,6 +403,25 @@ working in. A grouped session shares the windows but keeps its own size and its
 own selected window, and `destroy-unattached` takes it away the moment you
 close the tab, so nothing is left behind on the machine.
 
+**`v` watches without touching.** `enter` gives you a session you can type
+in; `v` opens the same window with tmux's `-r`, so the pane cannot send a
+keystroke into work someone else is driving. It is offered in the footer only
+while the selected row is on another machine, since there is nobody else at
+the keyboard for one of your own. Both are grouped sessions, so watching does
+not resize what it watches — with a view open, `tmux list-clients` shows the
+two sizes side by side:
+
+```
+session=autodad             readonly=no   size=158x35   ← your own terminal
+session=savras-view-856221  readonly=yes  size=83x44    ← the panel's pane
+```
+
+The view tidies itself up through a tmux hook rather than a command after the
+attach, because closing the tab kills the ssh outright and anything written
+after `tmux attach` in that script never runs. `set-hook client-attached 'set
+destroy-unattached on'` arms once someone is watching and fires however the
+client leaves, including a connection dropped mid-air.
+
 Two more things worth knowing:
 
 - **`idle` over there is "needs input" over here.** A session you drive by hand
@@ -402,6 +435,20 @@ Two more things worth knowing:
   handshake. The loop asks `kill -0` before sending a row, because nothing
   cleans those files up when a session exits — without it the panel would show
   ghosts for as long as the box stayed up.
+
+### A tab that is a session
+
+Start `claude` yourself in a tab and the panel used to show it twice: an
+anonymous `shell 2` you were looking at, and the session's own row, with
+nothing to say they were the same thing — so `enter` on the row attached a
+*second* time to a session already in front of you.
+
+Claude Code writes `~/.claude/sessions/<pid>.json` for every live session, and
+it carries the job id. Savras asks the pane's own foreground process what it
+is, so a pane running a session *is* that session's tab: one row, marked as
+the one you are in, and `enter` on it goes there rather than opening it again.
+It is asked on every pass rather than once, because it goes both ways — leave
+the session and the pane is a shell again.
 
 ### Ping
 
@@ -542,6 +589,7 @@ Press keys to see what this terminal sends. Ctrl-C to stop.
 | `x` | close the selected tab | — |
 | `d` | delete the selected session, after asking | — |
 | `a` | start a parallel agent under its lead | start a parallel agent under its lead |
+| `v` | watch a machine's session, read-only | — |
 | `q` / `Esc` | back to your work | quit |
 | `Q` | quit Savras, after asking | quit |
 | `ctrl-l` | paint the screen again | paint the screen again |

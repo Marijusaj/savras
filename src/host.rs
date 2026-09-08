@@ -25,6 +25,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::{App, Front, GroupBy, Row, Shell};
 use crate::focus;
+use crate::job::Job;
 use crate::ping::Ping;
 use crate::ui::{self, Hint};
 use crate::watch::Watch;
@@ -277,6 +278,8 @@ enum Action {
     CloseSelected,
     /// Start a parallel agent under the selected session's lead.
     AddAgent,
+    /// `v`: watch the selected session on another machine, read-only.
+    View,
     /// Open another pane of your own, running what Savras was started with.
     NewTab,
     /// `s` in the panel: group by repository instead of status, or back.
@@ -439,6 +442,15 @@ struct Pane {
     /// process, so it is asked once per pid rather than once per frame — and
     /// the pid only changes when you start or leave a program.
     running: Option<(i32, String)>,
+    /// Whether Savras opened this pane onto a session, as opposed to it being
+    /// a pane of your own that turned out to have a session running in it.
+    /// Only the second kind is re-examined: the first cannot stop being what
+    /// it was opened as.
+    opened: bool,
+    /// A pane that is *watching* a session rather than working in it. It is
+    /// the same session as the tab beside it, so it cannot be found by id
+    /// alone: press enter on the row and you want the one you can type in.
+    view: bool,
 }
 
 impl Pane {
@@ -525,6 +537,8 @@ impl Tabs {
                 work,
                 redraw: None,
                 running: None,
+                opened: false,
+                view: false,
             }],
             current: 0,
         }
@@ -561,6 +575,31 @@ impl Tabs {
     /// one and the last tab cannot be closed.
     fn shells(&self) -> usize {
         self.open.iter().filter(|t| t.short.is_none()).count()
+    }
+
+    /// Notice when a pane of your own is running a Claude Code session, and
+    /// let it *be* that session's tab.
+    ///
+    /// You start `claude` in a tab by hand and the panel had two rows for it:
+    /// an anonymous `shell 2` you were looking at, and the session's own row,
+    /// with nothing to say they were the same thing — and pressing enter on
+    /// the row attached a *second* time to a session already in front of you.
+    ///
+    /// The pane's foreground process is asked what it is on every pass rather
+    /// than once, because this goes both ways: leave the session and the pane
+    /// is a shell again.
+    fn adopt_sessions(&mut self, known: &[Job], jobs_dir: &Path) {
+        for pane in self.open.iter_mut().filter(|pane| !pane.opened) {
+            let found = pane
+                .work
+                .master
+                .process_group_leader()
+                .and_then(|pid| crate::job::job_running_as(pid, jobs_dir))
+                .filter(|id| known.iter().any(|job| &job.short == id));
+            if pane.short != found {
+                pane.short = found;
+            }
+        }
     }
 
     /// Your own panes, named, in the order you opened them.
@@ -608,9 +647,15 @@ impl Tabs {
     }
 
     fn position(&self, short: &str) -> Option<usize> {
+        self.find(short, false)
+    }
+
+    /// The tab holding this session, of the kind asked for: the one you work
+    /// in, or the one that is only watching.
+    fn find(&self, short: &str, view: bool) -> Option<usize> {
         self.open
             .iter()
-            .position(|t| t.short.as_deref() == Some(short))
+            .position(|t| t.short.as_deref() == Some(short) && t.view == view)
     }
 
     fn go_to(&mut self, index: usize) {
@@ -811,6 +856,11 @@ fn event_loop(
             // Which tabs exist, and which one you are in, before it is drawn:
             // opening or closing one has to show up in the same breath as the
             // key that did it, not on the next two-second refresh.
+            // Before the tabs are described: a pane you started a session in
+            // is that session's tab, and stops being one when you leave it.
+            session
+                .tabs
+                .adopt_sessions(&app.snapshot.jobs, &session.jobs_dir);
             let named = session.tabs.named_shells(&pane_label(&session.command));
             app.set_tabs(session.tabs.front_ref(), session.tabs.shorts(), named);
             terminal
@@ -928,6 +978,15 @@ fn event_loop(
                         }
                     }
                     Action::AddAgent => crate::agents::add(&mut app, &starting),
+                    Action::View => match view_selected(&mut session, &mut app) {
+                        Ok(true) => {
+                            attend_front(&mut session, &mut app);
+                            focus = Focus::Work;
+                            terminal.clear()?;
+                        }
+                        Ok(false) => {}
+                        Err(e) => app.error = Some(format!("could not watch: {e}")),
+                    },
                     Action::Regroup => {
                         // Say which it is now: the headings change, but the
                         // panel may be showing one repository and one status
@@ -1005,8 +1064,13 @@ fn event_loop(
 
         dirty |= crate::agents::settle(&mut app, &started);
 
-        while let Ok((host, jobs)) = machines.try_recv() {
-            app.set_remote(host, jobs);
+        while let Ok(news) = machines.try_recv() {
+            match news {
+                crate::remote::News::Running(host, jobs) => app.set_remote(host, jobs),
+                crate::remote::News::Trouble(host, why) => {
+                    app.error = Some(format!("{host}: {why}"))
+                }
+            }
             dirty = true;
         }
 
@@ -1063,6 +1127,47 @@ fn open_selected(session: &mut Session, app: &mut App) -> Result<bool> {
     open_short(session, app, &short)
 }
 
+/// Watch the selected session without being able to type into it.
+///
+/// Only means anything for a session on another machine. Locally there is
+/// nobody else at the keyboard: the session is either yours to open or it is
+/// running in the daemon, and `claude attach` is already the gentle way in.
+fn view_selected(session: &mut Session, app: &mut App) -> Result<bool> {
+    let Some(job) = app.selected_job() else {
+        return Ok(false);
+    };
+    let Some(remote) = job.machine.clone() else {
+        app.error = Some("v watches a session on another machine".to_string());
+        return Ok(false);
+    };
+    let short = job.short.clone();
+
+    // Already watching it: go there rather than opening a second window onto
+    // the same session.
+    if let Some(index) = session.tabs.find(&short, true) {
+        session.tabs.go_to(index);
+        app.select(&short);
+        return Ok(true);
+    }
+
+    let command = remote.open_command(crate::job::Reach::ReadOnly);
+    let (cols, rows) = session.work_size();
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let work = Work::spawn(&command, Some(&cwd), cols, rows, Origin::Opened)?;
+    session.tabs.push(Pane {
+        short: Some(short.clone()),
+        reopen: Some((command, cwd)),
+        work,
+        redraw: Some(Instant::now() + REDRAW_AFTER),
+        running: None,
+        opened: true,
+        view: true,
+    });
+    app.attend_to(&short);
+    app.select(&short);
+    Ok(true)
+}
+
 /// Bring a session to the front by id, opening it if it has no pane yet.
 fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool> {
     if let Some(index) = session.tabs.position(short) {
@@ -1088,6 +1193,8 @@ fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool>
         // at another width. Jog it into repainting at this one.
         redraw: Some(Instant::now() + REDRAW_AFTER),
         running: None,
+        opened: true,
+        view: false,
     });
     // Going to a session is the clearest possible way of saying you saw which
     // one it was.
@@ -1165,6 +1272,8 @@ fn new_tab(session: &mut Session) -> Result<()> {
         work,
         redraw: Some(Instant::now() + REDRAW_AFTER),
         running: None,
+        opened: true,
+        view: false,
     });
     Ok(())
 }
@@ -1440,6 +1549,7 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: Option<&Confirm>) -> Actio
         // can only grow is a leak you cannot see.
         [b'x'] => return Action::CloseSelected,
         [b'a'] => return Action::AddAgent,
+        [b'v'] => return Action::View,
         [b's'] => return Action::Regroup,
         // Closing a tab leaves the session running, which is the point of
         // tabs — and why finished sessions pile up in `claude agents` with
@@ -1909,6 +2019,8 @@ mod tests {
             work,
             redraw: None,
             running: None,
+            opened: true,
+            view: false,
         }
     }
 

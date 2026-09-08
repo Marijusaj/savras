@@ -60,28 +60,62 @@ fn script() -> String {
     )
 }
 
+/// What a machine has to say for itself.
+pub enum News {
+    /// What it is running, as of a moment ago. A batch replaces the machine's
+    /// rows wholesale, so a session ending there is a row ending here.
+    Running(String, Vec<Job>),
+    /// It could not be reached, and why — in ssh's own words.
+    ///
+    /// This exists because the first cut sent ssh's stderr to `/dev/null` and
+    /// simply showed nothing: a host you had misspelled, a key the agent had
+    /// forgotten and a box that was switched off all looked exactly like a
+    /// machine with no sessions on it. Silence is the one answer a panel must
+    /// never give.
+    Trouble(String, String),
+}
+
 /// Watch every machine, and hand back the batches as they arrive.
 ///
 /// One thread and one ssh per machine. A machine that cannot be reached is
 /// reported once and then retried, because the answer to a laptop that has
 /// closed its lid is to keep the row rather than to give up on the box.
-pub fn watch(hosts: &[String]) -> Receiver<(String, Vec<Job>)> {
+pub fn watch(hosts: &[String]) -> Receiver<News> {
     let (tx, rx) = mpsc::channel();
     for host in hosts {
         let host = host.clone();
         let tx = tx.clone();
         std::thread::spawn(move || loop {
-            let _ = stream(&host, &tx);
-            // The connection died: the box rebooted, the link dropped, the
-            // laptop shut. Wait long enough not to hammer it, then try again.
-            std::thread::sleep(std::time::Duration::from_secs(10));
+            let why = match stream(&host, &tx) {
+                Ok(why) => why,
+                Err(e) => e.to_string(),
+            };
+            // The connection ended: the box rebooted, the link dropped, the
+            // key was not offered. Say so — with ssh's own last words, which
+            // name the cause far better than anything this could invent — and
+            // then wait long enough not to hammer it before trying again.
+            let why = first_line(&why)
+                .unwrap_or("the connection ended")
+                .to_string();
+            if tx.send(News::Trouble(host.clone(), why)).is_err() {
+                return;
+            }
+            std::thread::sleep(RETRY);
         });
     }
     rx
 }
 
-/// One ssh, read to its end.
-fn stream(host: &str, tx: &mpsc::Sender<(String, Vec<Job>)>) -> std::io::Result<()> {
+/// How long to wait before dialling a machine that just dropped.
+const RETRY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// ssh's complaint, which is one line of use followed by several of banner.
+fn first_line(why: &str) -> Option<&str> {
+    why.lines().map(str::trim).find(|line| !line.is_empty())
+}
+
+/// One ssh, read to its end. Returns whatever it said on the way out.
+fn stream(host: &str, tx: &mpsc::Sender<News>) -> std::io::Result<String> {
     let mut child = Command::new("ssh")
         // Never ask: a panel cannot answer a password prompt, and a session
         // that blocks on one looks like a machine that is simply slow.
@@ -96,8 +130,23 @@ fn stream(host: &str, tx: &mpsc::Sender<(String, Vec<Job>)>) -> std::io::Result<
         .arg(script())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // Kept, not discarded: this is where "Permission denied (publickey)"
+        // and "Could not resolve hostname" come from, and they are the whole
+        // difference between a panel that explains itself and one that does
+        // not.
+        .stderr(Stdio::piped())
         .spawn()?;
+
+    let complaint = child.stderr.take().expect("stderr was piped");
+    let (say, said) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut why = String::new();
+        for line in BufReader::new(complaint).lines().map_while(Result::ok) {
+            why.push_str(&line);
+            why.push('\n');
+        }
+        let _ = say.send(why);
+    });
 
     let out = child.stdout.take().expect("stdout was piped");
     let mut batch = Vec::new();
@@ -105,7 +154,7 @@ fn stream(host: &str, tx: &mpsc::Sender<(String, Vec<Job>)>) -> std::io::Result<
         let line = line?;
         if line.trim() == TICK {
             let jobs = std::mem::take(&mut batch);
-            if tx.send((host.to_string(), jobs)).is_err() {
+            if tx.send(News::Running(host.to_string(), jobs)).is_err() {
                 break; // the panel has gone
             }
             continue;
@@ -115,7 +164,7 @@ fn stream(host: &str, tx: &mpsc::Sender<(String, Vec<Job>)>) -> std::io::Result<
         }
     }
     let _ = child.wait();
-    Ok(())
+    Ok(said.recv().unwrap_or_default())
 }
 
 /// One session's json, as the panel needs it.
@@ -166,6 +215,33 @@ fn read_one(host: &str, line: &str) -> Option<Job> {
 
 fn millis(at: Option<i64>) -> Option<DateTime<Utc>> {
     Utc.timestamp_millis_opt(at?).single()
+}
+
+/// The machines to watch when the command line names none.
+///
+/// One ssh host per line in `<config>/savras/machines`, `#` starting a
+/// comment. This is the one thing about Savras that has to be *told* rather
+/// than looked up: everything else is read off the disk, but no file anywhere
+/// says which of the hosts in your ssh config you want watched — and a flag
+/// you have to retype is a flag you forget, which is exactly how a machine
+/// goes missing from the panel without anything appearing to be wrong.
+pub fn configured() -> Vec<String> {
+    let Some(path) = machines_file() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(|line| line.split('#').next().unwrap_or("").trim())
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Where that list lives, for the panel to name when it is empty.
+pub fn machines_file() -> Option<std::path::PathBuf> {
+    directories::ProjectDirs::from("", "", "savras").map(|dirs| dirs.config_dir().join("machines"))
 }
 
 // --- on-disk shape -------------------------------------------------------
@@ -229,6 +305,18 @@ mod tests {
         // work was in one place when it is in two.
         let job = read_one("claude-box", SAMPLE).unwrap();
         assert_eq!(job.repo(), "claude-box:autodad-assistant");
+    }
+
+    #[test]
+    fn the_machines_file_is_a_list_of_hosts_with_comments() {
+        let text = "# the box\nclaude-box\n\n  other-box  # a spare\n#all-commented\n";
+        let hosts: Vec<String> = text
+            .lines()
+            .map(|line| line.split('#').next().unwrap_or("").trim())
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect();
+        assert_eq!(hosts, ["claude-box", "other-box"]);
     }
 
     #[test]

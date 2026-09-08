@@ -203,6 +203,25 @@ that has stopped thinking is one waiting for you, and that transition is
 exactly what the ping exists to announce. Liveness is decided over there, with
 `kill -0`, because nothing removes a session's json when it exits.
 
+### M3.6 · Watching, and remembering which machines
+`v` opens a machine's session read-only — tmux's `-r`, so the pane cannot type
+into work being driven from another terminal — offered only while the selected
+row is on another machine. It tidies up through a `client-attached` hook that
+sets `destroy-unattached`, because closing a tab kills the ssh and anything
+written after `tmux attach` never runs.
+
+The hosts to watch now live in `<config>/savras/machines`, so plain `svr`
+keeps them. A flag that has to be retyped is a flag that gets forgotten, and a
+forgotten one looked exactly like a box with nothing on it — which is how the
+machines went missing from the panel with nothing appearing to be wrong. ssh's
+stderr is kept and shown for the same reason: a misspelt host, a key the agent
+forgot and a switched-off box all used to look like silence.
+
+And a pane you start a session in is now that session's tab, found through
+`sessions/<pid>.json` and its `jobId`. It used to be an anonymous `shell 2`
+sitting beside a row for the same session, with `enter` on the row attaching a
+second time to what was already in front of you.
+
 ---
 
 ## Next

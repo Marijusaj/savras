@@ -64,6 +64,16 @@ pub struct Job {
     pub machine: Option<Remote>,
 }
 
+/// Whether you are going to a remote session to work in it or to watch it.
+///
+/// The difference is one tmux flag and it matters: `-r` means the pane cannot
+/// type into a session someone else — you, in your own terminal — is driving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reach {
+    Control,
+    ReadOnly,
+}
+
 /// A session on another machine, and how to get to it.
 ///
 /// A box you ssh into and work in by hand has no daemon to attach to, so
@@ -89,7 +99,7 @@ impl Remote {
     ///
     /// With no tmux to go to, this is a plain login shell on the box, which is
     /// still the useful thing to be given.
-    pub fn open_command(&self) -> Vec<String> {
+    pub fn open_command(&self, reach: Reach) -> Vec<String> {
         let mut ssh = vec!["ssh".to_string(), "-t".to_string()];
         // The watcher holds a multiplexed connection open; reusing it means
         // opening a session costs no handshake, and one of sshd's ten
@@ -104,16 +114,43 @@ impl Remote {
         ssh.push(match self.tmux.as_deref().and_then(split_target) {
             // `\;` and not `;`: the remote shell has to hand tmux a literal
             // semicolon as an argument rather than end the command there.
-            Some((session, window)) => {
-                let joined = [
+            Some((session, window)) => match reach {
+                // Grouped and attached in one: the group gives the pane its
+                // own size and its own selected window, and
+                // `destroy-unattached` takes the group away when you leave.
+                Reach::Control => [
                     format!("tmux new-session -t '{session}'"),
                     "set destroy-unattached on".to_string(),
                     "set -w aggressive-resize on".to_string(),
                     format!("select-window -t '{window}'"),
                 ]
-                .join(" \\; ");
-                joined
-            }
+                .join(" \\; "),
+                // Watching: the same group, but the client attaches
+                // read-only, so a keystroke here cannot land in a session
+                // someone else is driving.
+                //
+                // It has to be made detached first — there is no read-only
+                // form of `new-session` — and that is why the tidying is a
+                // *hook* rather than the option the other branch sets:
+                // `destroy-unattached` set at creation would destroy the
+                // session in the moment before the attach lands. Set on
+                // `client-attached` instead, it arms only once someone is
+                // there, and then fires however the client leaves. That
+                // matters more than it sounds: closing the tab kills the ssh
+                // outright, so anything written after the attach in this
+                // script — a `kill-session`, say — never runs at all.
+                Reach::ReadOnly => {
+                    let make = [
+                        format!("tmux new-session -d -s \"$S\" -t '{session}'"),
+                        "set-hook -t \"$S\" client-attached 'set destroy-unattached on'"
+                            .to_string(),
+                        "set -w aggressive-resize on".to_string(),
+                        format!("select-window -t \"$S:{window}\""),
+                    ]
+                    .join(" \\; ");
+                    format!("S=savras-view-$$; {make}; tmux attach -r -t \"$S\"")
+                }
+            },
             None => "exec ${SHELL:-sh} -l".to_string(),
         });
         ssh
@@ -139,7 +176,7 @@ impl Job {
         // A session on another machine is reached by ssh, whatever this one
         // would have done with it.
         if let Some(remote) = &self.machine {
-            return remote.open_command();
+            return remote.open_command(Reach::Control);
         }
         match (&self.backend, &self.daemon_short) {
             (Some(backend), Some(short)) if backend == "daemon" => {
@@ -350,6 +387,32 @@ pub fn load(jobs_dir: &Path) -> Result<Snapshot> {
     sort(&mut jobs);
 
     Ok(Snapshot { jobs })
+}
+
+/// The job id of the Claude Code session running as this process, if one is.
+///
+/// Claude Code writes `~/.claude/sessions/<pid>.json` for every live session,
+/// on every machine, and it carries `jobId` — the directory name under
+/// `jobs/`. So a pid is enough to say "that pane is not a shell, it is
+/// LINUX-B", which is the difference between a tab called `shell 2` sitting
+/// next to a row for the same session and one row that says where it is.
+pub fn job_running_as(pid: i32, jobs_dir: &Path) -> Option<String> {
+    // Beside the jobs directory, because that is where Claude Code keeps it —
+    // and because pointing Savras at another jobs directory should point this
+    // at the sessions that belong to it rather than at your real ones.
+    let path = jobs_dir
+        .parent()?
+        .join("sessions")
+        .join(format!("{pid}.json"));
+    let text = std::fs::read_to_string(path).ok()?;
+    let raw: RawSessionFile = serde_json::from_str(&text).ok()?;
+    raw.job_id.filter(|id| !id.is_empty())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawSessionFile {
+    job_id: Option<String>,
 }
 
 /// The panel's order, applied wherever jobs are put together: local ones as
@@ -697,7 +760,7 @@ mod tests {
             host: "claude-box".to_string(),
             tmux: Some("autodad:@2.%2".to_string()),
         };
-        let command = remote.open_command();
+        let command = remote.open_command(Reach::Control);
 
         assert_eq!(command[0], "ssh");
         // A tty, or tmux refuses to attach at all.
@@ -718,12 +781,40 @@ mod tests {
     }
 
     #[test]
+    fn watching_a_remote_session_cannot_type_into_it() {
+        // The user is driving that session from their own terminal. A pane
+        // that could type into it would be two people at one keyboard.
+        let remote = Remote {
+            host: "claude-box".to_string(),
+            tmux: Some("autodad:@2.%2".to_string()),
+        };
+        let script = remote.open_command(Reach::ReadOnly).last().unwrap().clone();
+
+        assert!(script.contains("attach -r"), "{script}");
+        // Still grouped, so watching does not resize what it is watching.
+        assert!(script.contains("new-session -d"), "{script}");
+        assert!(script.contains("-t 'autodad'"), "{script}");
+        assert!(script.contains("select-window -t \"$S:@2\""), "{script}");
+        // And tidied however the client leaves. It has to be a hook: closing
+        // the tab kills the ssh, so nothing written after the attach in this
+        // script would ever run — and the option cannot simply be set at
+        // creation, because the session is unattached for a moment first.
+        assert!(script.contains("set-hook"), "{script}");
+        assert!(script.contains("client-attached"), "{script}");
+        assert!(script.contains("destroy-unattached on"), "{script}");
+        assert!(
+            !script.contains("kill-session"),
+            "a kill after the attach never runs: {script}"
+        );
+    }
+
+    #[test]
     fn a_machine_with_no_tmux_window_is_still_worth_opening() {
         let remote = Remote {
             host: "claude-box".to_string(),
             tmux: None,
         };
-        let script = remote.open_command().last().unwrap().clone();
+        let script = remote.open_command(Reach::Control).last().unwrap().clone();
         assert!(script.contains("SHELL"), "{script}");
     }
 

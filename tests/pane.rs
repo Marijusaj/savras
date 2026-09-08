@@ -119,6 +119,38 @@ fn a_pane_is_named_after_what_it_is_running() {
     );
 }
 
+#[test]
+fn a_pane_you_start_a_session_in_becomes_that_session_s_tab() {
+    // The panel used to show this twice: an anonymous `shell 2` you were
+    // looking at, and the session's own row, with nothing saying they were the
+    // same thing — and enter on the row attached a second time to a session
+    // already in front of you.
+    //
+    // Claude Code writes ~/.claude/sessions/<pid>.json for every live session,
+    // carrying the job id, so the pane's own foreground process answers the
+    // question. The script here writes one for itself, which is exactly what
+    // starting `claude` in a tab does.
+    let pane = Pane::start_watching(
+        "adopted",
+        "printf '{\"jobId\":\"abc12345\"}' > \"$SAVRAS_TEST_DIR\"/sessions/$$.json; sleep 30",
+        true,
+    );
+    std::fs::create_dir_all(pane.dir.join("jobs/abc12345")).unwrap();
+    std::fs::write(
+        pane.dir.join("jobs/abc12345/state.json"),
+        r#"{"state":"working","name":"LINUX-B","cwd":"/tmp"}"#,
+    )
+    .unwrap();
+
+    // The marker, not just the name: the row exists either way, and what is
+    // being tested is that the panel knows this pane *is* it.
+    let seen = pane.wait_for("\u{25b6} LINUX-B");
+    assert!(
+        seen.contains("\u{25b6} LINUX-B"),
+        "the pane is that session and the panel never marked it as one; it drew:\n{seen}"
+    );
+}
+
 /// A real `svr` hosting a command of the test's choosing, in a real pty.
 struct Pane {
     dir: PathBuf,
@@ -142,11 +174,14 @@ impl Pane {
             Instant::now().elapsed().as_nanos()
         ));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        // `jobs` and `sessions` side by side, as Claude Code keeps them: the
+        // panel finds the second by looking next to the first.
+        std::fs::create_dir_all(dir.join("jobs")).unwrap();
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
         if sessions {
-            std::fs::create_dir_all(dir.join("aaaaaaaa")).unwrap();
+            std::fs::create_dir_all(dir.join("jobs/aaaaaaaa")).unwrap();
             std::fs::write(
-                dir.join("aaaaaaaa/state.json"),
+                dir.join("jobs/aaaaaaaa/state.json"),
                 r#"{"state":"working","name":"OTHER","cwd":"/tmp"}"#,
             )
             .unwrap();
@@ -162,10 +197,13 @@ impl Pane {
             .unwrap();
 
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_svr"));
-        command.args(["--no-sound", "--width", &PANEL.to_string()]);
+        // Nothing but this fixture: not the machines the developer watches.
+        command.args(["--machine", "off", "--no-sound"]);
+        command.args(["--width", &PANEL.to_string()]);
         command.arg("--jobs-dir");
-        command.arg(&dir);
+        command.arg(dir.join("jobs"));
         command.args(["--", "sh", "-c", script]);
+        command.env("SAVRAS_TEST_DIR", &dir);
         command.env_remove("TMUX");
         command.env("TERM", "xterm-256color");
         let child = pty.slave.spawn_command(command).unwrap();

@@ -66,7 +66,10 @@ options:
                       Savras makes of it, when a chord seems to do nothing
   --machine <host>    also watch the Claude Code sessions on an ssh host, and
                       open them in the tmux window they are running in. Repeat
-                      it, or separate hosts with commas
+                      it, or separate hosts with commas. With none named, the
+                      hosts in <config>/savras/machines are watched — one per
+                      line, # for comments — so plain `svr` keeps them.
+                      `--machine off` watches none of them
   --jobs-dir <path>   read jobs from somewhere other than ~/.claude/jobs
   -h, --help          show this help
   -V, --version       show the version
@@ -90,6 +93,7 @@ keys, with the panel focused:
              n does the same with the panel focused
   x          close the selected tab, yours or a session's
   a          start a parallel agent under this session's lead
+  v          watch a session on another machine without typing into it
   s          group by repository or by status
   d          delete the selected session for good, after asking:
              `claude stop` then `claude rm`, which x does not do
@@ -144,10 +148,12 @@ struct Options {
     group_by: app::GroupBy,
     /// Other machines to watch, as ssh targets.
     machines: Vec<String>,
+    /// `--machine off`: watch none, whatever is written down.
+    no_machines: bool,
 }
 
 fn main() -> Result<()> {
-    let options = match parse_args() {
+    let mut options = match parse_args() {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(()),
         Err(e) => {
@@ -155,6 +161,14 @@ fn main() -> Result<()> {
             std::process::exit(2);
         }
     };
+
+    // `--machine` names the machines for this run; with none named, the ones
+    // you have written down are watched. A flag that has to be retyped every
+    // time is a flag that gets forgotten, and a forgotten flag looks exactly
+    // like a machine that has nothing running on it.
+    if options.machines.is_empty() && !options.no_machines {
+        options.machines = remote::configured();
+    }
 
     // A panel inside a pane of another panel is two of everything: two lists
     // of the same sessions, two sets of the keys, and an `attach` opened twice
@@ -285,6 +299,7 @@ fn parse_args() -> Result<Option<Options>> {
 fn parse(args: Vec<String>) -> Result<Option<Options>> {
     let mut options = Options {
         machines: Vec::new(),
+        no_machines: false,
         mode: Mode::Tui,
         jobs_dir: None,
         ping: When::default(),
@@ -352,6 +367,14 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
             }
             "--machine" => {
                 let host = args.next().context("--machine needs an ssh host")?;
+                // `off` for the run you want kept to this machine — and for
+                // the tests, which must not depend on what you have written
+                // down or on a box being reachable.
+                if host == "off" || host == "none" {
+                    options.no_machines = true;
+                    options.machines.clear();
+                    continue;
+                }
                 for host in host.split(',').map(str::trim).filter(|h| !h.is_empty()) {
                     options.machines.push(host.to_string());
                 }
@@ -516,8 +539,11 @@ fn event_loop(
         }
 
         agents::settle(&mut app, &started);
-        while let Ok((host, jobs)) = machines.try_recv() {
-            app.set_remote(host, jobs);
+        while let Ok(news) = machines.try_recv() {
+            match news {
+                remote::News::Running(host, jobs) => app.set_remote(host, jobs),
+                remote::News::Trouble(host, why) => app.error = Some(format!("{host}: {why}")),
+            }
         }
 
         if watch.changed() {
