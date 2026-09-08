@@ -280,6 +280,8 @@ enum Action {
     AddAgent,
     /// `v`: watch the selected session on another machine, read-only.
     View,
+    /// `c`: take control of the session you are watching.
+    Control,
     /// Open another pane of your own, running what Savras was started with.
     NewTab,
     /// `s` in the panel: group by repository instead of status, or back.
@@ -447,6 +449,12 @@ struct Pane {
     /// Only the second kind is re-examined: the first cannot stop being what
     /// it was opened as.
     opened: bool,
+    /// Whether the program in this pane has drawn anything yet.
+    ///
+    /// `claude attach` takes a moment to answer, and until it does the pane is
+    /// genuinely empty — so without this, opening a session shows a black
+    /// rectangle and looks like something broke rather than like waiting.
+    drew: bool,
     /// A pane that is *watching* a session rather than working in it. It is
     /// the same session as the tab beside it, so it cannot be found by id
     /// alone: press enter on the row and you want the one you can type in.
@@ -537,6 +545,7 @@ impl Tabs {
                 work,
                 redraw: None,
                 running: None,
+                drew: false,
                 opened: false,
                 view: false,
             }],
@@ -909,6 +918,16 @@ fn event_loop(
                     Action::Cycle(delta)
                 } else if dead.is_some() && focus == Focus::Work {
                     dead_pane_key(&bytes)
+                } else if focus == Focus::Work
+                    && session.tabs.front().view
+                    && matches!(bytes.as_slice(), [b'\r'] | [b'\n'])
+                {
+                    // Enter, in a pane that is only watching. Nothing is being
+                    // taken from the child by reading it: the tmux client is
+                    // read-only, so every key sent into this pane is already
+                    // discarded on the far side. One of them may as well mean
+                    // the thing you are most likely to want next.
+                    Action::Control
                 } else {
                     route(
                         &bytes,
@@ -971,7 +990,6 @@ fn event_loop(
                                 // been to, whatever it was asking.
                                 attend_front(&mut session, &mut app);
                                 focus = Focus::Work;
-                                terminal.clear()?;
                             }
                             Ok(false) => {}
                             Err(e) => app.error = Some(format!("could not open: {e}")),
@@ -982,10 +1000,17 @@ fn event_loop(
                         Ok(true) => {
                             attend_front(&mut session, &mut app);
                             focus = Focus::Work;
-                            terminal.clear()?;
                         }
                         Ok(false) => {}
                         Err(e) => app.error = Some(format!("could not watch: {e}")),
+                    },
+                    Action::Control => match take_control(&mut session, &mut app) {
+                        Ok(true) => {
+                            attend_front(&mut session, &mut app);
+                            focus = Focus::Work;
+                        }
+                        Ok(false) => {}
+                        Err(e) => app.error = Some(format!("could not take control: {e}")),
                     },
                     Action::Regroup => {
                         // Say which it is now: the headings change, but the
@@ -1017,9 +1042,11 @@ fn event_loop(
                             },
                         };
                         match target {
-                            Some(index) if session.tabs.close(index) => {
-                                terminal.clear()?;
-                            }
+                            // The pane is gone from the list; the next draw
+                            // paints what is now in front of you. Nothing has
+                            // to be erased first: every cell of the pane is
+                            // written each frame.
+                            Some(index) if session.tabs.close(index) => {}
                             // The last tab is the working pane itself, and
                             // closing that is quitting — which asks first.
                             Some(_) => confirming = Some(Confirm::Quit),
@@ -1035,7 +1062,6 @@ fn event_loop(
                         match opened {
                             Ok(true) => {
                                 focus = Focus::Work;
-                                terminal.clear()?;
                             }
                             Ok(false) => {}
                             Err(e) => app.error = Some(format!("could not open: {e}")),
@@ -1056,8 +1082,9 @@ fn event_loop(
         // long as you leave it — but only the tab in front makes the screen
         // dirty, since the others are not on it.
         let front = session.tabs.current;
-        for (i, tab) in session.tabs.open.iter().enumerate() {
+        for (i, tab) in session.tabs.open.iter_mut().enumerate() {
             while tab.work.output.try_recv().is_ok() {
+                tab.drew = true;
                 dirty |= i == front;
             }
         }
@@ -1098,7 +1125,6 @@ fn event_loop(
         }
 
         if close_finished_shells(&mut session) {
-            terminal.clear()?;
             dirty = true;
         }
     }
@@ -1160,9 +1186,56 @@ fn view_selected(session: &mut Session, app: &mut App) -> Result<bool> {
         work,
         redraw: Some(Instant::now() + REDRAW_AFTER),
         running: None,
+        drew: false,
         opened: true,
         view: true,
     });
+    app.attend_to(&short);
+    app.select(&short);
+    Ok(true)
+}
+
+/// Stop watching and start working: the tab you are watching in becomes one
+/// you can type in.
+///
+/// In place, rather than opening a second tab beside it. Watching and working
+/// are the same window on the same session, and the tab you are looking at is
+/// the one you decided about — a new tab somewhere else in the list would make
+/// you find it again, and leave the read-only one behind to be closed by hand.
+///
+/// Dropping the old pane kills its ssh, and the view session on the far side
+/// goes with it: `destroy-unattached` was armed when it attached.
+fn take_control(session: &mut Session, app: &mut App) -> Result<bool> {
+    // The one in front if that is a view — enter, while watching — and
+    // otherwise the one the panel's cursor is on.
+    let watching = session.tabs.front();
+    let short = match (watching.view, &watching.short) {
+        (true, Some(short)) => short.clone(),
+        _ => match app.selected_job() {
+            Some(job) => job.short.clone(),
+            None => return Ok(false),
+        },
+    };
+    let Some(index) = session.tabs.find(&short, true) else {
+        app.error = Some("c takes control of a session you are watching".to_string());
+        return Ok(false);
+    };
+    let Some(job) = app.snapshot.jobs.iter().find(|job| job.short == short) else {
+        return Ok(false);
+    };
+    let (command, cwd) = resume(job);
+    let (cols, rows) = session.work_size();
+    // Spawn before touching the tab, so a failure leaves you watching rather
+    // than looking at nothing.
+    let work = Work::spawn(&command, Some(&cwd), cols, rows, Origin::Opened)?;
+
+    let pane = &mut session.tabs.open[index];
+    pane.work = work;
+    pane.reopen = Some((command, cwd));
+    pane.redraw = Some(Instant::now() + REDRAW_AFTER);
+    pane.drew = false;
+    pane.view = false;
+    session.tabs.go_to(index);
     app.attend_to(&short);
     app.select(&short);
     Ok(true)
@@ -1193,6 +1266,7 @@ fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool>
         // at another width. Jog it into repainting at this one.
         redraw: Some(Instant::now() + REDRAW_AFTER),
         running: None,
+        drew: false,
         opened: true,
         view: false,
     });
@@ -1272,6 +1346,7 @@ fn new_tab(session: &mut Session) -> Result<()> {
         work,
         redraw: Some(Instant::now() + REDRAW_AFTER),
         running: None,
+        drew: false,
         opened: true,
         view: false,
     });
@@ -1550,6 +1625,7 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: Option<&Confirm>) -> Actio
         [b'x'] => return Action::CloseSelected,
         [b'a'] => return Action::AddAgent,
         [b'v'] => return Action::View,
+        [b'c'] => return Action::Control,
         [b's'] => return Action::Regroup,
         // Closing a tab leaves the session running, which is the point of
         // tabs — and why finished sessions pile up in `claude agents` with
@@ -1600,6 +1676,7 @@ fn draw(
     let hint = match (focus, &question) {
         (Focus::Panel, Some(what)) => Hint::Confirming(what),
         (Focus::Panel, None) => Hint::Focused,
+        (Focus::Work, _) if session.tabs.front().view => Hint::Watching,
         (Focus::Work, _) => Hint::Background,
     };
     ui::draw_in(frame, panel_area, app, hint);
@@ -1610,17 +1687,51 @@ fn draw(
     .style(Style::default().fg(Color::Indexed(238)));
     frame.render_widget(divider, chunks[1]);
 
-    let parser = session.tabs.work().parser.lock().unwrap();
+    let front = session.tabs.front();
+    let parser = front.work.parser.lock().unwrap();
     draw_screen(
         frame,
         work_area,
         parser.screen(),
         focus == Focus::Work && dead.is_none(),
     );
+    if !front.drew && dead.is_none() {
+        draw_opening(frame, work_area, front.short.as_deref(), app);
+    }
 
     if let Some(code) = dead {
         draw_dead_banner(frame, work_area, code);
     }
+}
+
+/// Say which session is being opened, while the pane is still empty.
+///
+/// `claude attach` and an ssh to another machine both take a second or two to
+/// draw anything, and a black rectangle for that long reads as a crash. It is
+/// drawn only until the program says its first word, and never over anything.
+fn draw_opening(frame: &mut Frame, area: Rect, short: Option<&str>, app: &App) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let name = short
+        .and_then(|short| app.snapshot.jobs.iter().find(|job| job.short == short))
+        .map(|job| job.name.clone());
+    let text = match name {
+        Some(name) => format!(" opening {name}… "),
+        None => " opening… ".to_string(),
+    };
+    let line = Rect {
+        x: area.x,
+        y: area.y + area.height / 2,
+        width: area.width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(truncate_to(&text, line.width as usize)))
+            .style(Style::default().fg(Color::Indexed(245)))
+            .alignment(Alignment::Center),
+        line,
+    );
 }
 
 /// Say what happened, over the bottom of the dead pane, without covering the
@@ -2019,6 +2130,7 @@ mod tests {
             work,
             redraw: None,
             running: None,
+            drew: false,
             opened: true,
             view: false,
         }
@@ -2439,6 +2551,8 @@ mod tests {
         let f = Fixture::new("host-agent").job("aaa", r#"{"state":"working","name":"X"}"#);
         let mut app = App::new(f.0.clone());
         assert!(matches!(panel_key(b"a", &mut app, None), Action::AddAgent));
+        assert!(matches!(panel_key(b"v", &mut app, None), Action::View));
+        assert!(matches!(panel_key(b"c", &mut app, None), Action::Control));
     }
 
     #[test]

@@ -416,6 +416,14 @@ session=autodad             readonly=no   size=158x35   ← your own terminal
 session=savras-view-856221  readonly=yes  size=83x44    ← the panel's pane
 ```
 
+**`c` takes control**, turning the pane you are watching in into one you can
+type in — in place, so you keep your place in the tab list and the read-only
+one is not left behind to close by hand. While you are watching, `enter` does
+it too: the tmux client is read-only, so every key sent into that pane is
+already discarded on the far side, and one of them may as well mean the thing
+you are most likely to want next. The footer says so rather than making you
+guess: `watching · enter to take control`.
+
 The view tidies itself up through a tmux hook rather than a command after the
 attach, because closing the tab kills the ssh outright and anything written
 after `tmux attach` in that script never runs. `set-hook client-attached 'set
@@ -590,6 +598,7 @@ Press keys to see what this terminal sends. Ctrl-C to stop.
 | `d` | delete the selected session, after asking | — |
 | `a` | start a parallel agent under its lead | start a parallel agent under its lead |
 | `v` | watch a machine's session, read-only | — |
+| `c` | take control of what you are watching | — |
 | `q` / `Esc` | back to your work | quit |
 | `Q` | quit Savras, after asking | quit |
 | `ctrl-l` | paint the screen again | paint the screen again |

@@ -32,6 +32,9 @@ pub enum Hint<'a> {
     Focused,
     /// A column beside a working pane that has the keyboard.
     Background,
+    /// The pane has the keyboard, but it is only watching a session on another
+    /// machine and cannot type into it.
+    Watching,
     /// Focused, with a question open: the key that was pressed closes
     /// something for good, so it asks before it does. Carries the question,
     /// which names what is about to go.
@@ -454,8 +457,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
                     app.selected_job().is_some_and(|job| job.machine.is_some()),
                     area.width >= ROOMY,
                 ) {
-                    (true, true) => "enter open · v watch · n tab · d delete · a agent · Q quit",
-                    (true, false) => "enter open · v watch · d delete · Q quit",
+                    (true, true) => "enter open · v watch · c control · d delete · Q quit",
+                    (true, false) => "enter open · v watch · c control · Q quit",
                     (false, true) => "enter open · n tab · d delete · x close · a agent · Q quit",
                     (false, false) => "enter open · d delete · x close · Q quit",
                 },
@@ -478,6 +481,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
                 area.width as usize,
             ),
             Style::default().fg(Color::DarkGray),
+        ),
+        // Watching: the pane cannot be typed into, so the footer offers the
+        // one key that changes that rather than the usual three.
+        (None, Hint::Watching) => Span::styled(
+            truncate("watching · enter to take control", area.width as usize),
+            Style::default().fg(Color::Indexed(179)),
         ),
     };
     frame.render_widget(Paragraph::new(Line::from(text)), area);

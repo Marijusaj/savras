@@ -222,6 +222,25 @@ And a pane you start a session in is now that session's tab, found through
 sitting beside a row for the same session, with `enter` on the row attaching a
 second time to what was already in front of you.
 
+### M3.7 · Take control, and stop repainting the world
+`c` turns the pane you are watching in into one you can work in, in place, so
+the read-only tab is not left behind. `enter` does it too while the pane is in
+front: a read-only tmux client discards every key anyway, so one of them may
+as well mean something.
+
+And the flip keys no longer erase the screen. Every tab change called
+`terminal.clear()`, which blanks the terminal *now* and leaves it blank until
+the next draw lands — a black flash on every ctrl-shift-arrow, which in
+Ghostty reads as the whole window reloading. Nothing needed it: ratatui resets
+its buffer each frame and the pane writes every cell of its area, so a stale
+cell cannot survive a draw. `ctrl-l` still clears, because that one is asked
+for.
+
+What is left after that is honest waiting: `claude attach` takes a second or
+two to say anything, and the pane is genuinely empty until it does. It now
+says `opening NAME…` in the middle of the pane rather than showing a black
+rectangle that looks like a crash.
+
 ---
 
 ## Next
