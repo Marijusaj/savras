@@ -272,7 +272,7 @@ const MIN_PANEL: u16 = 12;
 /// Nor does it grow so far that the pane beside it stops being usable.
 const MIN_WORK: u16 = 20;
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 enum Focus {
     Work,
     Panel,
@@ -289,6 +289,7 @@ enum Origin {
 }
 
 /// What a keystroke asked for.
+#[derive(Debug)]
 enum Action {
     Nothing,
     Focus(Focus),
@@ -312,7 +313,11 @@ enum Action {
     /// Change the panel's shape: its width, or which side it is on.
     Reshape(Shape),
     /// Open another pane of your own, running what Savras was started with.
+    /// Asks where, when there is more than one answer.
     NewTab,
+    /// The answer to that question: here, or on that machine.
+    NewTabHere,
+    NewTabOn(String),
     /// `s` in the panel: group by repository instead of status, or back.
     Regroup,
     /// `d` in the panel: ask whether the selected session should be deleted.
@@ -329,6 +334,11 @@ enum Action {
 #[derive(Clone)]
 enum Confirm {
     Quit,
+    /// Which machine a new tab should open on. Only ever asked when there is
+    /// more than one answer: with no machines written down, `n` opens a tab
+    /// here exactly as it always has, because the common case must not pay
+    /// for the rare one.
+    Where(Vec<String>),
     Delete {
         short: String,
         name: String,
@@ -346,6 +356,14 @@ impl Confirm {
     fn question(&self) -> String {
         match self {
             Confirm::Quit => "Q again to quit Savras · any key stays".to_string(),
+            Confirm::Where(hosts) => {
+                let mut said = "new tab: 1 here".to_string();
+                for (n, host) in hosts.iter().enumerate() {
+                    said.push_str(&format!(" · {} {host}", n + 2));
+                }
+                said.push_str(" · any key cancels");
+                said
+            }
             // Said differently for a session on another machine, because it is
             // a different act: nothing over there is deleted, the process is
             // stopped, and the row goes when it does.
@@ -491,11 +509,20 @@ struct Pane {
     /// process, so it is asked once per pid rather than once per frame — and
     /// the pid only changes when you start or leave a program.
     running: Option<(i32, String)>,
-    /// Whether Savras opened this pane onto a session, as opposed to it being
-    /// a pane of your own that turned out to have a session running in it.
+    /// Whether Savras opened this pane *onto a session*, as opposed to it
+    /// being a pane of your own that may turn out to have one running in it.
     /// Only the second kind is re-examined: the first cannot stop being what
     /// it was opened as.
+    ///
+    /// A tab you opened yourself is the second kind, wherever it runs. It said
+    /// otherwise until now, which quietly excluded every `ctrl-t` tab from
+    /// adoption — so a session started in one showed up twice, which is the
+    /// thing M3.6 was supposed to have ended.
     opened: bool,
+    /// For a tab on another machine: the host, and the name of the tmux
+    /// session Savras asked for over there. A pid cannot cross an ssh hop, so
+    /// this is what adoption joins on instead — see `adopt_sessions`.
+    remote: Option<(String, String)>,
     /// Whether the program in this pane has drawn anything yet.
     ///
     /// `claude attach` takes a moment to answer, and until it does the pane is
@@ -590,6 +617,7 @@ impl Tabs {
                 running: None,
                 drew: false,
                 opened: false,
+                remote: None,
             }],
             current: 0,
         }
@@ -641,16 +669,45 @@ impl Tabs {
     /// is a shell again.
     fn adopt_sessions(&mut self, known: &[Job], jobs_dir: &Path) {
         for pane in self.open.iter_mut().filter(|pane| !pane.opened) {
-            let found = pane
-                .work
-                .master
-                .process_group_leader()
-                .and_then(|pid| crate::job::job_running_as(pid, jobs_dir))
-                .filter(|id| known.iter().any(|job| &job.short == id));
+            let found = match &pane.remote {
+                // On another machine a pid means nothing here: the pane's own
+                // process group leader is the local ssh client, which owns no
+                // session. The join is the tmux window Savras named when it
+                // opened the tab, which the far side reports back in each
+                // session's `tmux` field — an identifier that is true on both
+                // machines.
+                Some((host, tmux)) => known
+                    .iter()
+                    .find(|job| {
+                        job.machine.as_ref().is_some_and(|remote| {
+                            remote.host == *host
+                                && remote
+                                    .tmux
+                                    .as_deref()
+                                    .is_some_and(|at| at.starts_with(&format!("{tmux}:")))
+                        })
+                    })
+                    .map(|job| job.short.clone()),
+                None => pane
+                    .work
+                    .master
+                    .process_group_leader()
+                    .and_then(|pid| crate::job::job_running_as(pid, jobs_dir))
+                    .filter(|id| known.iter().any(|job| &job.short == id)),
+            };
             if pane.short != found {
                 pane.short = found;
             }
         }
+    }
+
+    /// How many tabs are already open on this machine, which is what numbers
+    /// the next one.
+    fn on(&self, host: &str) -> usize {
+        self.open
+            .iter()
+            .filter(|pane| pane.remote.as_ref().is_some_and(|(had, _)| had == host))
+            .count()
     }
 
     /// Your own panes, named, in the order you opened them.
@@ -848,6 +905,9 @@ fn event_loop(
     // silently never appearing.
     let (starting, started) = mpsc::channel::<Result<String>>();
     // One ssh per machine, held open, streaming what is running over there.
+    // The names are wanted after the watcher has taken the list: they are the
+    // answers to "where should this tab open".
+    let hosts = machines.clone();
     let machines = crate::remote::watch(&machines);
     let watch = Watch::start(&session.jobs_dir);
     app.watching = watch.live;
@@ -1045,12 +1105,25 @@ fn event_loop(
                             GroupBy::Status => "grouped by status".to_string(),
                         });
                     }
-                    Action::NewTab => match new_tab(&mut session, &app) {
+                    // With machines written down there is more than one answer
+                    // to "where", so it is asked. With none — the common case
+                    // — nothing is asked and nothing changes.
+                    Action::NewTab if !hosts.is_empty() => {
+                        confirming = Some(Confirm::Where(hosts.clone()));
+                    }
+                    Action::NewTab | Action::NewTabHere => match new_tab(&mut session, &app) {
                         Ok(()) => {
                             focus = Focus::Work;
                             terminal.clear()?;
                         }
                         Err(e) => app.error = Some(format!("could not open a tab: {e}")),
+                    },
+                    Action::NewTabOn(host) => match new_remote_tab(&mut session, &host) {
+                        Ok(()) => {
+                            focus = Focus::Work;
+                            terminal.clear()?;
+                        }
+                        Err(e) => app.error = Some(format!("could not open a tab on {host}: {e}")),
                     },
                     Action::CloseFront | Action::CloseSelected => {
                         let target = match action {
@@ -1214,6 +1287,7 @@ fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool>
         running: None,
         drew: false,
         opened: true,
+        remote: None,
     });
     // Going to a session is the clearest possible way of saying you saw which
     // one it was.
@@ -1292,9 +1366,71 @@ fn new_tab(session: &mut Session, app: &App) -> Result<()> {
         redraw: Some(Instant::now() + REDRAW_AFTER),
         running: None,
         drew: false,
-        opened: true,
+        opened: false,
+        remote: None,
     });
     Ok(())
+}
+
+/// A tab of your own **on another machine**: a shell in a tmux window over
+/// there, rather than one here.
+///
+/// One more argument to the same function rather than a second function
+/// beside it: the only thing that differs is which command is spawned, and a
+/// parallel `new_remote_tab` would duplicate the spawn, the push, the reopen
+/// and the redraw, then have to be edited again for every future field on a
+/// tab.
+///
+/// **tmux, not a bare login shell**, and that is the whole decision. Adoption
+/// joins a pane to a session by the pane's process group leader, which is a
+/// pid — local by nature. An ssh pane's leader is the local ssh client, which
+/// owns no session, so a `claude` started in a plain remote shell would sit
+/// here as an unadopted `ssh` row while the far side's own row appeared beside
+/// it: two rows for one session, which is exactly what M3.6 removed. tmux's
+/// `session:@window.%pane` crosses the hop, so the window is named *by Savras*
+/// and adoption joins on that name instead.
+///
+/// The name is `savras-<n>`, and `-A` attaches to it if it is already there,
+/// so the second time you open the box's first tab you are back in the work
+/// you left in it. Closing the tab detaches rather than kills — which is the
+/// whole reason for using tmux and the reason a session started there is safe.
+fn new_remote_tab(session: &mut Session, host: &str) -> Result<()> {
+    let name = format!("savras-{}", session.tabs.on(host) + 1);
+    let command = remote_shell(host, &name);
+    let (cols, rows) = session.work_size();
+    // Run from here: ssh does not care, and the session's own directory is on
+    // the other machine — see `Job::repo` for what asking about it costs.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let work = Work::spawn(&command, Some(&cwd), cols, rows, Origin::Opened)?;
+    session.tabs.push(Pane {
+        short: None,
+        reopen: Some((command, cwd)),
+        work,
+        redraw: Some(Instant::now() + REDRAW_AFTER),
+        running: None,
+        drew: false,
+        opened: false,
+        remote: Some((host.to_string(), name)),
+    });
+    Ok(())
+}
+
+/// A shell on `host`, in a tmux session of that name, attached.
+pub fn remote_shell(host: &str, tmux: &str) -> Vec<String> {
+    vec![
+        "ssh".to_string(),
+        "-t".to_string(),
+        // The watcher already holds a multiplexed connection to this box, so
+        // this costs a channel rather than a handshake.
+        "-o".to_string(),
+        "ControlMaster=auto".to_string(),
+        "-o".to_string(),
+        "ControlPath=~/.ssh/savras-%r@%h:%p".to_string(),
+        "-o".to_string(),
+        "ControlPersist=10m".to_string(),
+        host.to_string(),
+        format!("tmux new-session -A -s {tmux}"),
+    ]
 }
 
 /// Where a new tab of your own starts: the directory of the session you are
@@ -1612,6 +1748,21 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: Option<&Confirm>) -> Actio
         Some(Confirm::Delete { .. }) => {
             return match bytes {
                 [b'd'] => Action::Delete,
+                _ => Action::Focus(Focus::Panel),
+            };
+        }
+        // A digit picks a machine, and anything else means you did not want a
+        // tab after all — the same "any other key cancels" the other two use,
+        // so the shape of an open question is always the same.
+        Some(Confirm::Where(hosts)) => {
+            return match bytes {
+                [n @ b'1'..=b'9'] => match (n - b'1') as usize {
+                    0 => Action::NewTabHere,
+                    at => match hosts.get(at - 1) {
+                        Some(host) => Action::NewTabOn(host.clone()),
+                        None => Action::Focus(Focus::Panel),
+                    },
+                },
                 _ => Action::Focus(Focus::Panel),
             };
         }
@@ -2182,6 +2333,7 @@ mod tests {
             running: None,
             drew: false,
             opened: true,
+            remote: None,
         }
     }
 
@@ -2729,6 +2881,59 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_tab_on_the_box_is_a_named_tmux_session() {
+        // tmux and not a bare login shell, because a pid cannot cross an ssh
+        // hop: the name is the only handle that is true on both machines, so
+        // it is Savras that names it.
+        let command = remote_shell("claude-box", "savras-1");
+        assert_eq!(command[0], "ssh");
+        // A tty, or tmux refuses to attach at all.
+        assert!(command.contains(&"-t".to_string()), "{command:?}");
+        assert!(command.contains(&"claude-box".to_string()), "{command:?}");
+        let script = command.last().unwrap();
+        assert!(script.contains("new-session"), "{script}");
+        assert!(script.contains("savras-1"), "{script}");
+        // Attach if it is already there: the second time you open the box's
+        // first tab you are back in the work you left in it.
+        assert!(script.contains("-A"), "{script}");
+    }
+
+    #[test]
+    fn where_a_tab_opens_is_only_asked_when_there_is_a_choice() {
+        let f = Fixture::new("host-where").job("aaa", r#"{"state":"working","name":"X"}"#);
+        let mut app = App::new(f.0.clone());
+
+        let asking = Confirm::Where(vec!["claude-box".into(), "other-box".into()]);
+        let said = asking.question();
+        assert!(said.contains("1 here"), "{said}");
+        assert!(said.contains("2 claude-box"), "{said}");
+        assert!(said.contains("3 other-box"), "{said}");
+
+        // 1 is here, 2 and 3 are the machines in the order they were offered.
+        assert!(matches!(
+            panel_key(b"1", &mut app, Some(&asking)),
+            Action::NewTabHere
+        ));
+        match panel_key(b"2", &mut app, Some(&asking)) {
+            Action::NewTabOn(host) => assert_eq!(host, "claude-box"),
+            other => panic!("wanted claude-box, got {other:?}"),
+        }
+        match panel_key(b"3", &mut app, Some(&asking)) {
+            Action::NewTabOn(host) => assert_eq!(host, "other-box"),
+            other => panic!("wanted other-box, got {other:?}"),
+        }
+        // A number nobody offered, and any other key, mean no tab at all.
+        assert!(matches!(
+            panel_key(b"9", &mut app, Some(&asking)),
+            Action::Focus(Focus::Panel)
+        ));
+        assert!(matches!(
+            panel_key(b"q", &mut app, Some(&asking)),
+            Action::Focus(Focus::Panel)
+        ));
     }
 
     #[test]

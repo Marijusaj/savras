@@ -384,6 +384,53 @@ to trim — but the prefix is the thing that says where the work is, and it read
 well. It stays. Revisit only if a real box with four repos on it makes the
 column unreadable, and then by shortening the host, never by dropping it.
 
+### M4.3 · A tab on the box
+**`ctrl-t` can open a shell on another machine, and a session started in it is
+one row, not two.**
+
+```
+ctrl-t ─▶ new tab: 1 here · 2 claude-box · any key cancels
+              │
+              └─ 2 ─▶ ssh claude-box tmux new-session -A -s savras-1
+                        └─ start `claude` there and the row adopts the pane
+```
+
+The chooser is only offered when there is more than one answer: with no
+machines written down `ctrl-t` asks nothing and opens here, because the common
+case must not pay for the rare one. It is one argument to `new_tab` rather than
+a second function beside it — the only thing that differs is which command is
+spawned.
+
+**A named tmux session, not a bare login shell**, and that was the whole
+decision. Adoption joins a pane to a session through the pane's process group
+leader, which is a pid and local by nature; an ssh pane's leader is the local
+ssh client, which owns no session. So a `claude` started in a plain remote
+shell would have sat here as an unadopted `ssh` row while the far side's own
+row appeared beside it — the double row M3.6 removed, back for remote sessions
+only. tmux's `session:@window.%pane` crosses the hop, so Savras names the
+window and adoption matches on that name. Verified against the real box: a
+session in `savras-probe` reports `savras-probe:@19.%19`.
+
+`-A` attaches if the session is already there, so opening the box's first tab a
+second time is opening the work you left in it. Closing the tab detaches rather
+than kills — which is the whole reason for tmux, and what makes a session
+started over there safe.
+
+Savras still does not record that it started anything remotely: it names a
+window and then *asks the far side* what is running in it. Where a session runs
+stays the machine's own fact, and the price is named — a session started on the
+box appears when the 2s tick carries it, not instantly.
+
+**And a bug this uncovered, which was costing the local case too.** `new_tab`
+marked its panes as "opened onto a session", which excluded every one of them
+from adoption — so M3.6's fix only ever worked for the shell Savras started
+with, and a `claude` started in a `ctrl-t` tab still showed twice. A tab you
+opened yourself is a pane of your own, wherever it runs.
+
+Deliberately not in v1: picking a repository and launching `claude` there. A
+shell on the box guesses nothing, and `cb <repo>` then `claude` is two words
+once the shell is open.
+
 ### M4.4 · The percentage was wrong, twice
 **Both halves of it — the number and what it was divided by.**
 
@@ -431,46 +478,10 @@ option.
 
 ## Next
 
-### M4.3 · A tab on the box
-**`n` can open a shell on another machine, and a session started in it is one
-row, not two.**
-
-M3.5 lists another machine's sessions and `enter` joins them; what is missing is
-starting something there. The ssh invocation already exists — `Remote { host,
-tmux: None }.open_command()` builds it, ControlMaster and all, and falls through
-to `exec ${SHELL:-sh} -l` — so this is one argument, not a subsystem: `new_tab`
-takes a *place*, and the only thing that differs is which command is spawned. A
-parallel `new_remote_tab` would duplicate the spawn, the push, the reopen and
-the redraw, and would have to be edited again for every future field on a tab.
-
-`n` opens a chooser when there are machines to choose between, and behaves
-exactly as it does today when there are none — an unconfigured `machines` file
-is the common case, and it must not pay for the rare one. A second key was the
-other sketch and does not scale past one machine.
-
-**The tab is a named tmux window on the box, not a bare login shell**, and that
-is the whole decision. Adoption (M3.6) makes a pane you start a session in that
-session's tab by matching the pane's process group leader against a local
-`sessions/<pid>.json` — a pid, which is local by nature. An ssh pane's leader is
-the local ssh client, which owns no session, so a `claude` started in a bare
-remote shell would sit there as an unadopted `ssh` row while the far-side tick
-adds the session's own row beside it: the double row that M3.6 just removed,
-back again, for remote sessions only. The far side already publishes an
-identifier that crosses the hop — `tmux`, `session:@window.%pane`, which
-`open_command` already steers by — so the window is remembered on the pane and
-adoption joins on it. Same rule, keyed on the identifier that is valid on both
-machines.
-
-It stays a fact throughout: **savras must not remember that it started something
-remotely.** Where a session runs is owned by the machine running it and arrives
-on that host's ssh stream; a creation record would drift on the first reboot,
-the first hand-started session, and every savras restart. The price of that is
-visible and correct — a session started on the box appears when the far side has
-written its json and the 2s tick has carried it, not instantly.
-
-Deliberately not in v1: picking a repository and launching `claude` there. A
-shell on the box guesses nothing, and the owner's own path (`cb <repo>`, then
-`claude`) is two words once the shell is open.
+Nothing. The M4 series is done — the row says what a session is, the panel
+moves and resizes, agents sit under their lead, a tab can open on another
+machine, and the percentage is the one the session shows itself. What is left
+is below, and none of it is in anyone's way yet.
 
 ---
 

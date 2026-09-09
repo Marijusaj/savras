@@ -91,7 +91,9 @@ keys, with the panel focused:
   g/G        first/last  esc, q  back to your work
   ctrl-t     a tab of your own, running what Savras was started with,
              in the directory of the session you are on;
-             n does the same with the panel focused
+             n does the same with the panel focused. With machines
+             written down it asks where first: 1 here, 2.. the box,
+             and a tab on a box is a tmux window that survives it
   x          close the selected tab, yours or a session's
   a          start a parallel agent under this session's lead
   s          group by repository or by status

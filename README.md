@@ -180,6 +180,15 @@ keeps `cmd-t` for itself and always will, so the new tab it gives you is the
 wrong one: a window *beside* Savras, without the panel and without the sessions
 you have open. This is the same gesture, one level in.
 
+**A tab can open on another machine.** With hosts written in
+`<config>/savras/machines`, `ctrl-t` asks where first — `1 here`, `2 claude-box`
+— and with none written down it asks nothing and opens here, exactly as it
+always did. A tab on a box is a **tmux session named `savras-<n>`**, so closing
+the tab detaches rather than kills, and opening that tab again puts you back in
+the work you left. Start `claude` in one and it appears as **one row, not two**:
+a pid cannot cross an ssh hop, so adoption joins the pane to the session on the
+tmux window Savras named, which the far side reports back itself.
+
 Those panes are rows, at the head of the list, carrying the same markers as the
 sessions below them:
 
