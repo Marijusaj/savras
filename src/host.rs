@@ -996,6 +996,15 @@ fn event_loop(
                 let was_confirming = confirming.clone();
                 let action = if bytes.is_empty() {
                     Action::Nothing // nothing but a focus event
+                } else if let Some(Confirm::Where(hosts)) = &was_confirming {
+                    // An open question owns the keyboard from *either* side of
+                    // the divider. Quit and delete are asked by panel keys, so
+                    // the answer was always going to arrive at the panel; this
+                    // one is asked by ctrl-t, which is reachable from the
+                    // working pane — and an answer routed by focus went into
+                    // the child instead, cancelling the question with the very
+                    // keystroke meant to answer it.
+                    where_key(&bytes, hosts, focus)
                 } else if bytes.contains(&NEW_TAB) {
                     // From either side of the divider, and without going
                     // through the panel: this is the key you reach for
@@ -1726,6 +1735,29 @@ fn route(
     }
 }
 
+/// The answer to "where should this tab open".
+///
+/// A digit picks a machine — `1` is here, and the rest are the machines in the
+/// order they were offered — and anything else means you did not want a tab
+/// after all, the same "any other key cancels" the other two questions use.
+///
+/// Cancelling leaves the keyboard where it already was. The question can be
+/// asked from the working pane, and taking the focus to the panel because you
+/// changed your mind about a tab would be a second surprise on top of the
+/// first.
+fn where_key(bytes: &[u8], hosts: &[String], focus: Focus) -> Action {
+    match bytes {
+        [n @ b'1'..=b'9'] => match (n - b'1') as usize {
+            0 => Action::NewTabHere,
+            at => match hosts.get(at - 1) {
+                Some(host) => Action::NewTabOn(host.clone()),
+                None => Action::Focus(focus),
+            },
+        },
+        _ => Action::Focus(focus),
+    }
+}
+
 /// The panel is read-only, so it needs a cursor, a way in, and a way out.
 ///
 /// `confirming` is set once `Q` has been pressed: the next key either confirms
@@ -1751,21 +1783,11 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: Option<&Confirm>) -> Actio
                 _ => Action::Focus(Focus::Panel),
             };
         }
-        // A digit picks a machine, and anything else means you did not want a
-        // tab after all — the same "any other key cancels" the other two use,
-        // so the shape of an open question is always the same.
-        Some(Confirm::Where(hosts)) => {
-            return match bytes {
-                [n @ b'1'..=b'9'] => match (n - b'1') as usize {
-                    0 => Action::NewTabHere,
-                    at => match hosts.get(at - 1) {
-                        Some(host) => Action::NewTabOn(host.clone()),
-                        None => Action::Focus(Focus::Panel),
-                    },
-                },
-                _ => Action::Focus(Focus::Panel),
-            };
-        }
+        // Answered by `where_key` before the keyboard is routed by focus, so
+        // nothing still asking it can reach here. It is listed to say that,
+        // rather than falling through to `j` and `k` moving the cursor
+        // underneath a question.
+        Some(Confirm::Where(_)) => return Action::Nothing,
         None => {}
     }
     match bytes {
@@ -1835,10 +1857,14 @@ fn draw(
     };
 
     let question = confirming.map(Confirm::question);
+    // A question is shown wherever the keyboard is. It is drawn in the panel
+    // because that is where Savras speaks, but the one that asks it — ctrl-t —
+    // is pressed as readily from the working pane, and a question you cannot
+    // see is a keystroke that does nothing.
     let hint = match (focus, &question) {
-        (Focus::Panel, Some(what)) => Hint::Confirming(what),
+        (_, Some(what)) => Hint::Confirming(what),
         (Focus::Panel, None) => Hint::Focused,
-        (Focus::Work, _) => Hint::Background,
+        (Focus::Work, None) => Hint::Background,
     };
     ui::draw_in(frame, panel_area, app, hint);
 
@@ -2903,36 +2929,55 @@ mod tests {
 
     #[test]
     fn where_a_tab_opens_is_only_asked_when_there_is_a_choice() {
-        let f = Fixture::new("host-where").job("aaa", r#"{"state":"working","name":"X"}"#);
-        let mut app = App::new(f.0.clone());
-
-        let asking = Confirm::Where(vec!["claude-box".into(), "other-box".into()]);
-        let said = asking.question();
+        let hosts = vec!["claude-box".to_string(), "other-box".to_string()];
+        let said = Confirm::Where(hosts.clone()).question();
         assert!(said.contains("1 here"), "{said}");
         assert!(said.contains("2 claude-box"), "{said}");
         assert!(said.contains("3 other-box"), "{said}");
 
         // 1 is here, 2 and 3 are the machines in the order they were offered.
         assert!(matches!(
-            panel_key(b"1", &mut app, Some(&asking)),
+            where_key(b"1", &hosts, Focus::Panel),
             Action::NewTabHere
         ));
-        match panel_key(b"2", &mut app, Some(&asking)) {
+        match where_key(b"2", &hosts, Focus::Panel) {
             Action::NewTabOn(host) => assert_eq!(host, "claude-box"),
             other => panic!("wanted claude-box, got {other:?}"),
         }
-        match panel_key(b"3", &mut app, Some(&asking)) {
+        match where_key(b"3", &hosts, Focus::Panel) {
             Action::NewTabOn(host) => assert_eq!(host, "other-box"),
             other => panic!("wanted other-box, got {other:?}"),
         }
         // A number nobody offered, and any other key, mean no tab at all.
         assert!(matches!(
-            panel_key(b"9", &mut app, Some(&asking)),
+            where_key(b"9", &hosts, Focus::Panel),
             Action::Focus(Focus::Panel)
         ));
         assert!(matches!(
-            panel_key(b"q", &mut app, Some(&asking)),
+            where_key(b"q", &hosts, Focus::Panel),
             Action::Focus(Focus::Panel)
+        ));
+    }
+
+    /// ctrl-t is pressed from the working pane as readily as from the panel,
+    /// so the answer has to be read there too. It was not: the digit went to
+    /// the child, and the question it was meant to answer was cancelled by its
+    /// own keystroke — ctrl-t appearing to do nothing at all.
+    #[test]
+    fn the_answer_is_read_from_the_working_pane_too() {
+        let hosts = vec!["claude-box".to_string()];
+        assert!(matches!(
+            where_key(b"1", &hosts, Focus::Work),
+            Action::NewTabHere
+        ));
+        match where_key(b"2", &hosts, Focus::Work) {
+            Action::NewTabOn(host) => assert_eq!(host, "claude-box"),
+            other => panic!("wanted claude-box, got {other:?}"),
+        }
+        // Changing your mind about a tab does not also move the keyboard.
+        assert!(matches!(
+            where_key(b"q", &hosts, Focus::Work),
+            Action::Focus(Focus::Work)
         ));
     }
 

@@ -564,6 +564,15 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
 
 fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
     let text = match (&app.error, hint) {
+        // A question outranks an error, whichever arrived first: the error is
+        // news you have already been given, and the question is the one line
+        // that says what the next keystroke will do. A machine that cannot be
+        // reached says so every time it retries, and that must not be what
+        // swallows "new tab: 1 here · 2 claude-box".
+        (_, Hint::Confirming(question)) => Span::styled(
+            truncate(question, area.width as usize),
+            Style::default().fg(Color::Yellow),
+        ),
         (Some(err), _) => Span::styled(
             truncate(err, area.width as usize),
             Style::default().fg(Color::Red),
@@ -607,10 +616,6 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
                 area.width as usize,
             ),
             Style::default().fg(Color::DarkGray),
-        ),
-        (None, Hint::Confirming(question)) => Span::styled(
-            truncate(question, area.width as usize),
-            Style::default().fg(Color::Yellow),
         ),
         // The chord is the one key worth advertising from the working pane:
         // it is the only thing you do without coming here first.

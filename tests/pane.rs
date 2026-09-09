@@ -6,7 +6,7 @@
 //! is told has to be exactly what it is given, and the only way to know is to
 //! ask the child.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -151,10 +151,41 @@ fn a_pane_you_start_a_session_in_becomes_that_session_s_tab() {
     );
 }
 
+#[test]
+fn ctrl_t_asks_and_is_answered_from_the_working_pane() {
+    // With machines written down, ctrl-t asks where the tab should open. It is
+    // pressed from the working pane — that is the whole reason it exists as a
+    // chord — so the question has to be *shown* there and the answer *read*
+    // there. Neither was true: the panel drew its background hint instead of
+    // the question, and the digit went to the child, cancelling the question
+    // with the very keystroke meant to answer it. ctrl-t did nothing, twice.
+    let mut pane = Pane::start_on("ctrl-t", "cat", &["a-box"]);
+    pane.wait_for("ctrl-g focus");
+
+    let asked = pane.press_for(b"\x14", "new tab");
+    assert!(
+        asked.contains("1 here") && asked.contains("2 a-box"),
+        "ctrl-t from the pane asked nothing you could see; the panel drew:\n{asked}"
+    );
+
+    // `1` is here. The proof it was read as an answer rather than typed into
+    // the child is a second pane of your own — the header's count of what is
+    // behind the one in front, which is 0 and undrawn until there are two.
+    // The count and not the new row's name: a pane is named after the program
+    // running in it, and for the first moment of its life that is the shell it
+    // is about to exec out of.
+    let opened = pane.press_for(b"1", "\u{25b7} 1");
+    assert!(
+        opened.contains("\u{25b7} 1"),
+        "the answer went to the child instead of the question; the panel drew:\n{opened}"
+    );
+}
+
 /// A real `svr` hosting a command of the test's choosing, in a real pty.
 struct Pane {
     dir: PathBuf,
     rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    writer: Box<dyn std::io::Write + Send>,
     child: Box<dyn Child + Send + Sync>,
 }
 
@@ -163,11 +194,23 @@ impl Pane {
         Pane::start_watching(name, script, false)
     }
 
+    /// With machines named, which is what gives ctrl-t more than one answer.
+    /// They are never reached: the ssh that watches them fails, says so, and
+    /// retries — which is itself worth having under the test, since an error
+    /// in the footer must not be what hides the question.
+    fn start_on(name: &str, script: &str, machines: &[&str]) -> Self {
+        Pane::start_with(name, script, false, machines)
+    }
+
     /// `sessions` seeds the jobs directory with one, for the tests that need
     /// the panel to draw its list: with nothing to watch the panel says so
     /// instead, and your own panes are not listed either — one shell and no
     /// sessions is a list with nothing in it to tell apart.
     fn start_watching(name: &str, script: &str, sessions: bool) -> Self {
+        Pane::start_with(name, script, sessions, &[])
+    }
+
+    fn start_with(name: &str, script: &str, sessions: bool, machines: &[&str]) -> Self {
         let dir = std::env::temp_dir().join(format!(
             "savras-pane-e2e-{}-{name}-{}",
             std::process::id(),
@@ -198,7 +241,14 @@ impl Pane {
 
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_svr"));
         // Nothing but this fixture: not the machines the developer watches.
-        command.args(["--machine", "off", "--no-sound"]);
+        command.arg("--no-sound");
+        if machines.is_empty() {
+            command.args(["--machine", "off"]);
+        } else {
+            for host in machines {
+                command.args(["--machine", host]);
+            }
+        }
         command.args(["--width", &PANEL.to_string()]);
         command.arg("--jobs-dir");
         command.arg(dir.join("jobs"));
@@ -226,7 +276,21 @@ impl Pane {
             }
         });
 
-        Pane { dir, rx, child }
+        let writer = pty.master.take_writer().unwrap();
+        Pane {
+            dir,
+            rx,
+            writer,
+            child,
+        }
+    }
+
+    /// Send keys, then read until the panel says the thing — or long enough to
+    /// be sure it never will.
+    fn press_for(&mut self, keys: &[u8], needle: &str) -> String {
+        self.writer.write_all(keys).unwrap();
+        self.writer.flush().unwrap();
+        self.wait_for(needle)
     }
 
     fn wait_for(&self, needle: &str) -> String {
