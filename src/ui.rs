@@ -164,7 +164,11 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    let name_width = app
+    // Wide enough for the longest name, plus the gutter when anything is
+    // indented — an agent pays for its indent out of the column, and without
+    // this the column is set by a name that is then too long to fit in it.
+    let indented = (0..app.snapshot.jobs.len()).any(|i| app.under_lead(i));
+    let name_width = (app
         .snapshot
         .jobs
         .iter()
@@ -172,7 +176,8 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
         .max()
         .unwrap_or(4)
         .clamp(4, 12)
-        .min((area.width / 3) as usize) as u16;
+        + if indented { GUTTER.chars().count() } else { 0 })
+    .min((area.width / 3) as usize) as u16;
 
     let items: Vec<ListItem> = app
         .rows
@@ -206,10 +211,12 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
             )),
             Row::Job(i) => {
                 let job = &app.snapshot.jobs[*i];
+                let under = app.under_lead(*i);
                 ListItem::new(job_line(
                     job,
                     app.alerted(job),
                     app.tab(job),
+                    under,
                     name_width,
                     area.width,
                 ))
@@ -268,6 +275,7 @@ fn job_line(
     job: &Job,
     alerted: bool,
     tab: Tab,
+    under_lead: bool,
     name_width: u16,
     total_width: u16,
 ) -> Line<'static> {
@@ -316,23 +324,39 @@ fn job_line(
     // colour every other row wears. The `▶` says the same thing, but it is one
     // glyph in a column that already carries four meanings, and the name is
     // what the eye lands on.
+    // A parallel agent is indented under its lead, and pays for the gutter out
+    // of its own name rather than out of the row: the columns to the right are
+    // read down a list, so they have to stay where they are. Two columns is
+    // enough — the shape is read before the names are.
+    let named = (name_width as usize).saturating_sub(if under_lead {
+        GUTTER.chars().count()
+    } else {
+        0
+    });
     let name = if tab == Tab::Front {
         Span::styled(
-            pad(&job.name, name_width as usize),
+            pad(&job.name, named),
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )
     } else {
         Span::styled(
-            pad(&job.name, name_width as usize),
+            pad(&job.name, named),
             Style::default()
                 .fg(Color::Black)
                 .bg(color)
                 .add_modifier(Modifier::BOLD),
         )
     };
-    let mut spans = vec![mark, name];
+    let mut spans = vec![mark];
+    if under_lead {
+        spans.push(Span::styled(
+            GUTTER,
+            Style::default().fg(Color::Indexed(240)),
+        ));
+    }
+    spans.push(name);
 
     // What is left after the mark and the name, spent in the order these
     // things are worth: how long it has been open, what it is, what its pull
@@ -412,6 +436,9 @@ fn job_line(
     Line::from(spans)
 }
 
+/// What an agent's row is indented by, drawn in the dimmest grey that is still
+/// a line: the eye should find the shape without reading it.
+const GUTTER: &str = "└ ";
 /// `WORKING` is the longest of the four, and they read as a column only if
 /// they are one.
 const WORD_WIDTH: usize = 7;
@@ -1023,6 +1050,83 @@ mod tests {
 
         let other = cell_of("ASK");
         assert_ne!(other.bg, Color::Reset, "every other name keeps its badge");
+    }
+
+    #[test]
+    fn agents_are_drawn_under_their_lead_when_grouped_by_repository() {
+        let fixture = Fixture::new("ui-under")
+            .job(
+                "a",
+                r#"{"state":"working","name":"BOOKS","cwd":"/tmp","detail":"d"}"#,
+            )
+            .job(
+                "b",
+                r#"{"state":"working","name":"BOOKS-2","cwd":"/tmp","detail":"d"}"#,
+            );
+
+        let mut app = App::new(fixture.0.clone());
+        app.set_group_by(crate::app::GroupBy::Repo);
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let lines: Vec<String> = (0..24)
+            .map(|y| {
+                (0..60)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect()
+            })
+            .collect();
+
+        // Rows only — the detail footer names the group too, and "leads
+        // BOOKS-2" is not a row.
+        let row = |want: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains("WORKING") && l.contains(want))
+                .unwrap_or_else(|| panic!("no row for {want} in {lines:#?}"))
+        };
+        let lead = row("BOOKS  ");
+        let agent = row("BOOKS-2");
+        assert!(agent > lead, "the agent belongs under its lead");
+        assert!(
+            lines[agent].contains("└ BOOKS-2"),
+            "an agent is indented: {:?}",
+            lines[agent]
+        );
+        assert!(
+            !lines[lead].contains('└'),
+            "the lead is not: {:?}",
+            lines[lead]
+        );
+
+        // The columns to the right are read down a list, so the gutter comes
+        // out of the name rather than shifting everything along.
+        // Counted in characters, not bytes: `└` is three of the latter, and
+        // that difference is exactly the bug this alignment is guarding.
+        let ends = |l: &String| l.trim_end().chars().count();
+        assert_eq!(ends(&lines[lead]), ends(&lines[agent]));
+
+        // Grouped by status the hierarchy is not drawn at all: a lead and its
+        // agent can be in different groups, and an indent pointing at a row
+        // under another heading would be a lie.
+        let mut app = App::new(fixture.0.clone());
+        app.set_group_by(crate::app::GroupBy::Status);
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let text: String = (0..24)
+            .flat_map(|y| {
+                (0..60).map(move |x| (x, y)).map(|(x, y)| {
+                    terminal
+                        .backend()
+                        .buffer()
+                        .cell((x, y))
+                        .unwrap()
+                        .symbol()
+                        .to_string()
+                })
+            })
+            .collect();
+        assert!(!text.contains('└'), "no gutter when grouped by status");
     }
 
     #[test]

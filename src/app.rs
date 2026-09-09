@@ -108,6 +108,10 @@ pub struct App {
     /// How the rows are grouped, and the headings that grouping produced.
     group_by: GroupBy,
     pub groups: Vec<String>,
+    /// Which rows are agents drawn under their lead, by index into the
+    /// snapshot. Worked out while the rows are built, because that is where
+    /// the order is decided, and read back by the renderer for the indent.
+    nested: HashSet<usize>,
     /// What to call the keys that flip between sessions. Only ever shown once
     /// there is a session to flip to: a key that would do nothing is worse
     /// than no key at all, because you try it and conclude it is broken.
@@ -153,6 +157,7 @@ impl App {
             remote: std::collections::BTreeMap::new(),
             group_by: GroupBy::Status,
             groups: Vec::new(),
+            nested: HashSet::new(),
             switch_label: None,
             should_quit: false,
         };
@@ -354,8 +359,14 @@ impl App {
         }
     }
 
+    /// Whether this session is drawn as an agent under its lead.
+    pub fn under_lead(&self, at: usize) -> bool {
+        self.nested.contains(&at)
+    }
+
     fn rebuild_rows(&mut self) {
         self.rows.clear();
+        self.nested.clear();
         // Your own panes first, unheaded: one shell needs no group and several
         // read as a list on their own.
         for i in 0..self.shells.len() {
@@ -420,7 +431,15 @@ impl App {
                 self.rows.push(Row::Spacer);
             }
             self.rows.push(Row::Repo(g));
-            self.rows.extend(group.into_iter().map(Row::Job));
+            // A lead, then its own agents under it. Recorded here rather than
+            // asked again while drawing: it is the same derivation, and two of
+            // them is how the row and the indent come to disagree.
+            for (at, agent) in crate::agents::under_leads(&self.snapshot, &group) {
+                if agent {
+                    self.nested.insert(at);
+                }
+                self.rows.push(Row::Job(at));
+            }
         }
     }
 

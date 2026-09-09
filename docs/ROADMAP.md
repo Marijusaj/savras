@@ -343,36 +343,51 @@ This is the read-only rule bending a second time, in the same shape as the
 first: Savras still writes nothing and still speaks no private protocol. It
 signals a process, which is what `d` already did here.
 
+### M4.2 · Under the lead
+**Agents sit beneath the session that started them, and look it.**
+
+```
+✳ BOOKS     WORKING  auditing leg 3    70% 2h
+✳ └ BOOKS-2 WAITING  answer: which s…  21% 2h
+✳ └ BOOKS-4 DONE     merged      #411  45% 1h
+✳ PR-357    WORKING  a lone hyphen      5% 8m   ← not an agent
+```
+
+M2.3 made the group knowable from the names alone and then showed it only in
+the detail footer, one session at a time. In the list they were peers sorted
+alphabetically, so the lead was not visibly the lead and an agent could sort
+above it.
+
+The indent is paid for **out of the name column**, not out of the row: the
+columns to its right are read down a list, so they stay where they are, and the
+column is widened by the two the gutter takes so no name is squeezed by having
+a sibling. Grouped by repository only — grouped by status a lead and its agent
+can be under different headings, and an indent pointing at a row that is not on
+screen would be a lie.
+
+The ordering rule is the interesting part, because a list you *navigate* has to
+hold still (M2.2). A **family** is placed by the most demanding status anyone in
+it has, then by its lead's name — both things that do not change while it runs,
+so an agent finishing a task never reshuffles the group. A family with a
+question in it rises, which is the rule the repository headings already follow:
+a question does not stop being a question because an agent asked it. Inside the
+family it is the lead, then its agents by number.
+
+A session with no siblings *in that heading* is a family of one and comes out
+exactly as it went in. `PR-357` is still one row — the tail has to parse as a
+number for the name to be read as a group, and `BOOKS-LEG3` splits to itself,
+not to `BOOKS`, which is what stops every hyphenated name in a repository being
+filed under the first one alphabetically.
+
+The repository headings are **not** part of this pass. `claude-box:` repeats on
+every heading of a machine with more than one repo, and that was raised as waste
+to trim — but the prefix is the thing that says where the work is, and it reads
+well. It stays. Revisit only if a real box with four repos on it makes the
+column unreadable, and then by shortening the host, never by dropping it.
+
 ---
 
 ## Next
-
-### M4.2 · Under the lead
-**Agents sit beneath the session that started them, and look subordinate.**
-
-M2.3 made the group knowable from the names alone — `BOOKS` leads, `BOOKS-2`,
-`BOOKS-3`, `BOOKS-4` follow — and then showed it only in the detail footer, one
-session at a time. In the list they are five peers sorted alphabetically, so the
-lead is not visibly the lead and an agent can sort above it.
-
-Wanted, inside each repository group: the lead's row, then its agents directly
-under it in number order, indented and drawn smaller — the mark and the name
-dimmed, or a `└` gutter — so the shape is read before the names are. An agent
-should never appear away from its lead, and a session with no group keeps
-today's row exactly.
-
-Two things this must not break. Sorting is by name inside a group *because* the
-list has to hold still under the flip keys (M2.2), and grouping by lead has to
-inherit that: the order of a group must not change when an agent starts
-working. And the group is only a group when the lead is running — a lone
-`PR-357` is still one row, not an orphan indented under nothing.
-
-The repository headings are **not** part of this pass. `claude-box:` repeats on
-every heading of a machine with more than one repo, and that repetition was
-raised as waste to trim — but the prefix is the thing that says where the work
-is, and it reads well. It stays as it is. Revisit only if a real box with four
-repos on it makes the column genuinely unreadable, and then by shortening the
-host, never by dropping it.
 
 ### M4.3 · A tab on the box
 **`n` can open a shell on another machine, and a session started in it is one

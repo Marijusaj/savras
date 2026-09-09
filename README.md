@@ -312,8 +312,8 @@ SAVRAS  ◦ live  ● 1
 1 needs input · 3 working · 2 done
 
 savras
-● SAVRAS-4    WAITING  approve Bash: c…  #382  9%  5m
 ▶ SAVRAS      WORKING  grouping by rep…        2%  2h
+● └ SAVRAS-4  WAITING  approve Bash: c…  #382  9%  5m
 
 autodad-assistant
 ✳ BOOKS       WORKING  Four of the 24…        61% 10m
@@ -327,6 +327,20 @@ processore
 repository the old order holds: waiting, then working, then done, and by name
 within each. A question does not stop being a question because of where it was
 asked, and grouping must not bury it.
+
+**Parallel agents sit under their lead.** `SAVRAS-4` is indented beneath
+`SAVRAS`, in number order, because the names already say they belong together —
+Claude Code numbers repeats, so the bare name leads and the numbered ones
+follow. The indent comes out of the name column rather than shifting the row,
+so everything to the right of it still reads as a column down the list.
+
+A *family* is placed by the most demanding status anyone in it has, then by its
+lead's name — so a group with a question in it rises to the top, and an agent
+finishing a task never reshuffles the group under your cursor. A session with
+no siblings is an ordinary row: the tail has to parse as a number, so `PR-357`
+leads nothing and `BOOKS-LEG3` is not an agent of `BOOKS`. Grouped by status
+there is no indent at all, since a lead and its agent can be under different
+headings and an arrow pointing off-screen would be a lie.
 
 The name comes from the repository root — the nearest directory above the
 session's `cwd` with a `.git` in it. **Worktrees come home**: a worktree's

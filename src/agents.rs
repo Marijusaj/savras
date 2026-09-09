@@ -23,7 +23,7 @@ use std::sync::mpsc;
 use anyhow::{Context, Result};
 
 use crate::app::App;
-use crate::job::{Job, Snapshot};
+use crate::job::{Job, Snapshot, Status};
 
 /// The lead a session name belongs to, and its number within that lead.
 ///
@@ -138,6 +138,68 @@ pub fn next_name(snapshot: &Snapshot, lead: &str) -> String {
         n += 1;
     }
     format!("{base}-{n}")
+}
+
+/// One heading's sessions, ordered so that every lead is followed by its own
+/// agents, with `true` against the ones that are agents.
+///
+/// The list has to **hold still** — the flip keys walk it, and a row that
+/// moves while you are looking at it makes them a lottery (M2.2). So a family
+/// is placed by two things that do not change while it runs: the most
+/// demanding status anyone in it has, and its lead's name. A family with a
+/// question in it rises, which is the rule the repository headings already
+/// follow — a question does not stop being a question because of who asked it
+/// — and an agent finishing a task does not reshuffle the group.
+///
+/// Inside a family the order is the lead, then its agents by number. A session
+/// with no siblings *here* is a family of one and comes out exactly as it went
+/// in: `group_of` needs two to call it a group, and a lone `PR-357` is a row,
+/// not an orphan indented under nothing. "Here" matters — the lead has to be
+/// in this same heading, or the indent would point at a row that is not on
+/// screen.
+pub fn under_leads(snapshot: &Snapshot, group: &[usize]) -> Vec<(usize, bool)> {
+    // Families, keyed by the base name they share, in this heading only.
+    let mut families: Vec<(String, Vec<usize>)> = Vec::new();
+    for &at in group {
+        let (base, _) = split(&snapshot.jobs[at].name);
+        match families.iter_mut().find(|(had, _)| had == base) {
+            Some((_, members)) => members.push(at),
+            None => families.push((base.to_string(), vec![at])),
+        }
+    }
+
+    for (_, members) in families.iter_mut() {
+        // The bare name first — it is the session the others were named after
+        // — then by number, so the order is the one the names already imply.
+        members.sort_by_key(|&at| {
+            let (_, number) = split(&snapshot.jobs[at].name);
+            (number, snapshot.jobs[at].name.clone())
+        });
+    }
+
+    families.sort_by(|a, b| {
+        let rank = |members: &Vec<usize>| {
+            members
+                .iter()
+                .map(|&at| snapshot.jobs[at].status)
+                .min()
+                .unwrap_or(Status::Done)
+        };
+        rank(&a.1)
+            .cmp(&rank(&b.1))
+            .then_with(|| snapshot.jobs[a.1[0]].name.cmp(&snapshot.jobs[b.1[0]].name))
+    });
+
+    families
+        .into_iter()
+        .flat_map(|(_, members)| {
+            let alone = members.len() < 2;
+            members
+                .into_iter()
+                .enumerate()
+                .map(move |(n, at)| (at, !alone && n > 0))
+        })
+        .collect()
 }
 
 /// What a new parallel agent is told, as its opening prompt.
@@ -506,6 +568,95 @@ mod tests {
             group.describe(job(&s, "AGENT-2")),
             "parallel agent under AGENT"
         );
+    }
+
+    /// The names, in the order they come out, with agents marked.
+    fn laid_out(s: &Snapshot) -> Vec<String> {
+        let all: Vec<usize> = (0..s.jobs.len()).collect();
+        under_leads(s, &all)
+            .into_iter()
+            .map(|(at, agent)| {
+                format!(
+                    "{}{}",
+                    if agent { "└ " } else { "" },
+                    s.jobs[at].name.clone()
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn agents_come_out_under_their_lead_in_number_order() {
+        let f = Fixture::new("agents-under")
+            .job("a", &named("BOOKS-4"))
+            .job("b", &named("BOOKS"))
+            .job("c", &named("BOOKS-2"));
+        assert_eq!(
+            laid_out(&snap(&f)),
+            ["BOOKS", "└ BOOKS-2", "└ BOOKS-4"],
+            "the lead first, then its agents by number"
+        );
+    }
+
+    #[test]
+    fn a_session_with_no_siblings_is_a_row_and_not_an_orphan() {
+        // Two make a group; one is a session. This is also what stops a
+        // hierarchy being invented out of a hyphen.
+        let f = Fixture::new("agents-alone")
+            .job("a", &named("PR-357"))
+            .job("b", &named("BOOKS"));
+        assert_eq!(laid_out(&snap(&f)), ["BOOKS", "PR-357"]);
+    }
+
+    #[test]
+    fn a_name_that_merely_ends_in_a_word_is_not_an_agent() {
+        // `BOOKS-LEG3` splits to itself, not to `BOOKS` — the tail has to be a
+        // number. Otherwise every hyphenated name in a repository would be
+        // filed under the first one alphabetically.
+        let f = Fixture::new("agents-legs")
+            .job("a", &named("BOOKS"))
+            .job("b", &named("BOOKS-LEG3"))
+            .job("c", &named("BOOKS-LEG4"));
+        assert_eq!(laid_out(&snap(&f)), ["BOOKS", "BOOKS-LEG3", "BOOKS-LEG4"]);
+    }
+
+    #[test]
+    fn a_family_is_placed_by_the_most_demanding_status_in_it() {
+        // A question does not stop being a question because an agent asked it,
+        // so the family rises — and the agent is still visible, directly under
+        // the lead it belongs to.
+        let f = Fixture::new("agents-waiting")
+            .job("a", &named("ALPHA"))
+            .job("b", r#"{"state":"done","name":"BOOKS","cwd":"/tmp/repo"}"#)
+            .job(
+                "c",
+                r#"{"state":"working","name":"BOOKS-2","cwd":"/tmp/repo",
+                    "needs":"answer: which one?"}"#,
+            );
+        assert_eq!(
+            laid_out(&snap(&f)),
+            ["BOOKS", "└ BOOKS-2", "ALPHA"],
+            "the family with the question comes first, lead included"
+        );
+    }
+
+    #[test]
+    fn the_order_holds_still_when_an_agent_changes_what_it_is_doing() {
+        // The flip keys walk this list. Rows that trade places while you are
+        // looking at them make those keys a lottery (M2.2), so nothing here
+        // may be ordered by anything that changes minute to minute.
+        let working = Fixture::new("agents-still-a")
+            .job("a", &named("BOOKS"))
+            .job("b", &named("BOOKS-2"))
+            .job("c", &named("BOOKS-3"));
+        let one_done = Fixture::new("agents-still-b")
+            .job("a", &named("BOOKS"))
+            .job(
+                "b",
+                r#"{"state":"done","name":"BOOKS-2","cwd":"/tmp/repo"}"#,
+            )
+            .job("c", &named("BOOKS-3"));
+        assert_eq!(laid_out(&snap(&working)), laid_out(&snap(&one_done)));
     }
 
     #[test]
