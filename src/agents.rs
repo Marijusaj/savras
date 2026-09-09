@@ -702,6 +702,7 @@ mod tests {
             }),
             created_at: None,
             model: None,
+            context: None,
             failed: false,
             deploy: None,
         };

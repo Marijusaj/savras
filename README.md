@@ -45,9 +45,13 @@ concluded.
   green, `CHECKS` while they run, `FAILED` when one has not, then `MERGED` or
   `CLOSED`. Read from the cache Claude Code keeps itself, so it costs no network
   and can be a minute stale.
-- **Context spent.** Measured against the model's real window — a `[1m]` model
-  is a million tokens, everything else 200k. It turns red past 85%, where
-  compaction is coming and it is worth wrapping up rather than being surprised.
+- **Context spent**, and it is the same number the session shows in its own
+  status line. Read from the last message of the session's transcript — input,
+  output and both halves of the cache — against the window of the model it is
+  really running on. It turns red past 85%, where compaction is coming and it
+  is worth wrapping up rather than being surprised. A session on another
+  machine shows nothing, because nothing over there counts tokens; one of your
+  own that has only just started says `0%`, which is true.
 - **How long it has been open**, counted from when the session started and not
   from when it last spoke. A session in its fourth hour goes amber and its
   eighth red, because that is usually a session that has lost the plot.

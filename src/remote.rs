@@ -216,6 +216,7 @@ fn read_one(host: &str, line: &str) -> Option<Job> {
         // no context percentage to be had, and no pull request either: this is
         // a session someone is driving by hand, not a job with children.
         model: None,
+        context: None,
         failed: false,
         deploy: None,
     })

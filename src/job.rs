@@ -71,9 +71,15 @@ pub struct Job {
     /// changes what you do — a session in its sixth hour has usually lost the
     /// plot, and the panel is the only thing in a position to say so.
     pub created_at: Option<DateTime<Utc>>,
-    /// The model it was started with, from `respawnFlags`. Only the context
-    /// window is taken from it, which is why it is kept as written.
+    /// The model it was started with, or the configured default when its own
+    /// flags do not say. Only the context window is taken from it, which is
+    /// why it is kept as written.
     pub model: Option<String>,
+    /// What the session is actually holding, from the last message in its
+    /// transcript. `None` when there is no transcript to read, and then
+    /// `tokens` from the state file is all there is — see [`context_used`] for
+    /// why that is a poor second.
+    pub context: Option<u64>,
     /// Finished badly. Claude Code has no such state today; this is here so
     /// that one it grows is shown rather than read as `done`.
     pub failed: bool,
@@ -239,15 +245,27 @@ impl Job {
 
     /// How much of the context window is spent, as a percentage.
     ///
-    /// `None` when there is nothing to divide: a session on another machine
-    /// reports no token count, and `0%` would read as a session that has
-    /// spent nothing rather than one nobody counted.
+    /// `None` only when nobody counted — a session on another machine reports
+    /// no tokens at all, and there is a real difference between "nothing was
+    /// counted" and "nothing has been spent". A session of your own that has
+    /// only just started says `0%`, which is true and is what a blank was
+    /// mistaken for.
     pub fn context_percent(&self) -> Option<u8> {
-        if self.tokens == 0 {
+        if self.machine.is_some() {
             return None;
         }
         let window = context_window(self.model.as_deref());
-        Some(((self.tokens.saturating_mul(100) / window).min(100)) as u8)
+        // Rounded, not truncated, so the row agrees with the status line the
+        // session draws for itself: 386,839 of a million is 39% in both
+        // places, and two numbers for one thing is worse than either.
+        let percent = (self.context().saturating_mul(100) + window / 2) / window;
+        Some(percent.min(100) as u8)
+    }
+
+    /// The tokens this session is holding, which is what the percentage and
+    /// the detail footer both mean.
+    pub fn context(&self) -> u64 {
+        self.context.unwrap_or(self.tokens)
     }
 
     /// Which machine this session is on, when it is not this one.
@@ -396,6 +414,99 @@ fn model_of(flags: &[String]) -> Option<String> {
     flags.get(at + 1).cloned()
 }
 
+/// The model a session runs on when its own flags do not say.
+///
+/// `respawnFlags` carries `--model` only when the session was *started* with
+/// one; without it Claude Code uses the configured default, so that is where
+/// the answer is. Getting this wrong is not a rounding error — a 1M session
+/// measured against 200k reads 39% when it is really 18%, which is the
+/// difference between "carry on" and "wrap this up".
+fn default_model(claude_dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(claude_dir.join("settings.json")).ok()?;
+    let raw: serde_json::Value = serde_json::from_str(&text).ok()?;
+    raw.get("model")?.as_str().map(str::to_string)
+}
+
+/// How much context a session is actually holding, read from its transcript.
+///
+/// **Not `tokens` from `state.json`.** That field counts something else: one
+/// session here reported 154k while it was really holding 387k, and another
+/// 78k while holding 185k — wrong in both directions, so no correction factor
+/// would have saved it. The number Claude Code shows in its own status line is
+/// the last assistant message's `usage`, and that is what this reads: input,
+/// output, and both halves of the cache, which together are the whole of what
+/// the model was sent.
+///
+/// The file is a transcript of everything and runs to megabytes, so it is read
+/// from the *end* — one bounded seek, not a walk. Sub-agent turns are skipped:
+/// a subagent has a context of its own, and the row is about the session.
+fn context_used(transcript: &Path) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(transcript).ok()?;
+    let size = file.metadata().ok()?.len();
+    // Enough for the last exchange in the transcripts seen so far. It stays
+    // bounded because this is read on every scan: a transcript whose last
+    // usage is further back than this simply falls back to the state file.
+    const TAIL: u64 = 256 * 1024;
+    file.seek(SeekFrom::Start(size.saturating_sub(TAIL))).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+
+    // Backwards: the last message is the one holding the most.
+    for line in text.lines().rev() {
+        // The first line of the window is usually a fragment, and a transcript
+        // being written to can end in one too.
+        let Ok(entry) = serde_json::from_str::<RawEntry>(line) else {
+            continue;
+        };
+        if entry.is_sidechain.unwrap_or(false) {
+            continue;
+        }
+        if let Some(usage) = entry.message.and_then(|m| m.usage) {
+            return Some(usage.held());
+        }
+    }
+    None
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawEntry {
+    message: Option<RawMessage>,
+    /// A subagent's turn, which has a context of its own.
+    is_sidechain: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawMessage {
+    usage: Option<RawUsage>,
+}
+
+/// What the model was sent, which is what "context used" means. Cached input
+/// counts: it is in the window whether it was re-sent or not.
+#[derive(Debug, Default, Deserialize)]
+struct RawUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+}
+
+impl RawUsage {
+    fn held(&self) -> u64 {
+        self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+    }
+}
+
 /// The last component of a path, as a name — what a directory is called, with
 /// nothing asked of any filesystem.
 fn named(cwd: &Path) -> String {
@@ -498,6 +609,9 @@ struct RawState {
     updated_at: Option<String>,
     created_at: Option<String>,
     respawn_flags: Option<Vec<String>>,
+    /// Where Claude Code is reading this session's transcript from, which is
+    /// also where the only honest token count lives.
+    link_scan_path: Option<String>,
     backend: Option<String>,
     daemon_short: Option<String>,
 }
@@ -521,6 +635,9 @@ pub fn load(jobs_dir: &Path) -> Result<Snapshot> {
     // Read once for the whole scan rather than once per job: it is one small
     // file, and every job asks it the same question.
     let prs = pr_cache(jobs_dir);
+    // Read once for the whole scan, like the cache above: every session that
+    // was started without `--model` asks the same question of the same file.
+    let fallback_model = jobs_dir.parent().and_then(default_model);
 
     let mut jobs = Vec::new();
     for entry in entries.flatten() {
@@ -528,7 +645,7 @@ pub fn load(jobs_dir: &Path) -> Result<Snapshot> {
             continue; // pins.json and friends
         }
         let short = entry.file_name().to_string_lossy().to_string();
-        if let Some(mut job) = read_one(&entry.path(), &short) {
+        if let Some(mut job) = read_one(&entry.path(), &short, fallback_model.as_deref()) {
             job.deploy = job
                 .links
                 .first()
@@ -614,7 +731,7 @@ fn parse(path: &Path) -> Option<RawState> {
     serde_json::from_str(&text).ok()
 }
 
-fn read_one(dir: &Path, short: &str) -> Option<Job> {
+fn read_one(dir: &Path, short: &str, fallback_model: Option<&str>) -> Option<Job> {
     let raw = read_state(&dir.join("state.json"))?;
 
     let done = raw.state.as_deref() == Some("done");
@@ -686,7 +803,20 @@ fn read_one(dir: &Path, short: &str) -> Option<Job> {
             .created_at
             .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
             .map(|d| d.with_timezone(&Utc)),
-        model: raw.respawn_flags.as_deref().and_then(model_of),
+        // Its own flag first, then whatever this machine is configured to
+        // use: a session started without `--model` runs on the default, and
+        // measuring it against 200k when the default is a million is how a
+        // session at 18% came to read 39%.
+        model: raw
+            .respawn_flags
+            .as_deref()
+            .and_then(model_of)
+            .or_else(|| fallback_model.map(str::to_string)),
+        context: raw
+            .link_scan_path
+            .as_deref()
+            .map(Path::new)
+            .and_then(context_used),
         failed: matches!(raw.state.as_deref(), Some("failed") | Some("error")),
         // Filled in by `load`, which holds the cache the answer comes from.
         deploy: None,
@@ -997,6 +1127,78 @@ mod tests {
         );
         let job = &load(&f.0).unwrap().jobs[0];
         assert_eq!(job.open_command(), ["claude", "--resume", "abc"]);
+    }
+
+    #[test]
+    fn the_context_is_read_from_the_transcript_not_from_the_state_file() {
+        // `tokens` in state.json is not what the session is holding. Measured
+        // on one real session it said 154k against a true 387k, and on another
+        // 78k against 185k — wrong in both directions, so no correction factor
+        // would have saved it. The truth is the last message's usage, which is
+        // also the number Claude Code puts in its own status line.
+        let dir = std::env::temp_dir().join(format!("savras-ctx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let transcript = dir.join("t.jsonl");
+        std::fs::write(
+            &transcript,
+            // A sub-agent's turn after the real one: it has a context of its
+            // own, and the row is about the session.
+            r#"{"message":{"usage":{"input_tokens":2,"output_tokens":78,"cache_creation_input_tokens":891,"cache_read_input_tokens":385868}}}
+{"isSidechain":true,"message":{"usage":{"input_tokens":10,"output_tokens":10,"cache_read_input_tokens":1000}}}
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(context_used(&transcript), Some(386_839));
+
+        let f = Fixture::new("job-context").job(
+            "aaa",
+            &format!(
+                r#"{{"state":"working","name":"BOOKS","tokens":154268,
+                     "respawnFlags":["--model","opus[1m]"],
+                     "linkScanPath":"{}"}}"#,
+                transcript.display()
+            ),
+        );
+        let job = &load(&f.0).unwrap().jobs[0];
+        assert_eq!(job.context(), 386_839, "the transcript wins");
+        assert_eq!(
+            job.context_percent(),
+            Some(39),
+            "387k of a million, as the session says"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_session_of_your_own_that_has_spent_nothing_says_so() {
+        // Blank was mistaken for a bug, and fairly: a local session always has
+        // a count, so nothing to show means nothing was counted — which is
+        // only ever true of a session on another machine.
+        let f = Fixture::new("job-zero").job("aaa", r#"{"state":"working","name":"NEW"}"#);
+        let job = &load(&f.0).unwrap().jobs[0];
+        assert_eq!(job.context_percent(), Some(0));
+    }
+
+    #[test]
+    fn the_window_falls_back_to_the_configured_model() {
+        // A session started without `--model` runs on the default. Measuring
+        // it against 200k when the default is a million is how a session at
+        // 18% came to read 39%.
+        assert_eq!(context_window(Some("opus[1m]")), 1_000_000);
+        assert_eq!(context_window(Some("opus")), 200_000);
+        assert_eq!(context_window(None), 200_000);
+
+        let claude = std::env::temp_dir().join(format!("savras-model-{}", std::process::id()));
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(
+            claude.join("settings.json"),
+            r#"{"theme":"dark","model":"opus[1m]"}"#,
+        )
+        .unwrap();
+        assert_eq!(default_model(&claude).as_deref(), Some("opus[1m]"));
+        std::fs::remove_dir_all(&claude).ok();
     }
 
     #[test]

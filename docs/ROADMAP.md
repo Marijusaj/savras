@@ -285,10 +285,9 @@ Five changes, all reading from files that were already on disk:
   either end and costs one small file read per scan. A failing check outranks
   every other true thing about an open pull request, because it is the only one
   asking for something.
-- **Context spent, as a percentage.** The denominator is the model in
-  `respawnFlags`: `[1m]` in the name is a million, everything else 200k. It
-  turns red past 85%, where compaction is coming. A session that reports no
-  tokens — anything on another machine — shows nothing rather than `0%`.
+- **Context spent, as a percentage.** Both halves of this were wrong on the
+  first cut and are corrected in M4.4 below. It turns red past 85%, where
+  compaction is coming.
 - **The age is counted from `createdAt`, not `updatedAt`.** Freshness was
   useless: a working session rewrites its timestamp every few seconds, so it
   read `8s` for as long as it ran. How long a session has been *open* is the
@@ -384,6 +383,49 @@ every heading of a machine with more than one repo, and that was raised as waste
 to trim — but the prefix is the thing that says where the work is, and it reads
 well. It stays. Revisit only if a real box with four repos on it makes the
 column unreadable, and then by shortening the host, never by dropping it.
+
+### M4.4 · The percentage was wrong, twice
+**Both halves of it — the number and what it was divided by.**
+
+```
+                       savras said   the session said
+  BOOKS-LEG3               15%            39%
+  X                        38%            18%
+```
+
+Wrong in *both directions*, which is the useful clue: no correction factor
+would have saved it, so the inputs were wrong rather than the arithmetic.
+
+**The numerator.** `tokens` in `state.json` is not what a session is holding —
+it reported 154k for a session holding 387k, and 78k for one holding 185k. What
+Claude Code puts in its own status line is the last assistant message's
+`usage`, and that is now what Savras reads: input, output and *both* halves of
+the cache, which together are the whole of what the model was sent. The
+transcript runs to megabytes, so it is read from the end — one bounded 256KB
+seek, not a walk — and sub-agent turns are skipped, since a subagent has a
+context of its own and the row is about the session. The detail footer reads
+the same number, so the two cannot disagree.
+
+**The denominator.** `respawnFlags` carries `--model` only when the session was
+*started* with one. Without it the session runs on the configured default, so
+`settings.json` is where the answer is. Missing that is what made `X` — a
+million-token session at 18% — read 39% against a 200k window it was never on.
+
+Rounded rather than truncated, so 386,839 of a million is 39% here and 39%
+there. Two numbers for one thing is worse than either.
+
+**And `0%` is a fact.** A percentage was hidden whenever the count was zero,
+which was meant to spare a remote session from claiming it had spent nothing.
+But a session of your own always has a count, so a blank there says "nobody
+counted" about a session that had merely just started. The rule is now the
+honest one: nothing to show only when there is nothing that counts — which is
+only ever a session on another machine.
+
+Found while testing: the pane and ping suites fail outright when run from
+inside a Savras pane, because the child inherits `SAVRAS_PANE` and refuses to
+nest. The marker is now taken off the test's child. The panel is where this
+work happens, so "run the tests from anywhere but here" was never a real
+option.
 
 ---
 

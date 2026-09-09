@@ -128,6 +128,10 @@ impl Panel {
         // The panel would otherwise wrap its escape sequence for tmux
         // passthrough, and this pty is not tmux.
         command.env_remove("TMUX");
+        // Run from inside a Savras pane — which is where this gets run — the
+        // child would inherit the marker and refuse to start at all. See the
+        // same removal in `tests/pane.rs`.
+        command.env_remove("SAVRAS_PANE");
         command.env("TERM", "xterm-256color");
         let child = pty.slave.spawn_command(command).unwrap();
         drop(pty.slave);

@@ -513,9 +513,11 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
     // A session on another machine reports no token count — the file it comes
     // from has none. "0 tokens" would read as a session that has spent
     // nothing, which is a different and untrue thing.
-    if job.tokens > 0 {
+    if job.context() > 0 {
         lines[0].spans.push(Span::styled(
-            format!("  {} tokens", thousands(job.tokens)),
+            // The same number the row's percentage is computed from, so the
+            // two cannot be read against each other and disagree.
+            format!("  {} tokens", thousands(job.context())),
             Style::default().fg(Color::DarkGray),
         ));
     }
@@ -1256,7 +1258,9 @@ mod tests {
         );
         let lines = render(&fixture, 60, 26);
         let row = lines.iter().find(|l| l.contains("BOOKS")).unwrap();
-        assert!(row.contains("7%"), "{row:?}");
+        // 76k of a million is 7.6%, and rounds the way the session's own
+        // status line rounds it.
+        assert!(row.contains("8%"), "{row:?}");
     }
 
     #[test]

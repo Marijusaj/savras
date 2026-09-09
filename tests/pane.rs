@@ -205,6 +205,12 @@ impl Pane {
         command.args(["--", "sh", "-c", script]);
         command.env("SAVRAS_TEST_DIR", &dir);
         command.env_remove("TMUX");
+        // Savras refuses to run inside its own pane, and these tests are run
+        // from one as often as not — the panel is where the work happens. The
+        // marker is inherited, so it has to be taken off the child or every
+        // one of these fails with "already running in this terminal", which
+        // says nothing about the code under test.
+        command.env_remove("SAVRAS_PANE");
         command.env("TERM", "xterm-256color");
         let child = pty.slave.spawn_command(command).unwrap();
         drop(pty.slave);
