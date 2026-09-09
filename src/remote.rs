@@ -210,6 +210,13 @@ fn read_one(host: &str, line: &str) -> Option<Job> {
             host: host.to_string(),
             tmux: raw.tmux,
         }),
+        created_at: millis(raw.started_at),
+        // The far side's file names no model and counts no tokens, so there is
+        // no context percentage to be had, and no pull request either: this is
+        // a session someone is driving by hand, not a job with children.
+        model: None,
+        failed: false,
+        deploy: None,
     })
 }
 
@@ -259,6 +266,8 @@ struct RawSession {
     status: Option<String>,
     updated_at: Option<i64>,
     status_updated_at: Option<i64>,
+    /// When the session was started. The far side's word for `createdAt`.
+    started_at: Option<i64>,
     /// tmux's own ids for where it is running: `session:@window.%pane`. Ids,
     /// not indexes, so it survives windows being reordered.
     tmux: Option<String>,

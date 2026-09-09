@@ -9,15 +9,15 @@ SAVRAS  ◦ live
 1 needs input · 2 working · 4 done
 
 Needs input
-✳ WO        answer: All five items are tier A and the freeze is…   29m
+✳ WO        WAITING  answer: All five items are tier…    31%  29m
 
 Working
-✳ PLAN      pipeline validated end-to-end; fixing grading…         1m
-✳ SAVRAS    scaffolding the read-only panel                         8s
+✳ PLAN      WORKING  pipeline validated end-to-end…      12%   4h
+✳ SAVRAS    WORKING  scaffolding the read-only panel      2%   8m
 
 Completed
-✳ SETTINGS  Triaged the five ASSISTANT_SETTINGS asks…             53s
-✳ ROADMAP   58 tier-A items on origin/main @ ba75f62…              3d
+✳ SETTINGS  DONE     Triaged the five ASSISTANT_SET…     44%  53m
+✳ ROADMAP   DONE                       MERGED #357      88%   3d
 ────────────────────────────────────────────────────────────────────
 ~/Code/autodad-assistant  11,547 tokens
 pr#357
@@ -28,6 +28,34 @@ claude --resume a876377e-dd14-4de9-9c67-de3aee690f5a
 Keep it open in a narrow pane on the left. Glance at it to see which sessions
 are waiting on you, which are still working, and what the finished ones
 concluded.
+
+### What a row says
+
+```
+▶ BOOKS-LEG3   WORKING    READY #411   38%   2h
+  └ name       └ what     └ its PR     └ ctx └ open for
+```
+
+- **The name** — in white, with no colour badge, for the session in the pane
+  beside the panel. That is the one your keystrokes are going to.
+- **One word.** `WAITING` wants you, `WORKING` does not, `DONE` is finished,
+  `FAILED` broke. It sits where the summary used to and answers the question you
+  actually scan ten rows for.
+- **The pull request**, if the session produced one: `READY` when its checks are
+  green, `CHECKS` while they run, `FAILED` when one has not, then `MERGED` or
+  `CLOSED`. Read from the cache Claude Code keeps itself, so it costs no network
+  and can be a minute stale.
+- **Context spent.** Measured against the model's real window — a `[1m]` model
+  is a million tokens, everything else 200k. It turns red past 85%, where
+  compaction is coming and it is worth wrapping up rather than being surprised.
+- **How long it has been open**, counted from when the session started and not
+  from when it last spoke. A session in its fourth hour goes amber and its
+  eighth red, because that is usually a session that has lost the plot.
+
+The summary takes whatever width is left over, so a wide panel shows it and a
+narrow one clips or drops it. That is the trade: what a session *is* survives at
+every width, and the sentence about what it is doing is the thing that gives
+way — it is still in the detail footer under the cursor.
 
 ## How it works
 
@@ -115,10 +143,10 @@ SAVRAS  ◦ live  ● 1  ▷ 2
 1 needs input · 3 working · 2 done
 
 Needs input
-● AGENT-2     approve Bash: M=/User…    #382 5m
-▶ PLAN        pipeline validated end…         1m   ← in the pane now
-▷ SAVRAS      scaffolding the panel            8s   ← open, running, behind
-✳ ROADMAP     58 tier-A items…                 3d   ← not open
+● AGENT-2     WAITING  approve Bash: M…  #382  9%  5m
+▶ PLAN        WORKING  pipeline valid…        12%  4h   ← in the pane now
+▷ SAVRAS      WORKING  scaffolding th…         2%  8m   ← open, running, behind
+✳ ROADMAP     DONE       MERGED #357         88%  3d   ← not open
 ```
 
 **`ctrl-w` and `ctrl-s` walk the panel's list**, back and forward, from either
@@ -273,15 +301,15 @@ SAVRAS  ◦ live  ● 1
 1 needs input · 3 working · 2 done
 
 savras
-● SAVRAS-4    approve Bash: cargo…     #382 5m
-▶ SAVRAS      grouping by repository…        2s
+● SAVRAS-4    WAITING  approve Bash: c…  #382  9%  5m
+▶ SAVRAS      WORKING  grouping by rep…        2%  2h
 
 autodad-assistant
-✳ BOOKS       Four of the 24 bookkeeping…   10m
-✳ NEXT        29 open tier-A items…         19h
+✳ BOOKS       WORKING  Four of the 24…        61% 10m
+✳ NEXT        DONE       MERGED #411          88% 19h
 
 processore
-✳ PLAN        Transcripts and the review…  #28 1d
+✳ PLAN        DONE        READY #28          25%  1d
 ```
 
 **A repository with a session waiting on you sorts to the top**, and inside a

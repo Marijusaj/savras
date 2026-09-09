@@ -260,56 +260,56 @@ feature. It was that **"output arrived" was wired directly to "repaint
 everything"**, and a remote view was simply the loudest thing ever plugged into
 it. A local session that prints fast did the same, more quietly.
 
+### M4 · Vitals
+**The session line says what a session *is*, not what it is doing.**
+
+```
+✳ BOOKS        DONE      MERGED #423  22% 1d
+✳ PLAN         DONE        READY #28  25% 1h
+▶ SAVRAS-6     WORKING  M4 vitals: …  13% 1d
+  └ name       └ what    └ its PR     └ ctx └ open for
+```
+
+Five changes, all reading from files that were already on disk:
+
+- **The session in the pane is named in white**, plain, where every other row
+  wears its colour badge. The `▶` said this already, but it is one glyph in a
+  column carrying four meanings, and the name is what the eye lands on.
+- **One word: `WORKING`, `WAITING`, `DONE`, `FAILED`.** `FAILED` has no source
+  in Claude Code today; it is wired to a `state` of `failed` or `error` so that
+  one it grows shows up rather than reading as `done`.
+- **The pull request says what it is doing** — `READY`, `CHECKS`, `FAILED`,
+  `MERGED`, `CLOSED`, or a bare number when nothing is known yet. `children[]`
+  on the job carries the link and `~/.claude/gh-pr-status-cache.json` carries
+  its state, keyed by the same href, so the join needs nothing invented at
+  either end and costs one small file read per scan. A failing check outranks
+  every other true thing about an open pull request, because it is the only one
+  asking for something.
+- **Context spent, as a percentage.** The denominator is the model in
+  `respawnFlags`: `[1m]` in the name is a million, everything else 200k. It
+  turns red past 85%, where compaction is coming. A session that reports no
+  tokens — anything on another machine — shows nothing rather than `0%`.
+- **The age is counted from `createdAt`, not `updatedAt`.** Freshness was
+  useless: a working session rewrites its timestamp every few seconds, so it
+  read `8s` for as long as it ran. How long a session has been *open* is the
+  number that changes what you do, and it warms to amber at four hours and red
+  at eight.
+
+The width question turned out to answer itself. The four columns are fixed and
+the summary takes what is left, so nothing is dropped by a rule — the sentence
+is simply the thing that gives way, and a 44-column panel shows every column
+plus as much of the summary as fits. Below that the ladder is: keep the name and
+the age, then the word, then the pull request, then the percentage. The sentence
+is the right one to lose because it is the only one still available elsewhere,
+in the detail footer under the cursor.
+
+`Job::machine_tag()` landed with it, so "which machine" is spelled in one place
+and read by three — the repository heading, the row, and the footer deciding
+whether a key would do anything.
+
 ---
 
 ## Next
-
-### M4 · Vitals  ← next build
-**Make the session line say more in the same width.**
-
-Today: name, summary, PR number, age. Wanted: name, a one-word status, how much
-context is spent, and where the change actually is.
-
-The line reads left to right in the order you ask the questions:
-
-```
-▶ BOOKS-LEG3   WORKING    #411 PR READY   38%   2h
-  └ name       └ status   └ deploy        └ ctx └ open for
-```
-
-- **The session in the pane is white.** Its name is the one you are typing
-  into, and the row for it should say so without being decoded — the coloured
-  name badge every row carries makes the `▶` marker easy to miss. White, plain,
-  against the colour the others wear.
-- **One-word status** — `WORKING`, `WAITING`, `DONE`, `FAILED`. Derived from
-  `state`, `needs` and `tempo` (`blocked` is already in the file). It replaces
-  the summary in the narrow layout: what the session is *doing* is a longer
-  answer than what it *is*, and the second one fits.
-- **Deploy status** — `PR READY` with the number, then `MERGED`, and `CHECKS` /
-  `ERROR` while they run. Two sources already on disk: `children[]` on the job
-  carries the pull request link, and `~/.claude/gh-pr-status-cache.json` carries
-  `{state, checks:{passed, failed, pending}, review}` for it, refreshed by
-  Claude Code itself. Anything beyond that — a real deployment state from Vercel
-  or Actions — needs the background poller from M2 of the original plan, and
-  should wait for it.
-- **Token percentage** — `tokens` is in `state.json`. The denominator comes from
-  the model in `respawnFlags` (`opus[1m]` is a 1M context), so `21k/1M` renders
-  as `2%`. A session at 85% is about to compact, which is worth seeing coming.
-- **Age from the session's start, not its last word.** Today the column is time
-  since `updatedAt`, which is freshness — a busy session reads `8s` forever. The
-  number wanted is how long this session has been open, `18m` then `2h`, because
-  a session open for six hours is a session that has lost the plot, and that is
-  the one fact the panel can tell you and the pane cannot.
-
-- **Which machine, if not this one.** A remote session is told apart today only
-  by its `claude-box:` heading prefix, and `machine` is now read in three
-  places — `repo()`, the row, and the footer's `v` arm. One accessor
-  (`Job::machine_tag()`) before a fourth appears, and if the tag earns a place
-  on the row it earns it inside this budget rather than beside it.
-
-The constraint is width. A 44-column sidebar cannot hold all five columns and a
-summary, so this build is as much about what to *drop* at each width as what to
-add.
 
 ### M4.1 · Geometry
 **Move and resize the panel from the keyboard, while it is running.**

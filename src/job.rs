@@ -62,6 +62,58 @@ pub struct Job {
     pub daemon_short: Option<String>,
     /// The machine it is running on, when that is not this one.
     pub machine: Option<Remote>,
+    /// When the session was started — not when it last said something.
+    ///
+    /// The panel's age column is measured from here. Freshness was the first
+    /// cut and it says almost nothing: a working session rewrites `updatedAt`
+    /// every few seconds, so it reads `8s` for as long as it runs, however
+    /// long that is. How long a session has been *open* is the number that
+    /// changes what you do — a session in its sixth hour has usually lost the
+    /// plot, and the panel is the only thing in a position to say so.
+    pub created_at: Option<DateTime<Utc>>,
+    /// The model it was started with, from `respawnFlags`. Only the context
+    /// window is taken from it, which is why it is kept as written.
+    pub model: Option<String>,
+    /// Finished badly. Claude Code has no such state today; this is here so
+    /// that one it grows is shown rather than read as `done`.
+    pub failed: bool,
+    /// What the pull request this session produced is doing, when it has one
+    /// and the cache knows about it.
+    pub deploy: Option<Deploy>,
+}
+
+/// What a session's pull request is doing.
+///
+/// Read from `~/.claude/gh-pr-status-cache.json`, which Claude Code writes and
+/// refreshes itself — so this costs one small file read per scan and no
+/// network at all. Anything richer than this (a real deployment, from Vercel
+/// or Actions) needs a poller of our own, and waits for one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Deploy {
+    /// Open, with nothing known about its checks.
+    Open,
+    /// Open, checks green.
+    Ready,
+    /// Open, checks still running.
+    Checks,
+    /// Open, a check has failed — the one state you want to see from here.
+    Broken,
+    Merged,
+    Closed,
+}
+
+impl Deploy {
+    /// The word the row shows, next to the number.
+    pub fn word(self) -> &'static str {
+        match self {
+            Deploy::Open => "PR",
+            Deploy::Ready => "READY",
+            Deploy::Checks => "CHECKS",
+            Deploy::Broken => "FAILED",
+            Deploy::Merged => "MERGED",
+            Deploy::Closed => "CLOSED",
+        }
+    }
 }
 
 /// A session on another machine, and how to get to it.
@@ -164,6 +216,44 @@ impl Job {
         self.open_command().join(" ")
     }
 
+    /// The one word the row leads with: what this session *is*, right now.
+    ///
+    /// It takes the place of the summary in a narrow panel. The summary says
+    /// what a session is doing, which is a sentence and needs the width of
+    /// one; this answers the question you actually scan a list of ten
+    /// sessions for — which of these wants me, which are still going, which
+    /// are finished — and answers it in seven columns.
+    pub fn word(&self) -> &'static str {
+        match (self.failed, self.status) {
+            (true, _) => "FAILED",
+            (_, Status::NeedsInput) => "WAITING",
+            (_, Status::Working) => "WORKING",
+            (_, Status::Done) => "DONE",
+        }
+    }
+
+    /// How much of the context window is spent, as a percentage.
+    ///
+    /// `None` when there is nothing to divide: a session on another machine
+    /// reports no token count, and `0%` would read as a session that has
+    /// spent nothing rather than one nobody counted.
+    pub fn context_percent(&self) -> Option<u8> {
+        if self.tokens == 0 {
+            return None;
+        }
+        let window = context_window(self.model.as_deref());
+        Some(((self.tokens.saturating_mul(100) / window).min(100)) as u8)
+    }
+
+    /// Which machine this session is on, when it is not this one.
+    ///
+    /// The one place that answer is spelled. Three things ask it — the
+    /// repository heading, the row, and the footer deciding whether a key
+    /// would do anything — and a fourth spelling of it is how they drift.
+    pub fn machine_tag(&self) -> Option<&str> {
+        self.machine.as_ref().map(|remote| remote.host.as_str())
+    }
+
     /// Whether this session is in a worktree rather than the repository's own
     /// checkout — worth saying, because the same repository name then covers
     /// two different working copies.
@@ -200,7 +290,11 @@ impl Job {
             // `in_worktree`, and once per job per repository on every refresh
             // — which is why one session on a remote box made the whole
             // terminal, not just Savras, feel slow.
-            Some(remote) => format!("{}:{}", remote.host, named(&self.cwd)),
+            Some(_) => format!(
+                "{}:{}",
+                self.machine_tag().unwrap_or_default(),
+                named(&self.cwd)
+            ),
             None => repo_of(&self.cwd),
         }
     }
@@ -227,6 +321,76 @@ impl Job {
 /// Walking up for a `.git` is what git itself does, and it is the only way to
 /// get the same answer from a session started three directories inside a
 /// checkout as from one started at its root.
+/// What Claude Code last knew about the pull requests it has seen.
+///
+/// Keyed by the same `href` the job's `children[]` carries, so the join needs
+/// nothing invented at either end. A missing or unreadable file is an empty
+/// map: the deploy column simply says less, which is what it should do when
+/// nothing has been looked up yet.
+fn pr_cache(jobs_dir: &Path) -> std::collections::HashMap<String, RawPr> {
+    let Some(claude) = jobs_dir.parent() else {
+        return Default::default();
+    };
+    let text = match std::fs::read_to_string(claude.join("gh-pr-status-cache.json")) {
+        Ok(text) => text,
+        Err(_) => return Default::default(),
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+/// One pull request as the cache has it.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct RawPr {
+    state: Option<String>,
+    checks: Option<RawChecks>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+struct RawChecks {
+    passed: u32,
+    failed: u32,
+    pending: u32,
+}
+
+/// The one word for a pull request in that state.
+///
+/// A failing check outranks everything else that is true of an open pull
+/// request, because it is the only one of these that is asking for something.
+fn deploy_of(pr: &RawPr) -> Deploy {
+    match pr.state.as_deref() {
+        Some("MERGED") => Deploy::Merged,
+        Some("CLOSED") => Deploy::Closed,
+        // OPEN, DRAFT, or a state this version has never heard of: what the
+        // checks say is more use than the word itself.
+        _ => match pr.checks {
+            Some(c) if c.failed > 0 => Deploy::Broken,
+            Some(c) if c.pending > 0 => Deploy::Checks,
+            Some(c) if c.passed > 0 => Deploy::Ready,
+            _ => Deploy::Open,
+        },
+    }
+}
+
+/// How many tokens the model this session runs on can hold.
+///
+/// Claude Code writes the model into `respawnFlags` as it was asked for, and
+/// the long-context variants say so in the name: `claude-opus-5[1m]` is a
+/// million. Everything else is 200k, which is the family's ordinary window —
+/// and an unknown model guessing 200k is the safe way round, since it makes a
+/// busy session look busier rather than emptier than it is.
+fn context_window(model: Option<&str>) -> u64 {
+    match model {
+        Some(name) if name.contains("[1m]") => 1_000_000,
+        _ => 200_000,
+    }
+}
+
+/// The model out of `respawnFlags`: the argument after `--model`.
+fn model_of(flags: &[String]) -> Option<String> {
+    let at = flags.iter().position(|f| f == "--model")?;
+    flags.get(at + 1).cloned()
+}
+
 /// The last component of a path, as a name — what a directory is called, with
 /// nothing asked of any filesystem.
 fn named(cwd: &Path) -> String {
@@ -327,6 +491,8 @@ struct RawState {
     session_id: Option<String>,
     tokens: Option<u64>,
     updated_at: Option<String>,
+    created_at: Option<String>,
+    respawn_flags: Option<Vec<String>>,
     backend: Option<String>,
     daemon_short: Option<String>,
 }
@@ -347,13 +513,22 @@ pub fn load(jobs_dir: &Path) -> Result<Snapshot> {
         Err(e) => return Err(e).with_context(|| format!("reading {}", jobs_dir.display())),
     };
 
+    // Read once for the whole scan rather than once per job: it is one small
+    // file, and every job asks it the same question.
+    let prs = pr_cache(jobs_dir);
+
     let mut jobs = Vec::new();
     for entry in entries.flatten() {
         if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             continue; // pins.json and friends
         }
         let short = entry.file_name().to_string_lossy().to_string();
-        if let Some(job) = read_one(&entry.path(), &short) {
+        if let Some(mut job) = read_one(&entry.path(), &short) {
+            job.deploy = job
+                .links
+                .first()
+                .and_then(|link| prs.get(&link.href))
+                .map(deploy_of);
             jobs.push(job);
         }
     }
@@ -502,6 +677,14 @@ fn read_one(dir: &Path, short: &str) -> Option<Job> {
         machine: None,
         backend: raw.backend,
         daemon_short: raw.daemon_short,
+        created_at: raw
+            .created_at
+            .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+            .map(|d| d.with_timezone(&Utc)),
+        model: raw.respawn_flags.as_deref().and_then(model_of),
+        failed: matches!(raw.state.as_deref(), Some("failed") | Some("error")),
+        // Filled in by `load`, which holds the cache the answer comes from.
+        deploy: None,
     })
 }
 

@@ -512,6 +512,10 @@ mod tests {
                 host: "claude-box".to_string(),
                 tmux: Some("a:@1.%1".to_string()),
             }),
+            created_at: None,
+            model: None,
+            failed: false,
+            deploy: None,
         };
         let short = job.short.clone();
         app.set_remote("claude-box".to_string(), vec![job]);

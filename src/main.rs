@@ -477,10 +477,13 @@ fn print_once(jobs_dir: &std::path::Path) -> Result<()> {
         }
         println!("{}", status.heading());
         for j in group {
+            // The same age the panel shows: how long the session has been
+            // open, not how recently it spoke. See `Job::created_at`.
             println!(
-                "  {:<12} {:>4}  {}",
+                "  {:<12} {:<7} {:>4}  {}",
                 j.name,
-                job::age(j.updated_at, now),
+                j.word(),
+                job::age(j.created_at.or(j.updated_at), now),
                 j.summary
             );
         }

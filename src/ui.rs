@@ -9,7 +9,7 @@ use ratatui::{
 
 use crate::agents;
 use crate::app::{App, Row, Tab};
-use crate::job::{age, Job, Status};
+use crate::job::{age, Deploy, Job, Status};
 
 /// Keep the summary as long as this many columns are left for it. Claude
 /// Code's own panel keeps a truncated summary in a narrow pane, and a sidebar
@@ -271,15 +271,11 @@ fn job_line(
     name_width: u16,
     total_width: u16,
 ) -> Line<'static> {
-    let age = age(job.updated_at, Utc::now());
+    // Measured from the session's start, not its last word: see `created_at`.
+    // A session with no start recorded falls back to freshness rather than
+    // showing nothing, since the older files have only that.
+    let age = age(job.created_at.or(job.updated_at), Utc::now());
     let color = badge_color(job);
-    // Claude Code shows the pull request a session produced; it is often the
-    // one thing you want from a finished job.
-    let link = job
-        .links
-        .first()
-        .map(|l| format!(" #{} ", l.id))
-        .unwrap_or_default();
 
     // The marker sits where the status star does, so it costs no width in a
     // panel that has none to spare, and a filled dot against a star is a
@@ -316,40 +312,159 @@ fn job_line(
         )
     };
 
-    let mut spans = vec![
-        mark,
+    // The session you are typing into is named in white, plain, against the
+    // colour every other row wears. The `▶` says the same thing, but it is one
+    // glyph in a column that already carries four meanings, and the name is
+    // what the eye lands on.
+    let name = if tab == Tab::Front {
+        Span::styled(
+            pad(&job.name, name_width as usize),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
         Span::styled(
             pad(&job.name, name_width as usize),
             Style::default()
                 .fg(Color::Black)
                 .bg(color)
                 .add_modifier(Modifier::BOLD),
-        ),
-    ];
+        )
+    };
+    let mut spans = vec![mark, name];
 
-    // Columns already spent: bullet + name + gap + link + age.
-    let fixed = 2 + name_width + 2 + link.chars().count() as u16 + 4;
-    let room = (total_width.saturating_sub(fixed)) as usize;
-    if room >= MIN_SUMMARY {
+    // What is left after the mark and the name, spent in the order these
+    // things are worth: how long it has been open, what it is, what its pull
+    // request is doing, how much context is gone — and only then the sentence,
+    // which is the one that can be said elsewhere. A 44-column panel holds all
+    // of them and no summary; a wide one holds the summary as well; a very
+    // narrow one keeps the name and the age and gives up the rest in that
+    // order, rather than truncating everything into uselessness.
+    let mut room = (total_width.saturating_sub(2 + name_width)) as usize;
+    let mut spend = |cost: usize| -> bool {
+        let can = room >= cost;
+        if can {
+            room -= cost;
+        }
+        can
+    };
+
+    let age_shown = spend(1 + age.chars().count());
+    let word_shown = spend(1 + WORD_WIDTH);
+    let deploy = deploy_text(job);
+    let deploy_shown = !deploy.is_empty() && spend(1 + deploy.chars().count());
+    let percent = job.context_percent();
+    let ctx_shown = percent.is_some() && spend(1 + CTX_WIDTH);
+
+    if word_shown {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            pad(job.word(), WORD_WIDTH),
+            Style::default()
+                .fg(word_color(job))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    if room >= MIN_SUMMARY + 2 {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
-            truncate(&job.summary, room),
+            truncate(&job.summary, room - 2),
             Style::default().fg(Color::Gray),
         ));
     }
 
-    // Right-align the link and age against the pane edge.
+    // Everything from here is right-aligned against the pane edge.
     let used: usize = spans.iter().map(|s| s.content.chars().count()).sum();
-    let tail = link.chars().count() + age.chars().count();
+    let tail = usize::from(deploy_shown) * (1 + deploy.chars().count())
+        + usize::from(ctx_shown) * (1 + CTX_WIDTH)
+        + usize::from(age_shown) * (1 + age.chars().count());
     spans.push(Span::raw(
         " ".repeat((total_width as usize).saturating_sub(used + tail)),
     ));
-    if !link.is_empty() {
-        spans.push(Span::styled(link, Style::default().fg(Color::Indexed(141))));
+
+    if deploy_shown {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            deploy,
+            Style::default().fg(deploy_color(job.deploy)),
+        ));
     }
-    spans.push(Span::styled(age, Style::default().fg(Color::DarkGray)));
+    if let (true, Some(percent)) = (ctx_shown, percent) {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("{percent:>3}%"),
+            // Past about here a session is close to compacting, which is worth
+            // seeing before it happens rather than after.
+            Style::default().fg(if percent >= 85 {
+                Color::Indexed(203)
+            } else {
+                Color::DarkGray
+            }),
+        ));
+    }
+    if age_shown {
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(age, Style::default().fg(age_color(job))));
+    }
 
     Line::from(spans)
+}
+
+/// `WORKING` is the longest of the four, and they read as a column only if
+/// they are one.
+const WORD_WIDTH: usize = 7;
+/// `100%`.
+const CTX_WIDTH: usize = 4;
+
+/// The pull request, said in the width a sidebar has: the word and the number.
+fn deploy_text(job: &Job) -> String {
+    let Some(link) = job.links.first() else {
+        return String::new();
+    };
+    match job.deploy {
+        // A pull request nothing is known about is still worth its number —
+        // that is what the row said before any of this existed.
+        None => format!("#{}", link.id),
+        Some(deploy) => format!("{} #{}", deploy.word(), link.id),
+    }
+}
+
+fn deploy_color(deploy: Option<Deploy>) -> Color {
+    match deploy {
+        Some(Deploy::Broken) => Color::Indexed(203),
+        Some(Deploy::Ready) => Color::Indexed(114),
+        Some(Deploy::Checks) => Color::Indexed(179),
+        Some(Deploy::Merged) => Color::Indexed(141),
+        Some(Deploy::Closed) => Color::DarkGray,
+        Some(Deploy::Open) | None => Color::Indexed(141),
+    }
+}
+
+fn word_color(job: &Job) -> Color {
+    if job.failed {
+        return Color::Indexed(203);
+    }
+    match job.status {
+        Status::NeedsInput => Color::Indexed(179),
+        Status::Working => Color::Indexed(117),
+        Status::Done => Color::Indexed(114),
+    }
+}
+
+/// A session open for hours is the thing the age column exists to say, so it
+/// stops being grey once it is worth remarking on.
+fn age_color(job: &Job) -> Color {
+    let hours = job
+        .created_at
+        .map(|start| (Utc::now() - start).num_hours())
+        .unwrap_or(0);
+    match hours {
+        h if h >= 8 => Color::Indexed(203),
+        h if h >= 4 => Color::Indexed(179),
+        _ => Color::DarkGray,
+    }
 }
 
 fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
@@ -453,7 +568,8 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
                 // you press to no effect reads as a broken key.
                 match (
                     area.width >= ROOMY,
-                    app.selected_job().is_some_and(|job| job.machine.is_some()),
+                    app.selected_job()
+                        .is_some_and(|job| job.machine_tag().is_some()),
                 ) {
                     (true, false) => "enter open · n tab · d delete · x close · a agent · Q quit",
                     (true, true) => "enter open · n tab · d delete · x close · Q quit",
@@ -870,9 +986,173 @@ mod tests {
             .find(|l| l.contains("ROADMAP"))
             .expect("ROADMAP row");
         assert!(
-            row.contains("ROADMAP  compiling the plan"),
-            "name column collided with the summary: {row:?}"
+            row.contains("ROADMAP WORKING  compiling the plan"),
+            "name column collided with what follows it: {row:?}"
         );
+    }
+
+    #[test]
+    fn the_session_you_are_typing_into_is_named_in_white() {
+        // Every other row wears a colour badge, so the one you are in is the
+        // one *without* it. The `▶` says the same thing, but it is one glyph
+        // in a column already carrying four meanings, and the name is what
+        // the eye lands on.
+        let fixture = three_jobs();
+        let mut app = App::new(fixture.0.clone());
+        app.set_tabs(Front::Session("bbb".into()), vec!["bbb".into()], vec![]);
+        let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+
+        // Find the row each name starts on, and look at the name's first cell.
+        let cell_of = |name: &str| {
+            for y in 0..24u16 {
+                let line: String = (0..60)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect();
+                if let Some(at) = line.find(name) {
+                    return buffer.cell((at as u16, y)).unwrap().clone();
+                }
+            }
+            panic!("no row for {name}");
+        };
+
+        let front = cell_of("ROADMAP"); // "bbb", the one in the pane
+        assert_eq!(front.fg, Color::White, "the name should be plain white");
+        assert_eq!(front.bg, Color::Reset, "and wear no badge");
+
+        let other = cell_of("ASK");
+        assert_ne!(other.bg, Color::Reset, "every other name keeps its badge");
+    }
+
+    #[test]
+    fn the_row_says_what_the_session_is_in_one_word() {
+        let lines = render(&three_jobs(), 80, 24);
+        let word = |name: &str| {
+            let row = lines.iter().find(|l| l.contains(name)).expect(name).clone();
+            row
+        };
+        assert!(word("ROADMAP").contains("WORKING"), "{}", word("ROADMAP"));
+        assert!(word("ASK").contains("WAITING"), "{}", word("ASK"));
+        assert!(word("FIN").contains("DONE"), "{}", word("FIN"));
+    }
+
+    #[test]
+    fn the_columns_are_kept_and_the_sentence_is_what_gives_way() {
+        // 44 columns is the default sidebar. The four columns are fixed and
+        // the summary takes whatever is left, so what a session *is* survives
+        // at any width and the account of what it is doing is clipped — the
+        // trade this build makes, and the reverse of the old row's.
+        let fixture = Fixture::new("ui-vitals-narrow").job(
+            "aaa",
+            r#"{"state":"working","name":"BOOKS","tokens":76000,
+                "respawnFlags":["--model","claude-opus-5"],
+                "children":[{"id":"411","kind":"pr","href":"https://x/pull/411"}],
+                "detail":"a sentence far too long for a sidebar to hold"}"#,
+        );
+        let lines = render(&fixture, 44, 26);
+        let row = lines.iter().find(|l| l.contains("BOOKS")).unwrap();
+
+        assert!(row.contains("WORKING"), "{row:?}");
+        assert!(row.contains("#411"), "{row:?}");
+        assert!(row.contains("38%"), "76k of a 200k window: {row:?}");
+        assert!(row.contains('…'), "the summary should be clipped: {row:?}");
+        assert!(!row.contains("to hold"), "clipped, not fitted: {row:?}");
+        assert_eq!(row.chars().count(), 44);
+    }
+
+    #[test]
+    fn a_long_name_costs_the_summary_rather_than_a_column() {
+        // The name column is as wide as the longest name, so a wide name is
+        // exactly the case where something has to go. It is the sentence.
+        let fixture = Fixture::new("ui-vitals-wide-name").job(
+            "aaa",
+            r#"{"state":"working","name":"BOOKS-LEG-33","tokens":76000,
+                "children":[{"id":"411","kind":"pr","href":"https://x/pull/411"}],
+                "detail":"running the matcher tests"}"#,
+        );
+        let lines = render(&fixture, 44, 26);
+        let row = lines.iter().find(|l| l.contains("BOOKS")).unwrap();
+
+        assert!(row.contains("WORKING"), "{row:?}");
+        assert!(row.contains("#411"), "{row:?}");
+        assert!(
+            !row.contains("matcher"),
+            "the summary should be gone: {row:?}"
+        );
+        assert_eq!(row.chars().count(), 44);
+    }
+
+    #[test]
+    fn a_pull_request_says_what_it_is_doing_when_the_cache_knows() {
+        // Claude Code refreshes this file itself, so the column costs one
+        // small read per scan and no network at all.
+        let fixture = Fixture::new("ui-vitals-pr")
+            .job(
+                "aaa",
+                r#"{"state":"done","name":"BOOKS",
+                    "children":[{"id":"411","kind":"pr","href":"https://x/pull/411"}]}"#,
+            )
+            .job(
+                "bbb",
+                r#"{"state":"done","name":"LEDGER",
+                    "children":[{"id":"412","kind":"pr","href":"https://x/pull/412"}]}"#,
+            )
+            .job(
+                "ccc",
+                r#"{"state":"done","name":"COSTS",
+                    "children":[{"id":"413","kind":"pr","href":"https://x/pull/413"}]}"#,
+            )
+            .pr_cache(
+                r#"{"https://x/pull/411":{"state":"OPEN","checks":{"passed":5,"failed":0,"pending":0}},
+                    "https://x/pull/412":{"state":"MERGED","checks":{"passed":5,"failed":0,"pending":0}},
+                    "https://x/pull/413":{"state":"OPEN","checks":{"passed":2,"failed":1,"pending":0}}}"#,
+            );
+        let lines = render(&fixture, 70, 26);
+        let row = |name: &str| lines.iter().find(|l| l.contains(name)).expect(name).clone();
+
+        assert!(row("BOOKS").contains("READY #411"), "{}", row("BOOKS"));
+        assert!(row("LEDGER").contains("MERGED #412"), "{}", row("LEDGER"));
+        // A failing check outranks everything else true of an open pull
+        // request: it is the only one of these asking for something.
+        assert!(row("COSTS").contains("FAILED #413"), "{}", row("COSTS"));
+    }
+
+    #[test]
+    fn the_age_is_counted_from_the_start_not_the_last_word() {
+        // A working session rewrites `updatedAt` every few seconds, so
+        // freshness reads `8s` for as long as it runs, however long that is.
+        // How long it has been *open* is the number that changes what you do.
+        let now = Utc::now();
+        let started = now - chrono::Duration::hours(3);
+        let fixture = Fixture::new("ui-vitals-age").job(
+            "aaa",
+            &format!(
+                r#"{{"state":"working","name":"BOOKS",
+                     "createdAt":"{}","updatedAt":"{}"}}"#,
+                started.to_rfc3339(),
+                now.to_rfc3339()
+            ),
+        );
+        let lines = render(&fixture, 60, 26);
+        let row = lines.iter().find(|l| l.contains("BOOKS")).unwrap();
+
+        assert!(row.trim_end().ends_with("3h"), "{row:?}");
+    }
+
+    #[test]
+    fn a_million_token_model_is_measured_against_a_million() {
+        // The denominator is the model, and `[1m]` in its name is what says
+        // so. Reading the same 76k against 200k would cry compaction at a
+        // session that has spent under a tenth of its context.
+        let fixture = Fixture::new("ui-vitals-1m").job(
+            "aaa",
+            r#"{"state":"working","name":"BOOKS","tokens":76000,
+                "respawnFlags":["--model","claude-opus-5[1m]"]}"#,
+        );
+        let lines = render(&fixture, 60, 26);
+        let row = lines.iter().find(|l| l.contains("BOOKS")).unwrap();
+        assert!(row.contains("7%"), "{row:?}");
     }
 
     #[test]
