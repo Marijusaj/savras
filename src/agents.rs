@@ -217,6 +217,42 @@ pub fn start(name: &str, briefing: &str, cwd: &Path) -> Result<String> {
 /// `~/.claude/` itself. Which is the point: the daemon knows what a session is
 /// and what deleting one entails, and a directory removed behind its back
 /// leaves it believing otherwise.
+/// Stop a session on another machine.
+///
+/// There is no daemon over there to ask — a box you ssh into runs `claude` as
+/// an ordinary process — so the session is stopped by signalling it, with the
+/// same `TERM` that closing its terminal would send. Nothing is removed: the
+/// far side leaves `sessions/<pid>.json` behind whatever happens, and the
+/// watcher already refuses to show a pid that no longer answers `kill -0`, so
+/// the row goes when the process does and not before.
+///
+/// This is the read-only rule bending a second time, and in the same shape as
+/// the first: Savras still writes nothing and still speaks no private
+/// protocol. It signals a process, which is what `d` already does here.
+pub fn stop_remote(host: &str, pid: u32) -> Result<String> {
+    let out = Command::new("ssh")
+        .args(["-o", "BatchMode=yes"])
+        .arg(host)
+        .arg("kill")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("running ssh {host} kill {pid}"))?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        let why = why.trim();
+        anyhow::bail!(
+            "could not stop it on {host}{}",
+            if why.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", first_line(why))
+            }
+        );
+    }
+    Ok(String::new())
+}
+
 pub fn delete(short: &str) -> Result<String> {
     let _ = Command::new("claude")
         .arg("stop")
@@ -511,6 +547,7 @@ mod tests {
             machine: Some(crate::job::Remote {
                 host: "claude-box".to_string(),
                 tmux: Some("a:@1.%1".to_string()),
+                pid: Some(4242),
             }),
             created_at: None,
             model: None,

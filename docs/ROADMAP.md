@@ -307,28 +307,45 @@ in the detail footer under the cursor.
 and read by three — the repository heading, the row, and the footer deciding
 whether a key would do anything.
 
+### M4.1 · Geometry, and two things the panel knew but was not using
+**`<` `>` move the divider, `[` `]` move the panel.** Four columns a press,
+with the panel focused — single letters are free there because the pane is not
+listening. `--side` and `--width` fed a layout recomputed every frame, so they
+were already variables; what made it more than a variable is that the working
+pane is a real pty, and one whose width changes must be *told* or the program
+inside keeps drawing to the old size. Every open pane is resized, which is the
+`SIGWINCH` that makes each one repaint against the truth. The floor is the same
+12 columns `--width` enforces, and the ceiling leaves the pane 20 — a panel
+that can eat the terminal is a way to lose your session behind a list of
+sessions. Deciding is separate from doing, so the arithmetic is tested without
+a pty.
+
+**`ctrl-t` starts in the directory of the session you are on.** It ran in
+Savras's own start directory, so a shell opened beside `PLAN` needed a `cd` to
+`PLAN`'s repository every time — the tell being that the panel knew the answer
+and was not using it. The session in the pane decides it, the row under the
+cursor when there is none, and Savras's directory when there is no session in
+play. A session on another machine is skipped rather than used: its directory
+is on that machine.
+
+**`d` reaches a session on another machine.** It ran `claude stop` and
+`claude rm` against an id nothing local has ever heard of, so it silently did
+nothing at all and the row could not be got rid of. There is no daemon on a box
+you ssh into — a session there is an ordinary process — so `d` now signals it,
+with the `TERM` that closing its terminal would send, and the row goes when the
+process stops answering `kill -0`. Nothing is deleted over there: the far side
+leaves `sessions/<pid>.json` behind whatever happens, and the watcher already
+refuses to show a pid that is gone. The question says which act it is —
+*stop X on claude-box* rather than *delete X for good* — because they are not
+the same promise.
+
+This is the read-only rule bending a second time, in the same shape as the
+first: Savras still writes nothing and still speaks no private protocol. It
+signals a process, which is what `d` already did here.
+
 ---
 
 ## Next
-
-### M4.1 · Geometry
-**Move and resize the panel from the keyboard, while it is running.**
-
-`--side left|right` and `--width <cols>` are start-up flags today; the layout
-they feed is one `Layout::horizontal` in the host, recomputed every draw. So
-both are already variables — they are simply set once. Wanted: a key that
-widens, a key that narrows, and a key that flips the panel to the other side,
-each taking effect on the next frame.
-
-What makes it more than a variable: the working pane is a real pty, and a pty
-that changes width must be told (`SIGWINCH` and a resize on the `portable-pty`
-handle) or the program inside keeps drawing to the old size. Flipping sides is
-the same resize with the columns swapped.
-
-Open: which keys. The chord budget is spent — `ctrl-g`, `ctrl-l`, `ctrl-w`/`s`
-— and M2.2 established that Command never reaches us. Likely a mode: `ctrl-g`
-to the panel, then plain `<`/`>` and `[`/`]` while the panel has focus, where
-single letters are free because the pane is not listening.
 
 ### M4.2 · Under the lead
 **Agents sit beneath the session that started them, and look subordinate.**

@@ -209,6 +209,7 @@ fn read_one(host: &str, line: &str) -> Option<Job> {
         machine: Some(Remote {
             host: host.to_string(),
             tmux: raw.tmux,
+            pid: Some(pid),
         }),
         created_at: millis(raw.started_at),
         // The far side's file names no model and counts no tokens, so there is

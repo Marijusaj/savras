@@ -101,6 +101,13 @@ svr --open shell   # start on a prompt instead of a session
 svr solo           # just the panel, no working pane, for its own tab
 ```
 
+Both of those are also keys, so you can settle it by looking rather than by
+guessing at a number: with the panel focused, **`<` and `>` move the divider**
+four columns at a time and **`[` and `]` put the panel on the left or the
+right**. The pane beside it is a real pseudo-terminal, so it is told about the
+new size and the program inside repaints itself against it. The panel will not
+narrow past 12 columns or grow until the pane stops being usable.
+
 No tmux, no configuration, nothing else to install. Savras hosts the working
 pane itself: it opens a pseudo-terminal, runs your command in it, and draws its
 screen beside the panel. Keystrokes are forwarded to the child as raw bytes
@@ -160,7 +167,11 @@ cursor moves with you so the highlight always says where you are.
 
 **`ctrl-t` opens a tab of your own**, and `n` in the panel does the same. It
 runs what Savras was started with — your shell for plain `svr`, whatever
-followed `--` otherwise — in the directory Savras was started in. Your terminal
+followed `--` otherwise — **in the directory of the session you are on**: a
+shell opened beside `PLAN` starts in `PLAN`'s repository, because that is what
+you were about to `cd` to. The session in the pane decides it, or the row under
+the cursor when there is none, and Savras's own directory when there is no
+session in play at all. Your terminal
 keeps `cmd-t` for itself and always will, so the new tab it gives you is the
 wrong one: a window *beside* Savras, without the panel and without the sessions
 you have open. This is the same gesture, one level in.
@@ -608,6 +619,8 @@ Press keys to see what this terminal sends. Ctrl-C to stop.
 | `x` | close the selected tab | — |
 | `d` | delete the selected session, after asking | — |
 | `a` | start a parallel agent under its lead | start a parallel agent under its lead |
+| `<` / `>` | narrow / widen the panel | narrow / widen the panel |
+| `[` / `]` | put the panel left / right | put the panel left / right |
 | `q` / `Esc` | back to your work | quit |
 | `Q` | quit Savras, after asking | quit |
 | `ctrl-l` | paint the screen again | paint the screen again |

@@ -245,11 +245,32 @@ const DIVIDER: u16 = 1;
 const MOUSE_OFF: &str = "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l";
 
 /// Which side of the terminal the panel sits on.
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Side {
     Left,
     Right,
 }
+
+/// What a geometry key does to the panel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shape {
+    Narrower,
+    Wider,
+    /// Put the panel on this side, if it is not there already.
+    Put(Side),
+}
+
+/// How much one press moves the divider.
+///
+/// Four rather than one: the panel's columns are worth about that much each —
+/// a name grows, the summary gets a word — and a key you must hold down to
+/// see anything is a key that feels broken.
+const STEP: u16 = 4;
+/// The panel never narrows below this. It is the same floor `--width` enforces,
+/// and below it the rows say nothing worth reading.
+const MIN_PANEL: u16 = 12;
+/// Nor does it grow so far that the pane beside it stops being usable.
+const MIN_WORK: u16 = 20;
 
 #[derive(PartialEq, Clone, Copy)]
 enum Focus {
@@ -261,7 +282,7 @@ enum Focus {
 /// when that program exits: leaving the shell you started with closes Savras,
 /// but a session you opened from the panel exiting must not take the panel with
 /// it — that is how you lose both the panel and the reason it failed.
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Origin {
     Initial,
     Opened,
@@ -288,6 +309,8 @@ enum Action {
     CloseSelected,
     /// Start a parallel agent under the selected session's lead.
     AddAgent,
+    /// Change the panel's shape: its width, or which side it is on.
+    Reshape(Shape),
     /// Open another pane of your own, running what Savras was started with.
     NewTab,
     /// `s` in the panel: group by repository instead of status, or back.
@@ -306,7 +329,15 @@ enum Action {
 #[derive(Clone)]
 enum Confirm {
     Quit,
-    Delete { short: String, name: String },
+    Delete {
+        short: String,
+        name: String,
+        /// Where it lives, when that is not here: the host to reach and the
+        /// process id over there. Taken when the question is asked, from the
+        /// row it is about, so answering cannot act on a different session
+        /// than the one named.
+        on: Option<(String, u32)>,
+    },
 }
 
 impl Confirm {
@@ -315,6 +346,16 @@ impl Confirm {
     fn question(&self) -> String {
         match self {
             Confirm::Quit => "Q again to quit Savras · any key stays".to_string(),
+            // Said differently for a session on another machine, because it is
+            // a different act: nothing over there is deleted, the process is
+            // stopped, and the row goes when it does.
+            Confirm::Delete {
+                name,
+                on: Some((host, _)),
+                ..
+            } => {
+                format!("d again to stop {name} on {host} · any key leaves it")
+            }
             Confirm::Delete { name, .. } => {
                 format!("d again to delete {name} for good · any key keeps it")
             }
@@ -934,17 +975,22 @@ fn event_loop(
                             confirming = Some(Confirm::Delete {
                                 short: job.short.clone(),
                                 name: job.name.clone(),
+                                on: job
+                                    .machine
+                                    .as_ref()
+                                    .and_then(|remote| Some((remote.host.clone(), remote.pid?))),
                             });
                         }
                     }
                     Action::Delete => {
-                        if let Some(Confirm::Delete { short, name }) = &was_confirming {
+                        if let Some(Confirm::Delete { short, name, on }) = &was_confirming {
                             delete_session(
                                 &mut session,
                                 &mut app,
                                 &starting,
                                 short.clone(),
                                 name.clone(),
+                                on.clone(),
                             );
                         }
                     }
@@ -979,6 +1025,16 @@ fn event_loop(
                         }
                     }
                     Action::AddAgent => crate::agents::add(&mut app, &starting),
+                    Action::Reshape(how) => {
+                        // A key at the end of its travel says so rather than
+                        // doing nothing silently.
+                        // Every key redraws below; the clear is because the
+                        // divider has moved and the columns it used to sit in
+                        // are now the pane's.
+                        if reshape(&mut session, how)? {
+                            terminal.clear()?;
+                        }
+                    }
                     Action::Regroup => {
                         // Say which it is now: the headings change, but the
                         // panel may be showing one repository and one status
@@ -989,7 +1045,7 @@ fn event_loop(
                             GroupBy::Status => "grouped by status".to_string(),
                         });
                     }
-                    Action::NewTab => match new_tab(&mut session) {
+                    Action::NewTab => match new_tab(&mut session, &app) {
                         Ok(()) => {
                             focus = Focus::Work;
                             terminal.clear()?;
@@ -1223,9 +1279,9 @@ fn jog_new_panes(session: &mut Session) -> bool {
 /// and whatever followed `--` otherwise — in the directory Savras was started
 /// in. `Origin::Opened`, so leaving it closes the tab rather than Savras: only
 /// the shell you *arrived* in still takes the panel with it.
-fn new_tab(session: &mut Session) -> Result<()> {
+fn new_tab(session: &mut Session, app: &App) -> Result<()> {
     let (cols, rows) = session.work_size();
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let cwd = new_tab_cwd(session.tabs.short(), app);
     let command = session.command.clone();
     // Spawn before touching the tab list, so a failure changes nothing.
     let work = Work::spawn(&command, Some(&cwd), cols, rows, Origin::Opened)?;
@@ -1239,6 +1295,37 @@ fn new_tab(session: &mut Session) -> Result<()> {
         opened: true,
     });
     Ok(())
+}
+
+/// Where a new tab of your own starts: the directory of the session you are
+/// on.
+///
+/// A shell opened beside `PLAN` is nearly always wanted *in* `PLAN`'s
+/// repository — that is what you were about to type. Savras's own start
+/// directory was the first answer and it made you `cd` every time, which is
+/// the tell that the panel knew something it was not using.
+///
+/// The session in the pane first, since that is the one you are in; the
+/// panel's cursor next, for a tab opened while looking at a row you have not
+/// gone to; and Savras's own directory when there is no session in play at all.
+/// A session on another machine is skipped rather than used: its directory is
+/// on that machine, and a local shell cannot start there — see `Job::repo`
+/// for what asking costs.
+fn new_tab_cwd(front: Option<&str>, app: &App) -> PathBuf {
+    let here = |job: Option<&crate::job::Job>| -> Option<PathBuf> {
+        let job = job?;
+        if job.machine_tag().is_some() {
+            return None;
+        }
+        let cwd = job.cwd.clone();
+        cwd.is_dir().then_some(cwd)
+    };
+
+    let front = front.and_then(|short| app.snapshot.jobs.iter().find(|job| job.short == short));
+
+    here(front)
+        .or_else(|| here(app.selected_job()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 /// Where one press of a switch key lands.
@@ -1348,17 +1435,37 @@ fn delete_session(
     outcome: &mpsc::Sender<Result<String>>,
     short: String,
     name: String,
+    on: Option<(String, u32)>,
 ) {
     if let Some(index) = session.tabs.position(&short) {
         session.tabs.close(index);
     }
-    app.error = Some(format!("deleting {name}…"));
     let outcome = outcome.clone();
-    std::thread::spawn(move || {
-        let _ = outcome.send(
-            crate::agents::delete(&short).with_context(|| format!("could not delete {name}")),
-        );
-    });
+    match on {
+        // On another machine there is no daemon to ask and nothing local to
+        // remove: the session is a process over there, and stopping it is what
+        // makes the row go. Doing it locally was the old behaviour and it
+        // silently did nothing at all — `claude rm` was handed an id nothing
+        // here has ever heard of.
+        Some((host, pid)) => {
+            app.error = Some(format!("stopping {name} on {host}…"));
+            std::thread::spawn(move || {
+                let _ = outcome.send(
+                    crate::agents::stop_remote(&host, pid)
+                        .with_context(|| format!("could not stop {name}")),
+                );
+            });
+        }
+        None => {
+            app.error = Some(format!("deleting {name}…"));
+            std::thread::spawn(move || {
+                let _ = outcome.send(
+                    crate::agents::delete(&short)
+                        .with_context(|| format!("could not delete {name}")),
+                );
+            });
+        }
+    }
 }
 
 /// Clear the mark on whatever session is now in front — flipping to a tab is
@@ -1522,6 +1629,14 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: Option<&Confirm>) -> Actio
         // can only grow is a leak you cannot see.
         [b'x'] => return Action::CloseSelected,
         [b'a'] => return Action::AddAgent,
+        // The panel's shape, while the panel has the keyboard — which is the
+        // only place these single letters are free, since the pane is not
+        // listening. `<` and `>` point the way the divider goes; `[` and `]`
+        // are the sides of a screen.
+        [b'<'] | [b','] => return Action::Reshape(Shape::Narrower),
+        [b'>'] | [b'.'] => return Action::Reshape(Shape::Wider),
+        [b'['] => return Action::Reshape(Shape::Put(Side::Left)),
+        [b']'] => return Action::Reshape(Shape::Put(Side::Right)),
         [b's'] => return Action::Regroup,
         // Closing a tab leaves the session running, which is the point of
         // tabs — and why finished sessions pile up in `claude agents` with
@@ -1796,6 +1911,45 @@ fn shift_one(report: &str, offset: u16) -> Option<String> {
 }
 
 /// Returns true if the terminal changed size and the child was told about it.
+/// Move the divider, or the panel, while Savras is running.
+///
+/// `--side` and `--width` set these once at startup, and the layout is
+/// recomputed from them every frame — so the only real work here is telling
+/// the panes about it. A pseudo-terminal that changes width and is not told
+/// keeps drawing to the old one, so every open pane is resized, which sends
+/// each program a `SIGWINCH` and makes it repaint against the truth.
+///
+/// Returns whether anything actually moved: a key pressed at the end of its
+/// travel should redraw nothing rather than flicker.
+fn reshape(session: &mut Session, how: Shape) -> Result<bool> {
+    let was = (session.width, session.side);
+    let (width, side) = reshaped(session.width, session.side, session.size.0, how);
+    session.width = width;
+    session.side = side;
+    if (width, side) == was {
+        return Ok(false);
+    }
+    let (cols, rows) = session.work_size();
+    session.tabs.resize_all(cols.max(1), rows)?;
+    Ok(true)
+}
+
+/// Where the divider ends up, deciding separately from doing.
+///
+/// The floor is the same one `--width` enforces; the ceiling leaves the pane
+/// enough columns to still be worked in, because a panel that can eat the
+/// whole terminal is a way to lose your session behind a list of sessions.
+fn reshaped(width: u16, side: Side, total: u16, how: Shape) -> (u16, Side) {
+    match how {
+        Shape::Put(side) => (width, side),
+        Shape::Narrower => (width.saturating_sub(STEP).max(MIN_PANEL), side),
+        Shape::Wider => {
+            let most = total.saturating_sub(DIVIDER + MIN_WORK).max(MIN_PANEL);
+            ((width + STEP).min(most), side)
+        }
+    }
+}
+
 fn resize_if_needed(session: &mut Session) -> Result<bool> {
     let size = crossterm::terminal::size().unwrap_or(session.size);
     if size == session.size {
@@ -1953,6 +2107,7 @@ mod tests {
         let asking = Confirm::Delete {
             short: "aaa".into(),
             name: "OLD".into(),
+            on: None,
         };
         assert!(asking.question().contains("OLD"), "{}", asking.question());
         assert!(matches!(
@@ -2490,6 +2645,127 @@ mod tests {
     #[test]
     fn a_panel_wider_than_the_terminal_does_not_underflow() {
         assert_eq!(work_cols(30, 44), 0);
+    }
+
+    #[test]
+    fn the_panel_moves_and_resizes_and_stops_at_both_ends() {
+        // Four columns a press: the panel's columns are worth about that much
+        // each, and a key you have to hold down feels broken.
+        assert_eq!(reshaped(44, Side::Right, 180, Shape::Wider).0, 48);
+        assert_eq!(reshaped(44, Side::Right, 180, Shape::Narrower).0, 40);
+
+        // The floor is the one `--width` enforces. Below it the rows say
+        // nothing worth reading.
+        assert_eq!(reshaped(14, Side::Right, 180, Shape::Narrower).0, MIN_PANEL);
+        assert_eq!(
+            reshaped(MIN_PANEL, Side::Right, 180, Shape::Narrower).0,
+            MIN_PANEL
+        );
+
+        // And it cannot grow until the pane beside it stops being usable —
+        // a panel that can eat the terminal is a way to lose your session
+        // behind a list of sessions.
+        let (wide, _) = reshaped(60, Side::Right, 80, Shape::Wider);
+        assert_eq!(wide, 80 - DIVIDER - MIN_WORK);
+        assert_eq!(reshaped(wide, Side::Right, 80, Shape::Wider).0, wide);
+
+        // Sides are set, not toggled, so pressing `[` twice leaves it left
+        // rather than putting it back.
+        assert_eq!(
+            reshaped(44, Side::Right, 180, Shape::Put(Side::Left)).1,
+            Side::Left
+        );
+        assert_eq!(
+            reshaped(44, Side::Left, 180, Shape::Put(Side::Left)).1,
+            Side::Left
+        );
+    }
+
+    #[test]
+    fn a_new_tab_starts_in_the_repository_of_the_session_you_are_on() {
+        // A shell opened beside PLAN is nearly always wanted *in* PLAN's
+        // repository — that is what you were about to type. Savras's own start
+        // directory made you `cd` every time, which is the tell that the panel
+        // knew something it was not using.
+        let repo = std::env::temp_dir().join(format!("savras-tabcwd-{}", std::process::id()));
+        std::fs::create_dir_all(&repo).unwrap();
+        let f = Fixture::new("host-tabcwd")
+            .job(
+                "aaa",
+                &format!(
+                    r#"{{"state":"working","name":"PLAN","cwd":"{}"}}"#,
+                    repo.display()
+                ),
+            )
+            .job("bbb", r#"{"state":"working","name":"OTHER","cwd":"/tmp"}"#);
+        let mut app = App::new(f.0.clone());
+        app.refresh();
+
+        // The session in the pane wins: that is the one you are in.
+        assert_eq!(new_tab_cwd(Some("aaa"), &app), repo);
+
+        // With no session in the pane, the row under the cursor answers.
+        app.select("aaa");
+        assert_eq!(new_tab_cwd(None, &app), repo);
+
+        // A directory that is not on this machine is skipped rather than
+        // used — a local shell cannot start there, and asking is expensive.
+        let mut app = App::new(f.0.clone());
+        app.refresh();
+        let mut far = app.snapshot.jobs[0].clone();
+        far.short = "claude-box:42".to_string();
+        far.name = "BOX".to_string();
+        far.cwd = PathBuf::from("/home/ubuntu/Code/thing");
+        far.machine = Some(crate::job::Remote {
+            host: "claude-box".to_string(),
+            tmux: None,
+            pid: Some(42),
+        });
+        app.set_remote("claude-box".to_string(), vec![far]);
+        app.select("claude-box:42");
+        assert_ne!(
+            new_tab_cwd(Some("claude-box:42"), &app),
+            PathBuf::from("/home/ubuntu/Code/thing")
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn the_geometry_keys_are_only_read_by_the_panel() {
+        let f = Fixture::new("host-shape").job("aaa", r#"{"state":"working","name":"X"}"#);
+        let mut app = App::new(f.0.clone());
+        assert!(matches!(
+            panel_key(b"<", &mut app, None),
+            Action::Reshape(Shape::Narrower)
+        ));
+        assert!(matches!(
+            panel_key(b">", &mut app, None),
+            Action::Reshape(Shape::Wider)
+        ));
+        assert!(matches!(
+            panel_key(b"[", &mut app, None),
+            Action::Reshape(Shape::Put(Side::Left))
+        ));
+        assert!(matches!(
+            panel_key(b"]", &mut app, None),
+            Action::Reshape(Shape::Put(Side::Right))
+        ));
+    }
+
+    #[test]
+    fn stopping_a_session_on_another_machine_is_a_different_question() {
+        // Nothing over there is deleted and nothing local is either: the
+        // process is signalled, and the row goes when it stops answering.
+        let asking = Confirm::Delete {
+            short: "claude-box:915226".into(),
+            name: "autodad-f9".into(),
+            on: Some(("claude-box".into(), 915226)),
+        };
+        let said = asking.question();
+        assert!(said.contains("stop"), "{said}");
+        assert!(said.contains("claude-box"), "say where: {said}");
+        assert!(!said.contains("delete"), "nothing is deleted there: {said}");
     }
 
     #[test]

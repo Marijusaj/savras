@@ -89,13 +89,17 @@ keys, with the panel focused:
              as do ctrl-shift-arrows where the terminal sends them
   ↑/↓, k/j   move        enter   open the selected session
   g/G        first/last  esc, q  back to your work
-  ctrl-t     a tab of your own, running what Savras was started with;
+  ctrl-t     a tab of your own, running what Savras was started with,
+             in the directory of the session you are on;
              n does the same with the panel focused
   x          close the selected tab, yours or a session's
   a          start a parallel agent under this session's lead
   s          group by repository or by status
+  < >        narrow or widen the panel     [ ]  put it left or right
   d          delete the selected session for good, after asking:
-             `claude stop` then `claude rm`, which x does not do
+             `claude stop` then `claude rm`, which x does not do.
+             On another machine there is no daemon to ask, so it
+             stops the session's process over ssh instead
   r          refresh     Q       quit Savras, after asking
   ctrl-l     paint the screen again, if the terminal has scrolled it
 

@@ -126,6 +126,11 @@ pub struct Remote {
     pub host: String,
     /// Where tmux has it: `session:@window.%pane`, in tmux's own ids.
     pub tmux: Option<String>,
+    /// Its process id *on that machine*. The far side names its session file
+    /// after it, and it is the only handle anything over there answers to:
+    /// there is no daemon on a box you ssh into, so a session is stopped by
+    /// signalling the process, not by asking a service to.
+    pub pid: Option<u32>,
 }
 
 impl Remote {
@@ -911,6 +916,7 @@ mod tests {
         job.machine = Some(Remote {
             host: "claude-box".to_string(),
             tmux: Some("autodad:@2.%2".to_string()),
+            pid: Some(4242),
         });
         assert_eq!(
             job.open_command_line(),
@@ -926,6 +932,7 @@ mod tests {
         let remote = Remote {
             host: "claude-box".to_string(),
             tmux: Some("autodad:@2.%2".to_string()),
+            pid: Some(4242),
         };
         let command = remote.open_command();
 
@@ -952,6 +959,7 @@ mod tests {
         let remote = Remote {
             host: "claude-box".to_string(),
             tmux: None,
+            pid: Some(4242),
         };
         let script = remote.open_command().last().unwrap().clone();
         assert!(script.contains("SHELL"), "{script}");
