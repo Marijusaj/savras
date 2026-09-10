@@ -1524,7 +1524,7 @@ pub fn remote_shell(host: &str, tmux: &str) -> Vec<String> {
         "-o".to_string(),
         "ControlPersist=10m".to_string(),
         host.to_string(),
-        format!("tmux new-session -A -s {tmux}"),
+        format!("tmux new-session -A -s {}", crate::sh::quote(tmux)),
     ]
 }
 
