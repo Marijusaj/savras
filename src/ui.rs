@@ -568,7 +568,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
         // news you have already been given, and the question is the one line
         // that says what the next keystroke will do. A machine that cannot be
         // reached says so every time it retries, and that must not be what
-        // swallows "new tab: 1 here · 2 claude-box".
+        // swallows "new tab: 1 here · 2 <the machine>".
         (_, Hint::Confirming(question)) => Span::styled(
             truncate(question, area.width as usize),
             Style::default().fg(Color::Yellow),

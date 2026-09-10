@@ -10,6 +10,7 @@
 //! re-encoded, so arrow keys, Ctrl chords, paste and anything else the child
 //! understands arrive exactly as the terminal sent them.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -604,11 +605,36 @@ fn process_name(pid: i32) -> Option<String> {
 struct Tabs {
     open: Vec<Pane>,
     current: usize,
+    /// Which process group holds which session — see `adopt_sessions`.
+    groups: Groups,
+}
+
+/// The session-holding process groups, and when they were last asked for.
+///
+/// Asking costs a `ps`, and the answer only changes when you start or leave a
+/// session — never between two frames of the same second. So it is asked at
+/// the rate the panel refreshes rather than the rate it draws, and only while
+/// there is a pane still waiting to be told what it is.
+#[derive(Default)]
+struct Groups {
+    asked: Option<Instant>,
+    held: HashMap<i32, String>,
+}
+
+impl Groups {
+    fn take(&mut self, jobs_dir: &Path, asking: bool) -> &HashMap<i32, String> {
+        if asking && self.asked.is_none_or(|at| at.elapsed() >= REDRAW) {
+            self.held = crate::job::jobs_by_group(jobs_dir);
+            self.asked = Some(Instant::now());
+        }
+        &self.held
+    }
 }
 
 impl Tabs {
     fn new(work: Work) -> Self {
         Tabs {
+            groups: Groups::default(),
             open: vec![Pane {
                 short: None,
                 reopen: None,
@@ -667,8 +693,24 @@ impl Tabs {
     /// The pane's foreground process is asked what it is on every pass rather
     /// than once, because this goes both ways: leave the session and the pane
     /// is a shell again.
+    ///
+    /// What it is asked about is the process *group*, not the leader — see
+    /// `jobs_by_group`, which is where the answer to "why are there still two
+    /// rows" turned out to be.
     fn adopt_sessions(&mut self, known: &[Job], jobs_dir: &Path) {
-        for pane in self.open.iter_mut().filter(|pane| !pane.opened) {
+        // Destructured so the map and the panes are borrowed apart: the map is
+        // taken once for the whole pass rather than once per pane.
+        let Tabs { open, groups, .. } = self;
+        // And only while a pane of your own still does not know what it is.
+        // Once they all do, nothing here forks anything: an adopted pane keeps
+        // its group, so the answer it already has stays the right one until
+        // the group changes — which is you leaving the session, and which the
+        // very next pass sees as a miss.
+        let asking = open
+            .iter()
+            .any(|pane| !pane.opened && pane.remote.is_none() && pane.short.is_none());
+        let groups = groups.take(jobs_dir, asking);
+        for pane in open.iter_mut().filter(|pane| !pane.opened) {
             let found = match &pane.remote {
                 // On another machine a pid means nothing here: the pane's own
                 // process group leader is the local ssh client, which owns no
@@ -688,11 +730,14 @@ impl Tabs {
                         })
                     })
                     .map(|job| job.short.clone()),
+                // Here, the process group the pane has in the foreground. Not
+                // the group *leader's* session file: the leader of a `claude`
+                // is a launcher that never writes one.
                 None => pane
                     .work
                     .master
                     .process_group_leader()
-                    .and_then(|pid| crate::job::job_running_as(pid, jobs_dir))
+                    .and_then(|pgid| groups.get(&pgid).cloned())
                     .filter(|id| known.iter().any(|job| &job.short == id)),
             };
             if pane.short != found {

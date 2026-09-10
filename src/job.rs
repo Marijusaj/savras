@@ -5,7 +5,9 @@
 //! field is optional, and a job we cannot understand is skipped rather than
 //! fatal, so a Claude Code upgrade degrades the panel instead of breaking it.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -688,6 +690,74 @@ pub fn job_running_as(pid: i32, jobs_dir: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let raw: RawSessionFile = serde_json::from_str(&text).ok()?;
     raw.job_id.filter(|id| !id.is_empty())
+}
+
+/// Which job is running in each process group, for every live session on this
+/// machine.
+///
+/// A pane knows one number about what is in it: the process group its terminal
+/// has in the foreground. Asking `sessions/<that pid>.json` looked obvious and
+/// is wrong for the case it matters most in — a `claude` you start in a tab is
+/// a launcher that forks the session as a *child in the same group*, and it is
+/// the child that writes the file. The leader has no file and never will, so
+/// the lookup could only ever miss, and the pane stayed a row called `claude`
+/// beside the row for the very session inside it.
+///
+/// So the join is the group rather than the leader, which is true of both
+/// shapes: a session that is its own group leader is in the map under its own
+/// pid. It costs one `ps` for the handful of pids that have a file at all —
+/// asked once per pass, not once per pane, and not at all once every pane
+/// knows what it is.
+pub fn jobs_by_group(jobs_dir: &Path) -> HashMap<i32, String> {
+    let mut found = HashMap::new();
+    let Some(dir) = jobs_dir.parent().map(|d| d.join("sessions")) else {
+        return found;
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return found;
+    };
+    // Only the sessions that name a job: an interactive `claude` writes one of
+    // these too, and it is not a row on the panel to be joined to.
+    let jobs: Vec<(i32, String)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let pid: i32 = name.to_str()?.strip_suffix(".json")?.parse().ok()?;
+            Some((pid, job_running_as(pid, jobs_dir)?))
+        })
+        .collect();
+    if jobs.is_empty() {
+        return found;
+    }
+
+    let pids = jobs
+        .iter()
+        .map(|(pid, _)| pid.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    // One `ps` for all of them rather than one each: the fork is the whole
+    // cost here, and the same flags mean the same thing on both machines this
+    // runs on. A pid that has since exited is simply not in the answer.
+    let Ok(out) = Command::new("ps")
+        .args(["-o", "pid=,pgid=", "-p", &pids])
+        .output()
+    else {
+        return found;
+    };
+    let groups: HashMap<i32, i32> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut said = line.split_whitespace();
+            Some((said.next()?.parse().ok()?, said.next()?.parse().ok()?))
+        })
+        .collect();
+
+    for (pid, job) in jobs {
+        if let Some(group) = groups.get(&pid) {
+            found.insert(*group, job);
+        }
+    }
+    found
 }
 
 #[derive(Debug, Deserialize)]

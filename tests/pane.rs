@@ -127,20 +127,15 @@ fn a_pane_you_start_a_session_in_becomes_that_session_s_tab() {
     // already in front of you.
     //
     // Claude Code writes ~/.claude/sessions/<pid>.json for every live session,
-    // carrying the job id, so the pane's own foreground process answers the
-    // question. The script here writes one for itself, which is exactly what
-    // starting `claude` in a tab does.
+    // carrying the job id. Here the pane's own foreground process writes one
+    // for itself, which is the simple shape: the process the terminal has in
+    // front is the one the file is named after.
     let pane = Pane::start_watching(
         "adopted",
         "printf '{\"jobId\":\"abc12345\"}' > \"$SAVRAS_TEST_DIR\"/sessions/$$.json; sleep 30",
         true,
     );
-    std::fs::create_dir_all(pane.dir.join("jobs/abc12345")).unwrap();
-    std::fs::write(
-        pane.dir.join("jobs/abc12345/state.json"),
-        r#"{"state":"working","name":"LINUX-B","cwd":"/tmp"}"#,
-    )
-    .unwrap();
+    pane.seed_job("abc12345", "LINUX-B");
 
     // The marker, not just the name: the row exists either way, and what is
     // being tested is that the panel knows this pane *is* it.
@@ -148,6 +143,37 @@ fn a_pane_you_start_a_session_in_becomes_that_session_s_tab() {
     assert!(
         seen.contains("\u{25b6} LINUX-B"),
         "the pane is that session and the panel never marked it as one; it drew:\n{seen}"
+    );
+}
+
+#[test]
+fn a_session_owned_by_a_child_of_the_foreground_process_is_still_this_pane_s() {
+    // And here is the shape a real `claude` has, which the simple one above
+    // hid: the process the terminal has in front is a launcher, and it forks
+    // the session as a *child in the same process group*. The child writes the
+    // session file; the leader has none and never will.
+    //
+    // So asking `sessions/<leader>.json` could only ever miss, and every tab
+    // you started a session in stayed a row called `claude` sitting above the
+    // row for the very session inside it — two rows for one session, which is
+    // exactly what M3.6 was supposed to have ended.
+    //
+    // The script is that shape and nothing else: `sh` stays in front and
+    // waits, and the file is named after the child it started. `sh -c` runs
+    // without job control, so the child is in the shell's group — which is the
+    // whole point.
+    let pane = Pane::start_watching(
+        "adopted-child",
+        "sleep 30 & printf '{\"jobId\":\"abc12345\"}' > \"$SAVRAS_TEST_DIR\"/sessions/$!.json; wait",
+        true,
+    );
+    pane.seed_job("abc12345", "LINUX-B");
+
+    let seen = pane.wait_for("\u{25b6} LINUX-B");
+    assert!(
+        seen.contains("\u{25b6} LINUX-B"),
+        "the session is a child of the pane's foreground process and the panel \
+         never joined them; it drew:\n{seen}"
     );
 }
 
@@ -283,6 +309,17 @@ impl Pane {
             writer,
             child,
         }
+    }
+
+    /// A job for the panel to have a row for, which is what a pane gets joined
+    /// to. Written after the pane is up, as a real one appears while you watch.
+    fn seed_job(&self, short: &str, name: &str) {
+        std::fs::create_dir_all(self.dir.join("jobs").join(short)).unwrap();
+        std::fs::write(
+            self.dir.join("jobs").join(short).join("state.json"),
+            format!(r#"{{"state":"working","name":"{name}","cwd":"/tmp"}}"#),
+        )
+        .unwrap();
     }
 
     /// Send keys, then read until the panel says the thing — or long enough to
