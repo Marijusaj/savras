@@ -12,6 +12,7 @@ mod job;
 mod panel;
 mod ping;
 mod remote;
+mod sh;
 #[cfg(test)]
 mod testing;
 mod ui;
