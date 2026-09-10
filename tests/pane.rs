@@ -181,6 +181,30 @@ fn ctrl_t_asks_and_is_answered_from_the_working_pane() {
     );
 }
 
+#[test]
+fn ctrl_l_paints_the_screen_again_rather_than_waiting_for_an_answer() {
+    // `Terminal::clear` asks the terminal where the cursor is and waits for the
+    // reply. Savras reads stdin itself, so the reply never reaches the asker:
+    // ctrl-l stalled for the length of the timeout and then failed outright,
+    // tearing the screen down with "the cursor position could not be read".
+    let mut pane = Pane::start("ctrl-l", "cat");
+    pane.wait_for("ctrl-g focus");
+
+    // ctrl-g first: ctrl-l is the panel's, and the pane has the keys until it
+    // is asked for them.
+    pane.press_for(b"\x07", "enter open");
+    let seen = pane.press_for(b"\x0c", "SAVRAS");
+
+    assert!(
+        !seen.contains("cursor position"),
+        "ctrl-l asked the terminal a question nobody was left to answer:\n{seen}"
+    );
+    assert!(
+        seen.contains("SAVRAS") && seen.contains("No Claude Code sessions."),
+        "ctrl-l should have painted the whole panel again; it drew:\n{seen}"
+    );
+}
+
 /// A real `svr` hosting a command of the test's choosing, in a real pty.
 struct Pane {
     dir: PathBuf,
