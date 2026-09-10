@@ -207,6 +207,57 @@ fn ctrl_t_asks_and_is_answered_from_the_working_pane() {
     );
 }
 
+#[test]
+fn a_pane_showing_a_daemon_session_is_that_session_s_tab() {
+    // The shape that actually reaches the panel, and the one both earlier
+    // fixes missed. Every session Savras lists runs with `backend: daemon`:
+    // the work happens in a process under the Claude Code daemon, which is
+    // what writes `sessions/<pid>.json`, and your pane holds a client of it.
+    // The two share no pid, no process group, and nothing on disk — verified
+    // on a live session, whose file belonged to a `kind: bg` process three
+    // parents away from any terminal.
+    //
+    // What the pane does say is its title, which Claude Code sets to the
+    // session's name. That is the join, and this is the whole test: a title
+    // and a job by that name, with no session file written anywhere.
+    let pane = Pane::start_watching(
+        "daemon",
+        "printf '\\033]0;\\342\\234\\263 ROADMAP\\007'; sleep 30",
+        true,
+    );
+    pane.seed_job("cc76108a", "ROADMAP");
+
+    let seen = pane.wait_for("\u{25b6} ROADMAP");
+    assert!(
+        seen.contains("\u{25b6} ROADMAP"),
+        "the pane is showing that session and the panel kept it as a shell row \
+         beside the session's own; it drew:\n{seen}"
+    );
+}
+
+#[test]
+fn a_title_two_sessions_answer_to_joins_neither() {
+    // A guess here is worse than no answer: the pane would be marked as one
+    // session while `enter` on the row went to the other.
+    let pane = Pane::start_watching(
+        "ambiguous",
+        "printf '\\033]0;\\342\\234\\263 ROADMAP\\007'; sleep 30",
+        true,
+    );
+    pane.seed_job("cc76108a", "ROADMAP");
+    pane.seed_job("dd881190", "ROADMAP");
+
+    // Both rows are drawn, and then a moment longer than adoption would have
+    // taken. A pane that had been joined says so in the header, the way the
+    // test above reads it; this one must not.
+    let mut seen = pane.wait_for("ROADMAP");
+    seen.push_str(&pane.read_for(3));
+    assert!(
+        !seen.contains("\u{25b6} ROADMAP"),
+        "an ambiguous title was guessed at rather than left alone; it drew:\n{seen}"
+    );
+}
+
 /// A real `svr` hosting a command of the test's choosing, in a real pty.
 struct Pane {
     dir: PathBuf,
@@ -328,6 +379,20 @@ impl Pane {
         self.writer.write_all(keys).unwrap();
         self.writer.flush().unwrap();
         self.wait_for(needle)
+    }
+
+    /// Keep reading for a while longer, for the tests that assert the panel
+    /// does *not* draw something: absence needs a settled screen, not the
+    /// first frame that happens to arrive.
+    fn read_for(&self, secs: u64) -> String {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        let mut seen = String::new();
+        while Instant::now() < deadline {
+            if let Ok(chunk) = self.rx.recv_timeout(Duration::from_millis(250)) {
+                seen.push_str(&String::from_utf8_lossy(&chunk));
+            }
+        }
+        seen
     }
 
     fn wait_for(&self, needle: &str) -> String {

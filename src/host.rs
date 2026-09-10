@@ -557,17 +557,44 @@ impl Pane {
         };
         Shell {
             name: name.unwrap_or_else(|| fallback.to_string()),
-            detail: self
-                .work
-                .parser
-                .lock()
-                .unwrap()
-                .screen()
-                .title()
-                .trim()
-                .to_string(),
+            detail: self.title(),
         }
     }
+
+    /// The title the program in this pane set, if it set one.
+    fn title(&self) -> String {
+        self.work
+            .parser
+            .lock()
+            .unwrap()
+            .screen()
+            .title()
+            .trim()
+            .to_string()
+    }
+}
+
+/// The session a pane's terminal title names, when it names exactly one.
+///
+/// Claude Code writes the session's name into the terminal title, behind a
+/// glyph for what it is doing: `✳ ROADMAP`, `◑ SANDRA MEET`. The glyph changes
+/// as the session works, so it is cut off and the name is matched whole — a
+/// title that is anything else, like the launcher's `2 awaiting input · claude`
+/// or a login shell's host and directory, matches no session and joins nothing.
+///
+/// Two sessions with one name is no answer at all: joining the pane to either
+/// would be a guess, and a wrong guess sends `enter` to the other one. So an
+/// ambiguous title leaves the pane a shell, which is what it was before.
+fn job_named(title: &str, known: &[Job]) -> Option<String> {
+    let name = title
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim();
+    if name.is_empty() {
+        return None;
+    }
+    let mut named = known.iter().filter(|job| job.name == name);
+    let job = named.next()?;
+    named.next().is_none().then(|| job.short.clone())
 }
 
 /// What the operating system calls the process with this id.
@@ -733,12 +760,26 @@ impl Tabs {
                 // Here, the process group the pane has in the foreground. Not
                 // the group *leader's* session file: the leader of a `claude`
                 // is a launcher that never writes one.
+                // Here, the process group the pane has in the foreground. Not
+                // the group *leader's* session file: the leader of a `claude`
+                // is a launcher that never writes one.
+                //
+                // And when even the group says nothing, the title does. A
+                // session with `backend: daemon` — which is every session
+                // Savras lists — does not run in your pane at all: the pane
+                // holds a client, and the work happens in a process under the
+                // daemon that writes the session file. There is no pid in
+                // common and nothing on disk joining the two, so the pane's
+                // own terminal title, which Claude Code sets to the session's
+                // name, is the only thing that says which session you are
+                // looking at.
                 None => pane
                     .work
                     .master
                     .process_group_leader()
                     .and_then(|pgid| groups.get(&pgid).cloned())
-                    .filter(|id| known.iter().any(|job| &job.short == id)),
+                    .filter(|id| known.iter().any(|job| &job.short == id))
+                    .or_else(|| job_named(&pane.title(), known)),
             };
             if pane.short != found {
                 pane.short = found;
