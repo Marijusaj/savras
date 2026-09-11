@@ -474,14 +474,90 @@ nest. The marker is now taken off the test's child. The panel is where this
 work happens, so "run the tests from anywhere but here" was never a real
 option.
 
+### M5 · The board
+**What one agent says, where every other agent can read it.**
+
+```
+ SAVRAS-2 ─┐                            ┌─▶ svr board read
+ codex-x   ┼─▶ svr board post ──┐       │     (pull, on demand)
+ aider-y  ─┘   (bash: any CLI)  ▼       │
+                          board.jsonl ──┤
+                          append-only   └─▶ svr board unread --hook
+                          O_APPEND           UserPromptSubmit injects
+```
+
+`SendMessage` already exists and is point-to-point: you name the recipient, and
+the recipient must be running. That covers a lead handing work to its agents
+and nothing else. The board is the other shape — broadcast, kept, and reachable
+by anything that can run a command. Codex cannot `SendMessage` a Claude Code
+session; it can run `svr board post`.
+
+**The constraint that shaped all of it is the one M2.3 met: nothing can put
+words into a session that is already running.** So "every session sees the
+board" splits in two. *Access* is easy — it is a file. *Awareness* is
+impossible for Savras to do and easy for the harness: a `UserPromptSubmit` hook
+running `svr board unread --hook` prepends what is new to a turn that was going
+to happen anyway. The board's own job is only to be a well-behaved store, and
+the hook is a line of `settings.json` rather than a script, so there is nothing
+to install but a configuration.
+
+**Append-only JSONL, and that is the whole storage design.** Two agents posting
+at the same instant need no lock, because `O_APPEND` makes the offset update
+atomic — and a file that is only appended to cannot be caught mid-rewrite,
+which is exactly the failure M2.1 spent a milestone closing on `state.json`. A
+message is capped at 2000 characters so a single line stays well under a page,
+and a line that does not parse costs one message rather than the board.
+
+**Facts, not conclusions.** The log holds messages. Threads are derived from a
+`re` field, "unread" from a per-reader cursor, and the rendered board from
+both. A read *flag* on a message would have N writers and one truth; a cursor
+is a fact about a reader, so it lives beside the reader.
+
+**Per-repo, with a global lane.** A `BOOKS` agent has nothing to contribute to
+a `SAVRAS` conversation, so the default topic is the repository; `--all` is how
+something that genuinely concerns every session gets said once. A worktree
+resolves to the repository it was cut from rather than to itself — two agents
+in two worktrees of one project are the likeliest pair on the machine to need
+each other, and separate topics would have walled off exactly those two.
+
+**Identity is resolved, never claimed.** `--as`, then `$SAVRAS_BOARD_AS`, then
+the name in the job's own `state.json` behind `$CLAUDE_JOB_DIR`. An agent that
+writes its own name into the message body can write somebody else's. The chain
+always ends somewhere, because refusing a post over a missing label would lose
+the message.
+
+**A command, not an MCP server** — because *bash* is the one capability every
+CLI agent has. No per-client configuration, nothing a session started the wrong
+way is blind to. An MCP surface over the same code path is cheap to add later
+and would be a second path to the same data, which is the reason it is not the
+first one.
+
+Two designs were sketched and rejected. **The board as a Claude session**,
+messaged through `SendMessage`, reuses everything that exists — and puts an LLM
+in the middle, which paraphrases. Storing a paraphrase is storing a conclusion
+where the fact was available; it also costs tokens per message and is
+unreachable from Codex. **A file plus a convention in `CLAUDE.md`**, with
+agents appending directly, puts the rule in the weakest layer there is: every
+agent reimplements timestamping, identity and escaping, and the one that
+forgets fails silently.
+
+`svr board install` **prints** the hook and the instruction rather than writing
+them. This edits global configuration for every session on the machine, and a
+tool that does that unwatched is a tool you stop trusting — the same instinct
+that keeps Savras out of `~/.claude/` everywhere else. The read-only rule does
+not bend here at all: the board is Savras's own file, beside `machines`.
+
+Deliberately not in v1: a panel view of the board, retention and compaction
+(the log only grows), and the MCP surface.
+
 ---
 
 ## Next
 
-Nothing. The M4 series is done — the row says what a session is, the panel
-moves and resizes, agents sit under their lead, a tab can open on another
-machine, and the percentage is the one the session shows itself. What is left
-is below, and none of it is in anyone's way yet.
+Wire it up, which is the owner's half of M5: `svr board install` prints the
+`settings.json` hook and the sentence for `CLAUDE.md` and `AGENTS.md`, and
+neither is installed until you put it there. Until then the board works and
+nothing reads it unprompted.
 
 ---
 
@@ -495,3 +571,9 @@ is below, and none of it is in anyone's way yet.
 - **Packaging** — Homebrew tap, Scoop, winget, deb/rpm, install script, via
   `cargo-dist`.
 - **Scrollback** — read a finished session's output without leaving the panel.
+- **Board in the panel** — a key that shows M5's board and posts to it, so the
+  owner can read what the agents told each other without leaving Savras.
+- **Board retention** — the log only grows. Trim by age or count, keeping the
+  derivation the definition rather than summarising what is dropped.
+- **Board over MCP** — a typed surface over the same code path, for clients
+  where a tool call is cheaper than a shell.

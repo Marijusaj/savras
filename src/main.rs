@@ -6,6 +6,7 @@
 
 mod agents;
 mod app;
+mod board;
 mod focus;
 mod host;
 mod job;
@@ -41,6 +42,7 @@ savras — see every Claude Code session you have running
 
 usage: svr [options] [-- <command>...]
        svr solo [options]
+       svr board <post|read|unread|install> [...]
 
 By default Savras opens the panel as a column beside your work, with the
 session at the top of the list in the pane next to it — or the command after
@@ -49,6 +51,7 @@ session at the top of the list in the pane next to it — or the command after
 commands:
   (none)              the side panel, with the top session beside it
   solo                just the panel, with no working pane, for its own tab
+  board               the agent board — see `svr board --help`
 
 options:
   --side <left|right> which side the panel sits on (default right)
@@ -159,6 +162,19 @@ struct Options {
 }
 
 fn main() -> Result<()> {
+    // `svr board` is a plain command, not a mode of the panel: it is what an
+    // agent runs from a shell, and it must not be parsed as though somebody
+    // asked for a terminal UI.
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    match board::dispatch(&argv) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!("svr: {e}");
+            std::process::exit(2);
+        }
+    }
+
     let mut options = match parse_args() {
         Ok(Some(options)) => options,
         Ok(None) => return Ok(()),
