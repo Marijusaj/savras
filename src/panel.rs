@@ -13,6 +13,7 @@ use std::process::Command;
 use anyhow::{bail, Context as _, Result};
 
 use crate::host::Side;
+use crate::sh;
 
 /// The tmux session Savras creates when you are not already in one.
 const SESSION: &str = "savras";
@@ -171,7 +172,7 @@ fn command_or_shell(ctx: &Context) -> String {
     if ctx.command.is_empty() {
         String::new()
     } else {
-        shell_join(&ctx.command)
+        sh::join(&ctx.command)
     }
 }
 
@@ -187,7 +188,7 @@ pub fn run(width: u16, side: Side, command: Vec<String>, dry_run: bool) -> Resul
         width,
         side,
         size: crossterm::terminal::size().unwrap_or((160, 45)),
-        svr: shell_quote(&current_exe()?),
+        svr: sh::quote(&current_exe()?),
         cwd: std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".into()),
@@ -201,7 +202,7 @@ pub fn run(width: u16, side: Side, command: Vec<String>, dry_run: bool) -> Resul
     // does to your terminal can be read before it happens.
     if dry_run {
         for step in plan.steps.iter().chain(plan.exec.iter()) {
-            println!("tmux {}", shell_join(step));
+            println!("tmux {}", sh::join(step));
         }
         return Ok(());
     }
@@ -283,26 +284,6 @@ fn write_config() -> Result<String> {
     }
     std::fs::write(&path, TMUX_CONF).with_context(|| format!("writing {}", path.display()))?;
     Ok(path.to_string_lossy().to_string())
-}
-
-/// tmux takes a command as one shell string, so a path or argument containing
-/// spaces has to survive a trip through the shell.
-fn shell_join(parts: &[String]) -> String {
-    parts
-        .iter()
-        .map(|p| shell_quote(p))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn shell_quote(s: &str) -> String {
-    if !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || "-_./:=@+".contains(c))
-    {
-        return s.to_string();
-    }
-    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 #[cfg(test)]
@@ -422,18 +403,12 @@ mod tests {
     #[test]
     fn paths_and_arguments_with_spaces_survive_the_shell() {
         let mut c = ctx();
-        c.svr = shell_quote("/Users/me/My Code/svr");
+        c.svr = sh::quote("/Users/me/My Code/svr");
         c.command = vec!["claude".into(), "a b".into(), "it's".into()];
         let text = joined(&plan(&c));
 
         assert!(text.contains("'/Users/me/My Code/svr'"), "{text}");
         assert!(text.contains(r"claude 'a b' 'it'\''s'"), "{text}");
-    }
-
-    #[test]
-    fn ordinary_paths_are_left_alone() {
-        assert_eq!(shell_quote("/usr/local/bin/svr"), "/usr/local/bin/svr");
-        assert_eq!(shell_quote("claude"), "claude");
     }
 
     #[test]

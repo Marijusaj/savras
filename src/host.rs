@@ -970,6 +970,26 @@ impl Session {
     }
 }
 
+/// Clear the screen and force a full redraw — without asking the terminal
+/// where the cursor is.
+///
+/// `Terminal::clear` snapshots the cursor position and puts it back, which
+/// means writing `ESC [ 6 n` and waiting for the terminal to answer. Savras
+/// reads stdin itself, so the answer is swallowed by its own input loop and
+/// the query waits out its timeout before failing: `ctrl-l` and every new tab
+/// froze for two seconds and then reported that the cursor could not be read.
+///
+/// Nothing here needs the cursor kept. Each of these clears is followed
+/// immediately by a draw that paints every cell of the screen and places the
+/// cursor itself. So: clear through the backend, and reset both buffers so the
+/// next draw is a full one rather than a diff against what was on screen.
+fn repaint(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+    terminal.backend_mut().clear()?;
+    terminal.swap_buffers();
+    terminal.swap_buffers();
+    Ok(())
+}
+
 fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     mut session: Session,
@@ -1123,7 +1143,7 @@ fn event_loop(
                 }
                 match action {
                     Action::Nothing => {}
-                    Action::Repaint => terminal.clear()?,
+                    Action::Repaint => repaint(terminal)?,
                     Action::ConfirmQuit => confirming = Some(Confirm::Quit),
                     Action::ConfirmDelete => {
                         if let Some(job) = app.selected_job() {
@@ -1187,7 +1207,7 @@ fn event_loop(
                         // divider has moved and the columns it used to sit in
                         // are now the pane's.
                         if reshape(&mut session, how)? {
-                            terminal.clear()?;
+                            repaint(terminal)?;
                         }
                     }
                     Action::Regroup => {
@@ -1209,14 +1229,14 @@ fn event_loop(
                     Action::NewTab | Action::NewTabHere => match new_tab(&mut session, &app) {
                         Ok(()) => {
                             focus = Focus::Work;
-                            terminal.clear()?;
+                            repaint(terminal)?;
                         }
                         Err(e) => app.error = Some(format!("could not open a tab: {e}")),
                     },
                     Action::NewTabOn(host) => match new_remote_tab(&mut session, &host) {
                         Ok(()) => {
                             focus = Focus::Work;
-                            terminal.clear()?;
+                            repaint(terminal)?;
                         }
                         Err(e) => app.error = Some(format!("could not open a tab on {host}: {e}")),
                     },
@@ -1524,7 +1544,7 @@ pub fn remote_shell(host: &str, tmux: &str) -> Vec<String> {
         "-o".to_string(),
         "ControlPersist=10m".to_string(),
         host.to_string(),
-        format!("tmux new-session -A -s {tmux}"),
+        format!("tmux new-session -A -s {}", crate::sh::quote(tmux)),
     ]
 }
 

