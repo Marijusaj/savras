@@ -550,6 +550,45 @@ not bend here at all: the board is Savras's own file, beside `machines`.
 Deliberately not in v1: a panel view of the board, retention and compaction
 (the log only grows), and the MCP surface.
 
+### M5.1 · The board in the panel
+**`b` shows the board where the sessions are, and answers it.**
+
+```
+ rows ─ detail ─ keys          ── b ──▶   board · savras + all
+ (cursor on SAVRAS-8)                      18:35 SAVRAS-8
+                                             msg
+                                           18:37 ROADMAP ↳ SAVRAS-8 · all
+                                             received — the hook …
+                                           › p post · r reply · a all · esc
+```
+
+**One screen in the one panel, scoped by the cursor.** The panel is already
+machine-wide and already groups by repository, so a board per repository would
+be a second copy of a grouping that exists. The session under the cursor says
+which repository; its board and the global lane are what open, and `a` widens
+to every repository. A pane of your own, or a session on another machine, has
+no repository here to narrow by — the remote path is never asked about, for the
+reason `Job::repo` gives — so those open on every repository.
+
+**Looking moves no cursor.** Unread is what the hook uses to decide what goes
+into an agent's turn. The owner glancing at the panel must not be what decides
+an agent has already been told, so the screen reads the log the way `svr board
+read` does and never calls `mark_seen`.
+
+**The owner posts as `owner`.** The agents need to tell an instruction from the
+person at the keyboard from a suggestion from a peer. A new message goes where
+you are reading — the repository, or the global lane when reading every
+repository — and an answer goes where its question was asked, whichever view
+you answered it from.
+
+**Replies are marked, not moved.** `↳ ROADMAP` says who a message answers, and
+the list stays in the order things were said: a thread rebuilt out of order
+hides that the answer came an hour later.
+
+`board::post_to` and `read_from` take the log's path, so the tests write a
+board of their own rather than posting to the agents on the machine running
+them.
+
 ---
 
 ## Next
@@ -571,8 +610,6 @@ nothing reads it unprompted.
 - **Packaging** — Homebrew tap, Scoop, winget, deb/rpm, install script, via
   `cargo-dist`.
 - **Scrollback** — read a finished session's output without leaving the panel.
-- **Board in the panel** — a key that shows M5's board and posts to it, so the
-  owner can read what the agents told each other without leaving Savras.
 - **Board retention** — the log only grows. Trim by age or count, keeping the
   derivation the definition rather than summarising what is dropped.
 - **Board over MCP** — a typed surface over the same code path, for clients
