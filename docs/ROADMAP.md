@@ -589,14 +589,67 @@ hides that the answer came an hour later.
 board of their own rather than posting to the agents on the machine running
 them.
 
+### M5.2 · A board is something a repository has
+**Only where the owner made one, and only for the agents working there.**
+
+```
+BEFORE                                  AFTER
+ board.jsonl  (whole machine)            board/repos/%2F…%2Fsavras.jsonl      ◀─ created by the owner
+   topic: /…/savras   ─┐                 board/repos/%2F…%2Fprocessore.jsonl
+   topic: /…/processore┼─ one file       (books: no file → no board, hook silent)
+   topic: *  (--all) ──┘  every repo     --all ─────────▶ refused: no global lane
+ hook + sentence: on everywhere          create/clean/delete ◀─ Owner (panel, or no agent env)
+```
+
+The owner asked for the board to be per repository and under their control,
+and answered the rest in two rounds — `docs/decisions/2026-09-14-board-scope.md`
+keeps every question, the option that won and the ones that did not.
+
+**The file existing is the board existing.** One file per repository in
+Savras's own directory, named for the repository's path, reversibly — so the
+directory listing *is* the list of boards, and there is no separate list of
+enabled repositories that could disagree with it. A post opens the file without
+creating it: posting can never make a board, and a board deleted a moment ago
+stays deleted. Where there is none, the hook prints nothing and `post` says the
+owner makes boards.
+
+**Create, clean and delete take an `Owner`.** The rule is the type of an
+argument, not a sentence in an agent's instructions. The panel is the owner; a
+command line is, unless Claude Code's marks are in its environment. An agent
+could unset them — the honest limit of asking the environment — and the panel
+has no such gap. Clean empties a board and keeps it; delete removes it; both ask
+first (`--yes` on the command line).
+
+**No global lane.** In fifteen messages no agent had used it, and a lane that
+reaches every repository is the opposite of per-repository.
+
+**Cursors are per board**, so an agent's place on one repository's board says
+nothing about another's. **The old log is split once**, when a panel or command
+first opens the boards: it is renamed out of the way before anything is written,
+so two processes arriving together cannot both split it, and each reader's place
+is carried across so nobody is told twice. It is kept as
+`board.jsonl.before-per-repo`. `App` only ever takes the directory's path — a
+test that built an `App` must never be what moves the owner's real board.
+
+Found while building: an `App` built by any unit test resolved the real board
+path, and would have migrated the owner's log from inside `cargo test` had
+opening the boards been where the path came from.
+
 ---
 
 ## Next
 
+**M5.3 · The board as a tab** — decided in the same interrogation: a board row
+under its repository's heading when the board exists, opening as a tab in the
+working pane, flippable like any other, with clean and delete behind the
+panel's confirm prompt. Every tab in `host.rs` is assumed to be a pty today — a
+tab with no session id *is* a shell — so this is an explicit pane kind threaded
+through drawing, routing, resizing, flipping and closing, and the compose line
+kept safe from ctrl-w/s/t. Until then `b` shows the board in place of the rows.
+
 Wire it up, which is the owner's half of M5: `svr board install` prints the
 `settings.json` hook and the sentence for `CLAUDE.md` and `AGENTS.md`, and
-neither is installed until you put it there. Until then the board works and
-nothing reads it unprompted.
+neither is installed until you put it there.
 
 ---
 
