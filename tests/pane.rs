@@ -419,11 +419,22 @@ impl Pane {
         seen
     }
 
+    /// Read until the panel draws `needle`, or ten seconds pass.
+    ///
+    /// Every read is bounded by the deadline, and the needle is looked for after
+    /// each one. The first cut drained the channel until it had been quiet for a
+    /// quarter of a second and only then looked at either — so a panel that
+    /// never went quiet for that long held the test for as long as it kept
+    /// drawing, which on a Linux runner was the six hours CI allows.
     fn wait_for(&self, needle: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut seen = String::new();
-        while Instant::now() < deadline && !seen.contains(needle) {
-            while let Ok(chunk) = self.rx.recv_timeout(Duration::from_millis(250)) {
+        while !seen.contains(needle) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            if let Ok(chunk) = self.rx.recv_timeout(left.min(Duration::from_millis(250))) {
                 seen.push_str(&String::from_utf8_lossy(&chunk));
             }
         }
