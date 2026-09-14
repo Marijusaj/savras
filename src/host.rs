@@ -325,6 +325,13 @@ enum Action {
     ConfirmDelete,
     /// The second `d`: delete it.
     Delete,
+    /// `b` in the panel: the board of the repository the cursor is in, as a
+    /// tab in the working pane.
+    OpenBoard,
+    /// `c` on a board row: ask whether to empty it.
+    ConfirmClean,
+    /// The second `c`: empty it.
+    Clean,
 }
 
 /// A question the panel is holding open, waiting for the same key again.
@@ -348,6 +355,19 @@ enum Confirm {
         /// row it is about, so answering cannot act on a different session
         /// than the one named.
         on: Option<(String, u32)>,
+    },
+    /// Empty a repository's board. Named and counted, because what goes is
+    /// what the agents said, and nothing brings it back.
+    CleanBoard {
+        repo: String,
+        name: String,
+        count: usize,
+    },
+    /// Delete a repository's board: its agents' posts are refused until the
+    /// owner makes it again.
+    DeleteBoard {
+        repo: String,
+        name: String,
     },
 }
 
@@ -377,6 +397,15 @@ impl Confirm {
             }
             Confirm::Delete { name, .. } => {
                 format!("d again to delete {name} for good · any key keeps it")
+            }
+            Confirm::CleanBoard { name, count, .. } => {
+                format!(
+                    "c again to empty {name}'s board ({}) · any key keeps them",
+                    messages(*count)
+                )
+            }
+            Confirm::DeleteBoard { name, .. } => {
+                format!("d again to delete {name}'s board for good · any key keeps it")
             }
         }
     }
@@ -931,6 +960,7 @@ pub fn run(setup: Setup) -> Result<()> {
         command,
         switch,
         ping,
+        boards: BoardTabs::default(),
     };
 
     let mut terminal = crate::setup_terminal()?;
@@ -962,11 +992,99 @@ struct Session {
     /// The keys that flip tabs, or given back to the child by `--switch off`.
     switch: Switch,
     ping: Ping,
+    /// Boards open as tabs, and whether one is in front. See [`BoardTabs`].
+    boards: BoardTabs,
 }
 
 impl Session {
     fn work_size(&self) -> (u16, u16) {
         (work_cols(self.size.0, self.width), self.size.1)
+    }
+}
+
+/// Boards open as tabs in the working pane, and which one, if any, is in front.
+///
+/// **Beside the terminal tabs, not among them.** Every tab in [`Tabs`] is a
+/// pty: a tab with no session id *is* a shell, and the event loop reaches for
+/// the front tab's `Work` for its mouse mode, its exit, its keys and its
+/// screen. A board is none of those. So the terminal tab in front stays in
+/// front underneath; showing a board covers it, and going to any terminal tab
+/// uncovers it. To the owner it is one more tab — a row, a stop when flipping,
+/// a mark in the panel, and `x` to close it — and nothing in the pty tabs had
+/// to learn that it exists.
+#[derive(Default)]
+struct BoardTabs {
+    open: Vec<crate::app::BoardView>,
+    front: Option<usize>,
+}
+
+impl BoardTabs {
+    fn position(&self, repo: &str) -> Option<usize> {
+        self.open
+            .iter()
+            .position(|view| view.repo.as_deref() == Some(repo))
+    }
+
+    /// Bring a repository's board to the front, opening it if it is not open.
+    fn show(&mut self, dir: &Path, repo: &str) {
+        let at = match self.position(repo) {
+            Some(at) => at,
+            None => {
+                self.open.push(crate::app::BoardView::new(
+                    dir.to_path_buf(),
+                    Some(repo.to_string()),
+                ));
+                self.open.len() - 1
+            }
+        };
+        self.front = Some(at);
+    }
+
+    /// Uncover the terminal tab underneath.
+    fn hide(&mut self) {
+        self.front = None;
+    }
+
+    fn front(&self) -> Option<&crate::app::BoardView> {
+        self.front.and_then(|at| self.open.get(at))
+    }
+
+    fn front_mut(&mut self) -> Option<&mut crate::app::BoardView> {
+        self.front.and_then(|at| self.open.get_mut(at))
+    }
+
+    fn front_repo(&self) -> Option<String> {
+        self.front().and_then(|view| view.repo.clone())
+    }
+
+    /// Close a repository's board tab. The words half-written in it go with
+    /// it, as a closed terminal tab's screen does.
+    fn close(&mut self, repo: &str) -> bool {
+        let Some(at) = self.position(repo) else {
+            return false;
+        };
+        self.open.remove(at);
+        self.front = match self.front {
+            Some(front) if front == at => None,
+            Some(front) if front > at => Some(front - 1),
+            other => other,
+        };
+        true
+    }
+
+    /// The repositories with a board tab open, for the panel to mark.
+    fn repos(&self) -> Vec<String> {
+        self.open
+            .iter()
+            .filter_map(|view| view.repo.clone())
+            .collect()
+    }
+
+    /// Read every open board again, on the panel's own refresh.
+    fn reload(&mut self) {
+        for view in &mut self.open {
+            view.reload();
+        }
     }
 }
 
@@ -1046,10 +1164,22 @@ fn event_loop(
     let mut confirming: Option<Confirm> = None;
 
     loop {
+        // A board in front covers the terminal tab underneath, and nothing
+        // about that tab — its mouse mode, whether it has exited — is on
+        // screen while it does.
+        let showing_board = session.boards.front.is_some();
+
         // Follow the child in and out of mouse mode. Its request to enable
         // reporting only ever reached our parser, so mirror it outward or the
         // terminal keeps scrolling its own scrollback across both panes.
-        let wanted = session.tabs.work().mouse();
+        let wanted = if showing_board {
+            (
+                vt100::MouseProtocolMode::None,
+                vt100::MouseProtocolEncoding::Default,
+            )
+        } else {
+            session.tabs.work().mouse()
+        };
         if wanted != mouse {
             mouse = wanted;
             let mut out = std::io::stdout();
@@ -1060,7 +1190,11 @@ fn event_loop(
         // Whether the tab in front has finished. Asked of the front tab each
         // time round rather than latched, because flipping tabs changes the
         // answer — a dead tab you flip away from must stop being the banner.
-        let dead = session.tabs.work_mut().exit_code();
+        let dead = if showing_board {
+            None
+        } else {
+            session.tabs.work_mut().exit_code()
+        };
 
         // Leaving the shell you started with closes Savras — but only while you
         // are looking at it. Exiting it in a background tab leaves a dead tab
@@ -1077,7 +1211,12 @@ fn event_loop(
             // opening or closing one has to show up in the same breath as the
             // key that did it, not on the next two-second refresh.
             let named = session.tabs.named_shells(&pane_label(&session.command));
-            app.set_tabs(session.tabs.front_ref(), session.tabs.shorts(), named);
+            let front = match session.boards.front_repo() {
+                Some(repo) => Front::Board(repo),
+                None => session.tabs.front_ref(),
+            };
+            app.set_tabs(front, session.tabs.shorts(), named);
+            app.set_open_boards(session.boards.repos());
             terminal
                 .draw(|frame| draw(frame, &mut app, &session, focus, dead, confirming.as_ref()))?;
             last_draw = Instant::now();
@@ -1100,11 +1239,12 @@ fn event_loop(
                 let bytes = shift_mouse(&bytes, work_offset(session.width, session.side));
                 // A program that never asked for focus reporting would print
                 // these as stray characters, so they go no further.
-                let bytes = if session.tabs.work().wants_focus.load(Ordering::Relaxed) {
-                    bytes
-                } else {
-                    focus::strip(&bytes)
-                };
+                let bytes =
+                    if !showing_board && session.tabs.work().wants_focus.load(Ordering::Relaxed) {
+                        bytes
+                    } else {
+                        focus::strip(&bytes)
+                    };
                 let was_confirming = confirming.clone();
                 let action = if bytes.is_empty() {
                     Action::Nothing // nothing but a focus event
@@ -1117,6 +1257,10 @@ fn event_loop(
                     // the child instead, cancelling the question with the very
                     // keystroke meant to answer it.
                     where_key(&bytes, hosts, focus)
+                } else if focus == Focus::Work && showing_board && bytes.starts_with(PASTE) {
+                    // A paste into a board is words, whatever bytes are in it:
+                    // a ctrl-w inside pasted text must not flip the tab.
+                    board_tab_key(&bytes, &mut session.boards, &mut app)
                 } else if bytes.contains(&NEW_TAB) {
                     // From either side of the divider, and without going
                     // through the panel: this is the key you reach for
@@ -1131,6 +1275,8 @@ fn event_loop(
                     // through the panel: it is the one thing you do often
                     // enough that three keystrokes is two too many.
                     Action::Cycle(delta)
+                } else if focus == Focus::Work && showing_board && !bytes.contains(&FOCUS_TOGGLE) {
+                    board_tab_key(&bytes, &mut session.boards, &mut app)
                 } else if dead.is_some() && focus == Focus::Work {
                     dead_pane_key(&bytes)
                 } else {
@@ -1152,7 +1298,12 @@ fn event_loop(
                     Action::Repaint => repaint(terminal)?,
                     Action::ConfirmQuit => confirming = Some(Confirm::Quit),
                     Action::ConfirmDelete => {
-                        if let Some(job) = app.selected_job() {
+                        if let Some(board) = app.selected_board() {
+                            confirming = Some(Confirm::DeleteBoard {
+                                repo: board.repo.clone(),
+                                name: board.name.clone(),
+                            });
+                        } else if let Some(job) = app.selected_job() {
                             confirming = Some(Confirm::Delete {
                                 short: job.short.clone(),
                                 name: job.name.clone(),
@@ -1164,6 +1315,17 @@ fn event_loop(
                         }
                     }
                     Action::Delete => {
+                        if let Some(Confirm::DeleteBoard { repo, name }) = &was_confirming {
+                            let said = match crate::board::Boards::at(app.board_dir.clone())
+                                .delete(&crate::board::Owner::at_the_panel(), repo)
+                            {
+                                Ok(_) => format!("deleted {name}'s board"),
+                                Err(e) => format!("could not delete the board: {e}"),
+                            };
+                            session.boards.close(repo);
+                            app.refresh();
+                            app.error = Some(said);
+                        }
                         if let Some(Confirm::Delete { short, name, on }) = &was_confirming {
                             delete_session(
                                 &mut session,
@@ -1176,8 +1338,50 @@ fn event_loop(
                         }
                     }
                     Action::Focus(next) => focus = next,
+                    Action::OpenBoard => match app.selected_repo() {
+                        Some(repo) => {
+                            session.boards.show(&app.board_dir, &repo);
+                            focus = Focus::Work;
+                        }
+                        None => {
+                            app.error = Some(
+                                "no session of this machine's is selected, so there is \
+                                 no repository to show a board for"
+                                    .to_string(),
+                            )
+                        }
+                    },
+                    Action::ConfirmClean => {
+                        if let Some(board) = app.selected_board() {
+                            confirming = Some(Confirm::CleanBoard {
+                                repo: board.repo.clone(),
+                                name: board.name.clone(),
+                                count: board.count,
+                            });
+                        }
+                    }
+                    Action::Clean => {
+                        if let Some(Confirm::CleanBoard { repo, name, .. }) = &was_confirming {
+                            let said = match crate::board::Boards::at(app.board_dir.clone())
+                                .clean(&crate::board::Owner::at_the_panel(), repo)
+                            {
+                                Ok(gone) => {
+                                    format!("emptied {name}'s board: {} removed", messages(gone))
+                                }
+                                Err(e) => format!("could not empty the board: {e}"),
+                            };
+                            session.boards.reload();
+                            app.refresh();
+                            app.error = Some(said);
+                        }
+                    }
                     Action::Cycle(delta) => {
-                        let stop = neighbour(&app, &session.tabs.front_ref(), delta);
+                        let front = match session.boards.front_repo() {
+                            Some(repo) => Front::Board(repo),
+                            None => session.tabs.front_ref(),
+                        };
+                        let stop = neighbour(&app, &front, delta);
+                        let to_board = matches!(stop, Some(Stop::Board(_)));
                         let moved = match stop {
                             // Back to a pane of your own, in the order you
                             // opened them.
@@ -1192,13 +1396,22 @@ fn event_loop(
                             Some(Stop::Session(short)) => {
                                 open_short(&mut session, &mut app, &short)
                             }
+                            Some(Stop::Board(repo)) => {
+                                session.boards.show(&app.board_dir, &repo);
+                                app.select_board(&repo);
+                                Ok(true)
+                            }
                             None => Ok(false),
                         };
                         match moved {
                             Ok(true) => {
-                                // A session you have flipped to is one you have
-                                // been to, whatever it was asking.
-                                attend_front(&mut session, &mut app);
+                                // Any terminal tab you flip to uncovers it.
+                                if !to_board {
+                                    session.boards.hide();
+                                    // A session you have flipped to is one you
+                                    // have been to, whatever it was asking.
+                                    attend_front(&mut session, &mut app);
+                                }
                                 focus = Focus::Work;
                             }
                             Ok(false) => {}
@@ -1234,6 +1447,7 @@ fn event_loop(
                     }
                     Action::NewTab | Action::NewTabHere => match new_tab(&mut session, &app) {
                         Ok(()) => {
+                            session.boards.hide();
                             focus = Focus::Work;
                             repaint(terminal)?;
                         }
@@ -1241,11 +1455,28 @@ fn event_loop(
                     },
                     Action::NewTabOn(host) => match new_remote_tab(&mut session, &host) {
                         Ok(()) => {
+                            session.boards.hide();
                             focus = Focus::Work;
                             repaint(terminal)?;
                         }
                         Err(e) => app.error = Some(format!("could not open a tab on {host}: {e}")),
                     },
+                    // A board tab closes on its own terms: it holds no pty,
+                    // and closing it uncovers the terminal tab underneath.
+                    Action::CloseFront | Action::CloseSelected
+                        if match action {
+                            Action::CloseFront => session.boards.front.is_some(),
+                            _ => app.selected_board().is_some(),
+                        } =>
+                    {
+                        let repo = match action {
+                            Action::CloseFront => session.boards.front_repo(),
+                            _ => app.selected_board().map(|board| board.repo.clone()),
+                        };
+                        if let Some(repo) = repo {
+                            session.boards.close(&repo);
+                        }
+                    }
                     Action::CloseFront | Action::CloseSelected => {
                         let target = match action {
                             Action::CloseFront => Some(session.tabs.current),
@@ -1271,10 +1502,22 @@ fn event_loop(
                         }
                     }
                     Action::Open | Action::Reopen => {
-                        let opened = if matches!(action, Action::Reopen) {
-                            reopen(&mut session)
-                        } else {
-                            open_selected(&mut session, &mut app)
+                        let board = app.selected_board().map(|board| board.repo.clone());
+                        let opened = match (&action, board) {
+                            // Enter on a board row opens the board, as enter on
+                            // a session's row opens the session.
+                            (Action::Open, Some(repo)) => {
+                                session.boards.show(&app.board_dir, &repo);
+                                Ok(true)
+                            }
+                            (Action::Reopen, _) => reopen(&mut session),
+                            _ => {
+                                let opened = open_selected(&mut session, &mut app);
+                                if matches!(opened, Ok(true)) {
+                                    session.boards.hide();
+                                }
+                                opened
+                            }
                         };
                         match opened {
                             Ok(true) => {
@@ -1320,6 +1563,9 @@ fn event_loop(
 
         if watch.changed() || last_refresh.elapsed() >= REFRESH {
             app.refresh();
+            // An open board is a file the agents keep writing to; what they
+            // said should not wait for a key to be seen.
+            session.boards.reload();
             // A pane you started a session in is that session's tab, and stops
             // being one when you leave it. Asked here rather than before each
             // frame: it costs a `process_group_leader()` and a read of
@@ -1335,7 +1581,11 @@ fn event_loop(
             // terminal has focus; in another application it is as invisible
             // as any other, and must ping like one. A session open in a tab
             // *behind* another tab is not in front of you either.
-            let open = session.tabs.short().map(str::to_string);
+            // With a board covering it, no session is in front of you.
+            let open = match session.boards.front {
+                Some(_) => None,
+                None => session.tabs.short().map(str::to_string),
+            };
             let pinged = session
                 .ping
                 .poll(&app.snapshot, watching(window_focused, open.as_deref()));
@@ -1592,6 +1842,8 @@ enum Stop {
     /// order you opened them, which is the order the panel lists them in.
     Shell(usize),
     Session(String),
+    /// A repository's board, where its row is.
+    Board(String),
 }
 
 /// The stop one step from where you are, in the order the panel shows.
@@ -1616,6 +1868,10 @@ fn neighbour(app: &App, front: &Front, delta: isize) -> Option<Stop> {
         .iter()
         .filter_map(|row| match row {
             Row::Shell(i) => Some(Stop::Shell(*i)),
+            Row::Board(i) => app
+                .board_rows
+                .get(*i)
+                .map(|board| Stop::Board(board.repo.clone())),
             Row::Job(i) => app
                 .snapshot
                 .jobs
@@ -1633,6 +1889,7 @@ fn neighbour(app: &App, front: &Front, delta: isize) -> Option<Stop> {
         .position(|stop| match (stop, front) {
             (Stop::Shell(i), Front::Shell(j)) => i == j,
             (Stop::Session(short), Front::Session(theirs)) => short == theirs,
+            (Stop::Board(repo), Front::Board(theirs)) => repo == theirs,
             _ => false,
         })
         .unwrap_or(0) as isize;
@@ -1900,15 +2157,27 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: Option<&Confirm>) -> Actio
         // rather than falling through to `j` and `k` moving the cursor
         // underneath a question.
         Some(Confirm::Where(_)) => return Action::Nothing,
+        // Emptying or deleting a board is as final as deleting a session.
+        Some(Confirm::CleanBoard { .. }) => {
+            return match bytes {
+                [b'c'] => Action::Clean,
+                _ => Action::Focus(Focus::Panel),
+            };
+        }
+        Some(Confirm::DeleteBoard { .. }) => {
+            return match bytes {
+                [b'd'] => Action::Delete,
+                _ => Action::Focus(Focus::Panel),
+            };
+        }
         None => {}
     }
-    if app.board.is_some() {
-        return board_key(bytes, app);
-    }
     match bytes {
-        // What the agents have been saying to each other, for the session
-        // under the cursor. See `App::open_board`.
-        [b'b'] => app.open_board(),
+        // The board of the repository the cursor is in, as a tab.
+        [b'b'] => return Action::OpenBoard,
+        // Empty the board under the cursor, having asked. On any other row
+        // there is nothing to empty, and nothing happens.
+        [b'c'] => return Action::ConfirmClean,
         [b'j'] | [ESC, b'[', b'B'] => app.step(1),
         [b'k'] | [ESC, b'[', b'A'] => app.step(-1),
         [b'g'] => app.jump(false),
@@ -1946,62 +2215,81 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: Option<&Confirm>) -> Actio
     Action::Nothing
 }
 
-/// The panel's keys while the board is on screen.
+/// How a bracketed paste begins.
+const PASTE: &[u8] = b"\x1b[200~";
+
+/// `1 message`, `2 messages`.
+fn messages(n: usize) -> String {
+    if n == 1 {
+        "1 message".to_string()
+    } else {
+        format!("{n} messages")
+    }
+}
+
+/// Keys for a board in the working pane.
 ///
-/// Reading, the keys move, post, and leave — and `q` and esc leave the board
-/// rather than the panel, because that is the nearer thing to be leaving.
-/// Writing, every key is a letter, `q` and `b` included, until enter or esc.
-fn board_key(bytes: &[u8], app: &mut App) -> Action {
-    let Some(composing) = app.board.as_ref().map(|v| v.compose.is_some()) else {
+/// It is a line to write in under a conversation, so typing writes: every
+/// printable key is a letter, and a paste is its words. Enter sends — or, on a
+/// repository with no board, makes one, since that is the one thing to do
+/// there and the panel is the owner. ↑ and ↓ pick a message to answer, and esc
+/// lets go of the words first and then of the message. ctrl-g, ctrl-t and the
+/// flip keys never get here: they are the pane's, whatever tab is in it.
+fn board_tab_key(bytes: &[u8], boards: &mut BoardTabs, app: &mut App) -> Action {
+    let Some(view) = boards.front_mut() else {
         return Action::Nothing;
     };
-
-    if composing {
-        // A paste arrives wrapped in markers when the terminal brackets it,
-        // and the words inside are words like any other.
-        let text = String::from_utf8_lossy(bytes)
-            .replace("\x1b[200~", "")
-            .replace("\x1b[201~", "");
-        if matches!(text.as_bytes(), [b'\r'] | [b'\n']) {
-            app.send_board();
-            return Action::Nothing;
+    let text = String::from_utf8_lossy(bytes)
+        .replace("\x1b[200~", "")
+        .replace("\x1b[201~", "");
+    let said = match text.as_bytes() {
+        [b'\r'] | [b'\n'] if !view.exists => match view.create() {
+            Ok(Some(name)) => Some(format!("created a board for {name}")),
+            Ok(None) => None,
+            Err(e) => Some(format!("could not create the board: {e}")),
+        },
+        [b'\r'] | [b'\n'] => match &view.compose {
+            Some(compose) if !compose.text.trim().is_empty() => Some(match view.send() {
+                Ok(message) => {
+                    format!("posted to {}", crate::board::topic_name(&message.topic))
+                }
+                Err(e) => format!("could not post: {e}"),
+            }),
+            _ => None,
+        },
+        [0x7f] | [0x08] => {
+            view.backspace();
+            None
         }
-        if let Some(view) = app.board.as_mut() {
-            match text.as_bytes() {
-                [ESC] => view.cancel(),
-                [0x7f] | [0x08] => view.backspace(),
-                // An arrow, or any other sequence: nothing a line of text uses.
-                [ESC, ..] => {}
-                _ => view.type_text(&text),
+        [ESC] => {
+            if view.compose.is_some() {
+                view.cancel();
+            } else {
+                view.selected = None;
             }
+            None
         }
-        return Action::Nothing;
-    }
-
-    match bytes {
+        [ESC, b'[', b'A'] => {
+            view.step(-1);
+            None
+        }
+        [ESC, b'[', b'B'] => {
+            view.step(1);
+            None
+        }
         [REPAINT] => return Action::Repaint,
-        [b'Q'] => return Action::ConfirmQuit,
-        [ESC] | [b'q'] | [b'b'] => {
-            app.close_board();
-            return Action::Nothing;
+        // Any other sequence is a key a line of text has no use for.
+        [ESC, ..] => None,
+        _ => {
+            view.type_text(&text);
+            None
         }
-        // A board is the owner's to make, and the panel is the owner.
-        [b'c'] => {
-            app.create_board();
-            return Action::Nothing;
-        }
-        _ => {}
-    }
-    if let Some(view) = app.board.as_mut() {
-        match bytes {
-            [b'j'] | [ESC, b'[', b'B'] => view.step(1),
-            [b'k'] | [ESC, b'[', b'A'] => view.step(-1),
-            [b'g'] => view.jump(false),
-            [b'G'] => view.jump(true),
-            [b'p'] => view.compose(false),
-            [b'r'] => view.compose(true),
-            _ => {}
-        }
+    };
+    if let Some(said) = said {
+        // The row's count and existence changed; refresh first, since a
+        // refresh is also what clears the footer's last word.
+        app.refresh();
+        app.error = Some(said);
     }
     Action::Nothing
 }
@@ -2051,6 +2339,11 @@ fn draw(
     )
     .style(Style::default().fg(Color::Indexed(238)));
     frame.render_widget(divider, chunks[1]);
+
+    if let Some(view) = session.boards.front() {
+        ui::draw_board_tab(frame, work_area, view, focus == Focus::Work);
+        return;
+    }
 
     let front = session.tabs.front();
     let parser = front.work.parser.lock().unwrap();
@@ -2482,62 +2775,208 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_board_is_made_read_and_answered_from_the_panel() {
-        let f =
-            Fixture::new("board-keys").job("aaa", r#"{"state":"working","name":"X","cwd":"/tmp"}"#);
-        let dir = f.0.parent().unwrap().join("boards");
+    /// A session in a repository that has a board with one message on it, and
+    /// a panel grouped by repository, so the board has a row.
+    fn with_a_board(tag: &str) -> (Fixture, App, crate::board::Boards, String) {
+        let f = Fixture::new(tag);
+        let root = f.0.parent().unwrap().to_path_buf();
+        let repo = root.join("savras");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        let f = f.job(
+            "aaa",
+            &format!(
+                r#"{{"state":"working","name":"SAVRAS-8","cwd":"{}"}}"#,
+                repo.display()
+            ),
+        );
+        let here = repo.to_string_lossy().to_string();
+        let dir = root.join("boards");
         let boards = crate::board::Boards::at(dir.clone());
-        let repo = crate::board::topic_of(std::path::Path::new("/tmp"));
+        boards
+            .create(&crate::board::Owner::at_the_panel(), &here)
+            .unwrap();
+        boards.post("ROADMAP", &here, None, "anyone?").unwrap();
         let mut app = App::new(f.0.clone());
         app.board_dir = dir;
+        app.set_group_by(GroupBy::Repo);
+        (f, app, boards, here)
+    }
 
-        panel_key(b"b", &mut app, None);
-        assert!(app.board.is_some(), "b opens the board");
-        // No board yet: `p` has nowhere to write to, and `c` makes one.
-        panel_key(b"p", &mut app, None);
-        assert!(app.board.as_ref().unwrap().compose.is_none());
-        panel_key(b"c", &mut app, None);
-        assert!(boards.exists(&repo), "c creates the board");
-        let asked = boards.post("ROADMAP", &repo, None, "anyone?").unwrap();
-        app.refresh();
-        // Reading it, q is leaving the board — the nearer thing — and the
-        // keyboard stays with the panel.
-        assert!(matches!(panel_key(b"q", &mut app, None), Action::Nothing));
-        assert!(app.board.is_none());
+    #[test]
+    fn a_board_row_opens_empties_and_deletes_its_board_having_asked() {
+        let (_f, mut app, _boards, here) = with_a_board("board-row-keys");
+        app.select_board(&here);
 
-        panel_key(b"b", &mut app, None);
-        panel_key(b"r", &mut app, None);
-        // Writing, every key is a letter, including the ones that are keys; a
-        // bracketed paste is its words, and its line breaks are spaces.
+        assert!(matches!(panel_key(b"\r", &mut app, None), Action::Open));
+        assert!(matches!(panel_key(b"b", &mut app, None), Action::OpenBoard));
+        assert!(matches!(
+            panel_key(b"x", &mut app, None),
+            Action::CloseSelected
+        ));
+        assert!(matches!(
+            panel_key(b"c", &mut app, None),
+            Action::ConfirmClean
+        ));
+        assert!(matches!(
+            panel_key(b"d", &mut app, None),
+            Action::ConfirmDelete
+        ));
+
+        // Both ask, naming the board and what goes.
+        let clean = Confirm::CleanBoard {
+            repo: here.clone(),
+            name: "savras".into(),
+            count: 1,
+        };
+        assert!(
+            clean.question().contains("savras's board (1 message)"),
+            "{}",
+            clean.question()
+        );
+        assert!(matches!(
+            panel_key(b"c", &mut app, Some(&clean)),
+            Action::Clean
+        ));
+        assert!(matches!(
+            panel_key(b"d", &mut app, Some(&clean)),
+            Action::Focus(Focus::Panel)
+        ));
+
+        let delete = Confirm::DeleteBoard {
+            repo: here.clone(),
+            name: "savras".into(),
+        };
+        assert!(matches!(
+            panel_key(b"d", &mut app, Some(&delete)),
+            Action::Delete
+        ));
+        for answer in [&b"c"[..], b"\r", b"x"] {
+            assert!(
+                matches!(
+                    panel_key(answer, &mut app, Some(&delete)),
+                    Action::Focus(Focus::Panel)
+                ),
+                "{answer:?} must not delete a board"
+            );
+        }
+    }
+
+    #[test]
+    fn a_board_tab_is_written_in_like_a_line_of_text() {
+        let (_f, mut app, boards, here) = with_a_board("board-tab-keys");
+        let dir = app.board_dir.clone();
+        let mut tabs = BoardTabs::default();
+        tabs.show(&dir, &here);
+
+        // Typing writes, every key a letter — the panel's keys included — and
+        // a bracketed paste is its words, its line breaks spaces.
         for key in [
             &b"q"[..],
             b"b",
             b"\x1b[200~ yes\r\nsoon\x1b[201~",
             b"x",
             b"\x7f",
-            b"\x1b[A",
         ] {
-            assert!(matches!(panel_key(key, &mut app, None), Action::Nothing));
+            assert!(matches!(
+                board_tab_key(key, &mut tabs, &mut app),
+                Action::Nothing
+            ));
         }
+        board_tab_key(b"\r", &mut tabs, &mut app);
+        let posted = boards.read(&here, 10).pop().unwrap();
+        assert_eq!(posted.text, "qb yes  soon");
+        assert_eq!(posted.from, crate::board::OWNER);
+        assert!(posted.re.is_none(), "nothing was picked: a new message");
+        assert_eq!(app.error.as_deref(), Some("posted to savras"));
+
+        // ↑ picks a message, and what is written then answers it.
+        board_tab_key(b"\x1b[A", &mut tabs, &mut app);
+        board_tab_key(b"\x1b[A", &mut tabs, &mut app);
+        board_tab_key(b"on it", &mut tabs, &mut app);
+        board_tab_key(b"\r", &mut tabs, &mut app);
+        let first = boards.read(&here, 10)[0].id.clone();
+        let answer = boards.read(&here, 10).pop().unwrap();
+        assert_eq!(answer.re.as_deref(), Some(first.as_str()));
+
+        // Esc lets go of the words first, then of the message.
+        board_tab_key(b"\x1b[A", &mut tabs, &mut app);
+        board_tab_key(b"never mind", &mut tabs, &mut app);
+        board_tab_key(b"\x1b", &mut tabs, &mut app);
+        assert!(tabs.front().unwrap().compose.is_none());
+        assert!(tabs.front().unwrap().selected.is_some());
+        board_tab_key(b"\x1b", &mut tabs, &mut app);
+        assert!(tabs.front().unwrap().selected.is_none());
+        // And enter with nothing written sends nothing.
+        board_tab_key(b"\r", &mut tabs, &mut app);
+        assert_eq!(boards.count(&here), 3);
+    }
+
+    #[test]
+    fn enter_in_a_repository_without_a_board_makes_one() {
+        let (_f, mut app, boards, here) = with_a_board("board-tab-make");
+        boards
+            .delete(&crate::board::Owner::at_the_panel(), &here)
+            .unwrap();
+        app.refresh();
+        let dir = app.board_dir.clone();
+        let mut tabs = BoardTabs::default();
+        tabs.show(&dir, &here);
+
+        board_tab_key(b"hello", &mut tabs, &mut app);
         assert!(
-            app.board.as_ref().unwrap().compose.is_some(),
-            "still writing"
+            tabs.front().unwrap().compose.is_none(),
+            "there is nowhere to write yet"
         );
-        panel_key(b"\r", &mut app, None);
+        board_tab_key(b"\r", &mut tabs, &mut app);
+        assert!(boards.exists(&here));
+        assert_eq!(app.error.as_deref(), Some("created a board for savras"));
+        assert!(
+            app.board_rows.iter().any(|b| b.repo == here),
+            "and its row appears"
+        );
+    }
 
-        let answer = boards.read(&repo, 10).pop().unwrap();
-        assert_eq!(answer.text, "qb yes  soon");
-        assert_eq!(answer.from, crate::board::OWNER);
-        assert_eq!(answer.re.as_deref(), Some(asked.id.as_str()));
-        assert!(app.board.as_ref().unwrap().compose.is_none());
+    #[test]
+    fn a_board_tab_covers_the_terminal_tab_and_closing_it_uncovers_it() {
+        let dir = std::env::temp_dir().join("savras-no-boards-here");
+        let mut tabs = BoardTabs::default();
+        tabs.show(&dir, "/code/savras");
+        tabs.show(&dir, "/code/books");
+        assert_eq!(tabs.repos(), ["/code/savras", "/code/books"]);
+        assert_eq!(tabs.front_repo().as_deref(), Some("/code/books"));
 
-        // Esc abandons a message without posting it.
-        panel_key(b"p", &mut app, None);
-        panel_key(b"never mind", &mut app, None);
-        panel_key(b"\x1b", &mut app, None);
-        assert!(app.board.as_ref().unwrap().compose.is_none());
-        assert_eq!(boards.count(&repo), 2);
+        // Showing one already open brings it forward, not a second copy.
+        tabs.show(&dir, "/code/savras");
+        assert_eq!(tabs.repos().len(), 2);
+        assert_eq!(tabs.front_repo().as_deref(), Some("/code/savras"));
+
+        // Closing one behind keeps the one in front…
+        assert!(tabs.close("/code/books"));
+        assert_eq!(tabs.front_repo().as_deref(), Some("/code/savras"));
+        // …and closing the one in front uncovers the terminal tab.
+        assert!(tabs.close("/code/savras"));
+        assert!(tabs.front.is_none());
+        assert!(!tabs.close("/code/savras"));
+    }
+
+    #[test]
+    fn flipping_stops_at_a_board_on_the_way_down_its_repository() {
+        let (_f, mut app, _boards, here) = with_a_board("board-flip");
+        app.set_tabs(Front::Shell(0), Vec::new(), plain_shells(1));
+        let short = app.snapshot.jobs[0].short.clone();
+
+        assert_eq!(
+            neighbour(&app, &Front::Shell(0), 1),
+            Some(Stop::Board(here.clone()))
+        );
+        assert_eq!(
+            neighbour(&app, &Front::Board(here.clone()), 1),
+            Some(Stop::Session(short))
+        );
+        assert_eq!(
+            neighbour(&app, &Front::Board(here.clone()), -1),
+            Some(Stop::Shell(0))
+        );
     }
 
     #[test]
@@ -2853,6 +3292,7 @@ mod tests {
         match stop {
             Stop::Shell(i) => Front::Shell(*i),
             Stop::Session(short) => Front::Session(short.clone()),
+            Stop::Board(repo) => Front::Board(repo.clone()),
         }
     }
 
@@ -2923,6 +3363,7 @@ mod tests {
                 false,
                 std::time::Duration::from_secs(0),
             ),
+            boards: BoardTabs::default(),
         }
     }
 

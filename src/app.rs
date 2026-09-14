@@ -1,6 +1,6 @@
 //! Panel state: what is on screen and what is selected.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -26,6 +26,10 @@ pub enum Row {
     /// flipping already put them, and a stop you cannot see is a stop you
     /// cannot use.
     Shell(usize),
+    /// A repository's board, first under its heading, indexing
+    /// [`App::board_rows`]. Only when the repository has one, and only when
+    /// grouped by repository: a status group has no repository to put it under.
+    Board(usize),
     /// A blank line between groups. Drawn, never selected.
     Spacer,
 }
@@ -80,6 +84,8 @@ pub enum Front {
     /// The nth pane of your own, counted in the order they were opened.
     Shell(usize),
     Session(String),
+    /// A repository's board, by the repository's path.
+    Board(String),
 }
 
 pub struct App {
@@ -127,6 +133,14 @@ pub struct App {
     /// Where the boards are kept. A field of its own so a test can point it at
     /// boards of its own rather than the ones the machine's agents are reading.
     pub board_dir: PathBuf,
+    /// The boards drawn as rows, in the order they appear — rebuilt with the
+    /// rows, since whether a repository has a board is asked of the disk then.
+    pub board_rows: Vec<BoardRow>,
+    /// Which boards are open as tabs in the working pane, by repository.
+    open_boards: Vec<String>,
+    /// Which repository a directory belongs to, worked out once per directory.
+    /// See [`App::board_for`].
+    topics: HashMap<PathBuf, String>,
     pub should_quit: bool,
 }
 
@@ -160,7 +174,7 @@ pub struct Compose {
 }
 
 impl BoardView {
-    fn new(dir: PathBuf, repo: Option<String>) -> Self {
+    pub fn new(dir: PathBuf, repo: Option<String>) -> Self {
         let mut view = Self {
             dir,
             repo,
@@ -177,9 +191,9 @@ impl BoardView {
         Boards::at(self.dir.clone())
     }
 
-    /// Read the board again, keeping the cursor on its message — or on the
-    /// newest, if that is where it was, so an answer arriving is an answer you
-    /// see rather than one that lands below the fold.
+    /// Read the board again. A message you picked stays picked wherever the
+    /// list moved; nothing picked stays nothing — the bottom, where what
+    /// arrives is seen and where a new message is written.
     pub fn reload(&mut self) {
         let (exists, messages) = match &self.repo {
             Some(repo) => {
@@ -188,13 +202,10 @@ impl BoardView {
             }
             None => (false, Vec::new()),
         };
-        let on_newest =
-            self.selected.is_none() || self.selected == self.messages.len().checked_sub(1);
-        let kept = match self.selected.and_then(|i| self.messages.get(i)) {
-            Some(m) if !on_newest => messages.iter().position(|n| n.id == m.id),
-            _ => None,
-        };
-        self.selected = kept.or(messages.len().checked_sub(1));
+        self.selected = self
+            .selected
+            .and_then(|i| self.messages.get(i))
+            .and_then(|picked| messages.iter().position(|m| m.id == picked.id));
         self.messages = messages;
         self.exists = exists;
     }
@@ -206,32 +217,41 @@ impl BoardView {
             .map_or_else(|| "no repository".to_string(), board::topic_name)
     }
 
-    /// Move the cursor by `delta` messages, stopping at the ends.
+    /// Move the cursor one message up (`delta < 0`) or down. Up from nothing
+    /// picks the newest; down past the newest lets go again, which is back to
+    /// writing a new message rather than an answer. It stops at the top.
     pub fn step(&mut self, delta: isize) {
-        let Some(at) = self.selected else {
-            return;
+        let last = self.messages.len().checked_sub(1);
+        self.selected = match (self.selected, delta < 0) {
+            (None, true) => last,
+            (None, false) => None,
+            (Some(at), true) => Some(at.saturating_sub(1)),
+            (Some(at), false) if Some(at) == last => None,
+            (Some(at), false) => Some(at + 1),
         };
-        let to = at as isize + delta;
-        if to >= 0 && (to as usize) < self.messages.len() {
-            self.selected = Some(to as usize);
-        }
     }
 
+    /// The oldest message, or back to the bottom with nothing picked.
     pub fn jump(&mut self, to_end: bool) {
         self.selected = if to_end {
-            self.messages.len().checked_sub(1)
+            None
         } else {
             (!self.messages.is_empty()).then_some(0)
         };
     }
 
-    /// Start writing: a new message, or an answer to the one under the cursor.
-    /// Where there is no board there is nowhere for it to go, so nothing starts.
+    /// Start writing: a new message, or an answer — to the message picked, or
+    /// the newest when none is. Where there is no board there is nowhere for it
+    /// to go, so nothing starts.
     pub fn compose(&mut self, reply: bool) {
         if !self.exists {
             return;
         }
-        let re = match (reply, self.selected.and_then(|i| self.messages.get(i))) {
+        let picked = self
+            .selected
+            .and_then(|i| self.messages.get(i))
+            .or(self.messages.last());
+        let re = match (reply, picked) {
             (false, _) => None,
             (true, Some(m)) => Some(m.clone()),
             // Nothing on the board to answer.
@@ -246,7 +266,20 @@ impl BoardView {
     /// Characters typed or pasted. A line break becomes a space — a message is
     /// read as one line wherever it is shown — and anything else unprintable
     /// is dropped.
+    ///
+    /// Writing starts with the first letter, where nothing has started it: an
+    /// answer to the message picked, or a new message when none is. That is the
+    /// board tab, where typing is the only way to write.
     pub fn type_text(&mut self, text: &str) {
+        if self.compose.is_none() {
+            if !self.exists {
+                return;
+            }
+            self.compose = Some(Compose {
+                text: String::new(),
+                re: self.selected.and_then(|i| self.messages.get(i)).cloned(),
+            });
+        }
         let Some(compose) = self.compose.as_mut() else {
             return;
         };
@@ -272,7 +305,7 @@ impl BoardView {
     /// Post what has been written, as the owner. On failure the words are kept:
     /// a message you typed and lost to an error — an empty one, or a board
     /// deleted while you wrote — is one you type twice.
-    fn send(&mut self) -> Result<Message> {
+    pub fn send(&mut self) -> Result<Message> {
         let Some(compose) = self.compose.take() else {
             anyhow::bail!("nothing is being written");
         };
@@ -298,7 +331,7 @@ impl BoardView {
     /// Give this repository a board, as the owner — which the panel is. Returns
     /// the repository's name when one was made, and `None` when there was no
     /// repository to make it for or it already had one.
-    fn create(&mut self) -> Result<Option<String>> {
+    pub fn create(&mut self) -> Result<Option<String>> {
         let Some(repo) = self.repo.clone() else {
             return Ok(None);
         };
@@ -306,6 +339,17 @@ impl BoardView {
         self.reload();
         Ok(made.then(|| board::topic_name(&repo)))
     }
+}
+
+/// A repository's board, as a row under the repository's heading.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoardRow {
+    /// The repository, by path — what the board is kept under.
+    pub repo: String,
+    /// The repository, as it is shown.
+    pub name: String,
+    /// How many messages the board holds, as of the last refresh.
+    pub count: usize,
 }
 
 /// How a session relates to the working pane.
@@ -322,11 +366,12 @@ pub enum Tab {
 enum Anchor {
     Shell(usize),
     Job(String),
+    Board(String),
 }
 
 /// Rows you can land on. Headings and blank lines are drawn, never selected.
 fn selectable(row: &Row) -> bool {
-    matches!(row, Row::Job(_) | Row::Shell(_))
+    matches!(row, Row::Job(_) | Row::Shell(_) | Row::Board(_))
 }
 
 impl App {
@@ -352,6 +397,9 @@ impl App {
             // The path only: opening the boards migrates the old log, and that
             // is for a panel starting up, not for every `App` a test builds.
             board_dir: board::default_dir().unwrap_or_default(),
+            board_rows: Vec::new(),
+            open_boards: Vec::new(),
+            topics: HashMap::new(),
             should_quit: false,
         };
         app.refresh();
@@ -385,6 +433,13 @@ impl App {
             self.rebuild_rows();
             self.restore_selection(anchor);
         }
+    }
+
+    /// Tell the panel which boards are open as tabs. Kept apart from
+    /// [`App::set_tabs`] because boards are not terminal tabs, and nothing
+    /// about a shell or a session needs to know they exist.
+    pub fn set_open_boards(&mut self, open: Vec<String>) {
+        self.open_boards = open;
     }
 
     /// What the nth pane of your own is called.
@@ -438,6 +493,7 @@ impl App {
             // that has been true since before there were tabs. Several do.
             Front::Shell(_) if self.shells.len() < 2 => None,
             Front::Shell(i) => Some(self.shell_name(*i)),
+            Front::Board(repo) => Some(format!("board · {}", board::topic_name(repo))),
         }
     }
 
@@ -459,9 +515,19 @@ impl App {
         }
     }
 
-    /// How many sessions are open behind the one you are looking at.
+    /// Whether a repository's board is open as a tab, and whether it is the one
+    /// in front — marked the way a session's tab is, because it is one.
+    pub fn board_tab(&self, repo: &str) -> Tab {
+        match &self.front {
+            Some(Front::Board(front)) if front == repo => Tab::Front,
+            _ if self.open_boards.iter().any(|open| open == repo) => Tab::Behind,
+            _ => Tab::None,
+        }
+    }
+
+    /// How many tabs are open behind the one you are looking at.
     pub fn behind_count(&self) -> usize {
-        (self.shells.len() + self.tabs.len()).saturating_sub(1)
+        (self.shells.len() + self.tabs.len() + self.open_boards.len()).saturating_sub(1)
     }
 
     pub fn alert_count(&self) -> usize {
@@ -517,11 +583,21 @@ impl App {
     /// session on another machine — there is no repository to show one for. A
     /// remote `cwd` is never asked about: see `Job::repo` for what that costs.
     pub fn open_board(&mut self) {
-        let repo = match self.selected_job() {
+        let repo = self.selected_repo();
+        self.board = Some(BoardView::new(self.board_dir.clone(), repo));
+    }
+
+    /// The repository the cursor is in: a board row's own, or the one a
+    /// session of this machine's is working in. `None` for a pane of your own
+    /// or a session on another machine, whose path is never looked up here.
+    pub fn selected_repo(&self) -> Option<String> {
+        if let Some(board) = self.selected_board() {
+            return Some(board.repo.clone());
+        }
+        match self.selected_job() {
             Some(job) if job.machine.is_none() => Some(board::topic_of(&job.cwd)),
             _ => None,
-        };
-        self.board = Some(BoardView::new(self.board_dir.clone(), repo));
+        }
     }
 
     pub fn close_board(&mut self) {
@@ -595,6 +671,10 @@ impl App {
                 .get(i)
                 .map(|j| Anchor::Job(j.short.clone())),
             Some(Row::Shell(i)) => Some(Anchor::Shell(i)),
+            Some(Row::Board(i)) => self
+                .board_rows
+                .get(i)
+                .map(|board| Anchor::Board(board.repo.clone())),
             _ => None,
         }
     }
@@ -607,6 +687,7 @@ impl App {
     fn rebuild_rows(&mut self) {
         self.rows.clear();
         self.nested.clear();
+        self.board_rows.clear();
         // Your own panes first, unheaded: one shell needs no group and several
         // read as a list on their own.
         for i in 0..self.shells.len() {
@@ -671,6 +752,12 @@ impl App {
                 self.rows.push(Row::Spacer);
             }
             self.rows.push(Row::Repo(g));
+            // The repository's board, first under its heading — where it is
+            // found before the sessions talking on it.
+            if let Some(board) = self.board_for(&group) {
+                self.rows.push(Row::Board(self.board_rows.len()));
+                self.board_rows.push(board);
+            }
             // A lead, then its own agents under it. Recorded here rather than
             // asked again while drawing: it is the same derivation, and two of
             // them is how the row and the indent come to disagree.
@@ -681,6 +768,34 @@ impl App {
                 self.rows.push(Row::Job(at));
             }
         }
+    }
+
+    /// The board of the repository these sessions are in, if it has one.
+    ///
+    /// Asked of a session of this machine's only: a remote `cwd` is a path on
+    /// another machine, never looked up here (see `Job::repo`). Which
+    /// repository a directory is in is a walk up for `.git`, so it is kept per
+    /// directory — rows are rebuilt on every refresh, and that answer changes
+    /// only when a repository is made or moved. Whether the board exists, and
+    /// how much is on it, is asked every time: that is what changes.
+    fn board_for(&mut self, group: &[usize]) -> Option<BoardRow> {
+        let cwd = group
+            .iter()
+            .map(|&i| &self.snapshot.jobs[i])
+            .find(|job| job.machine.is_none())?
+            .cwd
+            .clone();
+        let repo = self
+            .topics
+            .entry(cwd)
+            .or_insert_with_key(|cwd| board::topic_of(cwd))
+            .clone();
+        let boards = Boards::at(self.board_dir.clone());
+        boards.exists(&repo).then(|| BoardRow {
+            name: board::topic_name(&repo),
+            count: boards.count(&repo),
+            repo,
+        })
     }
 
     /// The repositories in play, most-waiting first and then by name.
@@ -726,6 +841,9 @@ impl App {
                 self.rows.iter().position(|r| match (r, &anchor) {
                     (Row::Job(i), Anchor::Job(short)) => &self.snapshot.jobs[*i].short == short,
                     (Row::Shell(i), Anchor::Shell(j)) => i == j,
+                    (Row::Board(i), Anchor::Board(repo)) => {
+                        self.board_rows.get(*i).is_some_and(|b| &b.repo == repo)
+                    }
                     _ => false,
                 })
             })
@@ -795,6 +913,25 @@ impl App {
             .iter()
             .position(|r| matches!(r, Row::Shell(j) if *j == i))
         {
+            self.list_state.select(Some(row));
+        }
+    }
+
+    /// The board row the cursor is on, if it is on one.
+    pub fn selected_board(&self) -> Option<&BoardRow> {
+        match self.current_row() {
+            Some(Row::Board(i)) => self.board_rows.get(i),
+            _ => None,
+        }
+    }
+
+    /// Put the cursor on a repository's board row, so flipping to the board
+    /// moves the highlight with you.
+    pub fn select_board(&mut self, repo: &str) {
+        if let Some(row) = self.rows.iter().position(|r| match r {
+            Row::Board(i) => self.board_rows.get(*i).is_some_and(|b| b.repo == repo),
+            _ => false,
+        }) {
             self.list_state.select(Some(row));
         }
     }
@@ -1214,8 +1351,9 @@ mod tests {
         assert!(view.exists);
         assert_eq!(view.name(), "savras");
         assert_eq!(on_board(&app), ["the ubuntu leg hangs"]);
-        // On the newest, which is what you opened it to see.
-        assert_eq!(view.selected, Some(0));
+        // Nothing picked: the bottom, where the newest is and a new message is
+        // written.
+        assert_eq!(view.selected, None);
     }
 
     #[test]
@@ -1284,7 +1422,7 @@ mod tests {
             posted.id,
             "and it is on screen"
         );
-        assert_eq!(view.selected, Some(view.messages.len() - 1));
+        assert_eq!(view.selected, None, "back at the bottom");
 
         // An answer carries what it answers, on the same board.
         let first = boards.read(&here, 10)[0].id.clone();
@@ -1345,7 +1483,7 @@ mod tests {
         app.refresh();
         let view = app.board.as_ref().unwrap();
         assert_eq!(view.messages.last().unwrap().text, "green now");
-        assert_eq!(view.selected, Some(view.messages.len() - 1));
+        assert_eq!(view.selected, None, "still at the bottom, where it arrived");
 
         // Scrolled back to read something, the cursor stays where you put it.
         app.board.as_mut().unwrap().jump(false);
@@ -1389,6 +1527,119 @@ mod tests {
         app.close_board();
 
         assert_eq!(tree(&dir), before, "the boards are exactly as they were");
+    }
+
+    #[test]
+    fn a_repositorys_board_is_a_row_under_its_heading_while_it_exists() {
+        let (f, dir, here) = with_a_board("board-row", true);
+        let mut app = App::new(f.0.clone());
+        app.board_dir = dir.clone();
+        app.set_group_by(GroupBy::Repo);
+
+        let heading = app
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Repo(_)))
+            .unwrap();
+        assert!(
+            matches!(app.rows[heading + 1], Row::Board(0)),
+            "first under its heading: {:?}",
+            app.rows
+        );
+        assert_eq!(
+            app.board_rows,
+            [BoardRow {
+                repo: here.clone(),
+                name: "savras".to_string(),
+                count: 1
+            }]
+        );
+
+        // Grouped by status there is no heading to put it under.
+        app.set_group_by(GroupBy::Status);
+        assert!(!app.rows.iter().any(|r| matches!(r, Row::Board(_))));
+        assert!(app.board_rows.is_empty());
+
+        // Deleted, it is gone on the next refresh.
+        app.set_group_by(GroupBy::Repo);
+        Boards::at(dir)
+            .delete(&Owner::at_the_panel(), &here)
+            .unwrap();
+        app.refresh();
+        assert!(app.board_rows.is_empty());
+    }
+
+    #[test]
+    fn the_cursor_lands_on_a_board_row_and_keeps_to_it() {
+        let (f, dir, here) = with_a_board("board-cursor", true);
+        let mut app = App::new(f.0.clone());
+        app.board_dir = dir;
+        app.set_group_by(GroupBy::Repo);
+
+        app.jump(false);
+        assert_eq!(
+            app.selected_board().map(|b| b.repo.as_str()),
+            Some(here.as_str()),
+            "the first row you can land on"
+        );
+        assert_eq!(app.selected_repo().as_deref(), Some(here.as_str()));
+        app.step(1);
+        assert_eq!(
+            app.selected_job().map(|j| j.name.as_str()),
+            Some("SAVRAS-8")
+        );
+
+        app.select_board(&here);
+        app.refresh();
+        assert!(
+            app.selected_board().is_some(),
+            "a refresh keeps the cursor on the board"
+        );
+    }
+
+    #[test]
+    fn a_board_open_as_a_tab_is_marked_and_named_like_one() {
+        let (f, dir, here) = with_a_board("board-tab-mark", true);
+        let mut app = App::new(f.0.clone());
+        app.board_dir = dir;
+        app.set_group_by(GroupBy::Repo);
+
+        assert_eq!(app.board_tab(&here), Tab::None);
+        app.set_open_boards(vec![here.clone()]);
+        assert_eq!(app.board_tab(&here), Tab::Behind);
+        app.set_tabs(Front::Board(here.clone()), Vec::new(), shells(1));
+        assert_eq!(app.board_tab(&here), Tab::Front);
+        assert_eq!(app.front_name().as_deref(), Some("board · savras"));
+        assert_eq!(app.behind_count(), 1, "the shell underneath it");
+    }
+
+    #[test]
+    fn nothing_picked_is_a_new_message_and_a_picked_one_is_answered() {
+        let (_f, dir, here) = with_a_board("board-pick", true);
+        Boards::at(dir.clone())
+            .post("RESEARCH", &here, None, "second")
+            .unwrap();
+        let mut view = BoardView::new(dir, Some(here));
+
+        assert_eq!(view.selected, None);
+        view.step(1);
+        assert_eq!(view.selected, None, "nothing below the bottom");
+        view.step(-1);
+        assert_eq!(view.selected, Some(1), "up from the bottom is the newest");
+        view.step(-1);
+        view.step(-1);
+        assert_eq!(view.selected, Some(0), "and it stops at the top");
+        view.step(1);
+        view.step(1);
+        assert_eq!(view.selected, None, "down past the newest lets go");
+
+        view.type_text("new");
+        assert!(view.compose.as_ref().unwrap().re.is_none());
+        view.cancel();
+        view.step(-1);
+        view.type_text("on it");
+        let answering = view.compose.as_ref().unwrap().re.as_ref().unwrap();
+        assert_eq!(answering.text, "second");
     }
 
     #[test]
