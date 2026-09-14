@@ -538,7 +538,7 @@ fn draw_board(frame: &mut Frame, area: Rect, app: &App) {
             ),
             Span::styled(
                 truncate(
-                    &format!(" · {}", view.lane()),
+                    &format!(" · {}", view.name()),
                     (area.width as usize).saturating_sub(5),
                 ),
                 Style::default().fg(Color::DarkGray),
@@ -547,12 +547,24 @@ fn draw_board(frame: &mut Frame, area: Rect, app: &App) {
         chunks[0],
     );
 
-    if view.messages.is_empty() {
+    if !view.exists || view.messages.is_empty() {
+        // A repository without a board is the common case, and a blank screen
+        // would read as a board nobody has written on. Say which it is.
+        let said = match (&view.repo, view.exists) {
+            (None, _) => "No session of this machine's is selected, so there is no \
+                          repository to show a board for."
+                .to_string(),
+            (Some(_), false) => format!(
+                "{} has no board. Press c to create one, and the agents working \
+                 there can read it and post to it.",
+                view.name()
+            ),
+            (Some(_), true) => "Nothing on the board yet.".to_string(),
+        };
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "Nothing on the board yet.",
-                Style::default().fg(Color::DarkGray),
-            ))),
+            Paragraph::new(said)
+                .style(Style::default().fg(Color::DarkGray))
+                .wrap(Wrap { trim: true }),
             chunks[1],
         );
     } else {
@@ -614,21 +626,6 @@ fn board_lines(view: &BoardView, width: usize) -> (Vec<Line<'static>>, Option<us
                 Style::default().fg(Color::Indexed(140)),
             ));
         }
-        // Which lane, whenever the screen holds more than one: a message to
-        // every agent must not read like one to this repository.
-        let lane = if m.topic == board::EVERYWHERE {
-            Some("all".to_string())
-        } else if view.everywhere {
-            Some(board::topic_name(&m.topic))
-        } else {
-            None
-        };
-        if let Some(lane) = lane {
-            head.push(Span::styled(
-                format!(" · {lane}"),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
         lines.push(Line::from(head));
         for row in wrap(&m.text, width.saturating_sub(2)) {
             lines.push(Line::from(Span::styled(
@@ -651,8 +648,8 @@ fn board_lines(view: &BoardView, width: usize) -> (Vec<Line<'static>>, Option<us
 fn draw_compose(frame: &mut Frame, area: Rect, view: &BoardView, compose: &Compose) {
     let width = area.width as usize;
     let whither = match &compose.re {
-        Some(m) => format!("to {} · answering {}", view.destination_name(), m.from),
-        None => format!("to {} as {}", view.destination_name(), board::OWNER),
+        Some(m) => format!("to {} · answering {}", view.name(), m.from),
+        None => format!("to {} as {}", view.name(), board::OWNER),
     };
     let chars: Vec<char> = compose.text.chars().collect();
     let shown: String = chars[chars.len().saturating_sub(width.saturating_sub(3))..]
@@ -798,12 +795,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
                 Style::default().fg(Color::DarkGray),
             )
         }
+        // Only the keys that would do something: `p` on a repository with no
+        // board is a key pressed to no effect, which reads as a broken one.
         (None, Hint::Focused | Hint::Standalone) if app.board.is_some() => Span::styled(
             truncate(
-                if area.width >= ROOMY {
-                    "p post · r reply · a all repos · esc back"
-                } else {
-                    "p post · r reply · a all · esc back"
+                match app.board.as_ref() {
+                    Some(view) if view.exists => "p post · r reply · esc back",
+                    Some(view) if view.repo.is_some() => "c create a board · esc back",
+                    _ => "esc back",
                 },
                 area.width as usize,
             ),
@@ -1601,42 +1600,45 @@ mod tests {
             .collect()
     }
 
-    /// A session, and the two messages this feature was first tested with.
-    fn a_board(tag: &str) -> (Fixture, std::path::PathBuf) {
+    /// A session in `/tmp`, and — when `made` — a board for it holding the two
+    /// messages this feature was first tested with.
+    fn a_board(tag: &str, made: bool) -> (Fixture, std::path::PathBuf) {
         let f = Fixture::new(tag).job(
             "aaa",
             r#"{"state":"working","name":"SAVRAS-8","cwd":"/tmp"}"#,
         );
-        let log = f.0.parent().unwrap().join("board.jsonl");
-        let first = board::post_to(&log, "SAVRAS-8", board::EVERYWHERE, None, "msg").unwrap();
-        board::post_to(
-            &log,
-            "ROADMAP",
-            board::EVERYWHERE,
-            Some(first.id),
-            "received — the hook delivered it into my turn unprompted, so the round trip works",
-        )
-        .unwrap();
-        (f, log)
+        let dir = f.0.parent().unwrap().join("boards");
+        if made {
+            let boards = board::Boards::at(dir.clone());
+            let repo = board::topic_of(std::path::Path::new("/tmp"));
+            boards.create(&board::Owner::at_the_panel(), &repo).unwrap();
+            let first = boards.post("SAVRAS-8", &repo, None, "msg").unwrap();
+            boards
+                .post(
+                    "ROADMAP",
+                    &repo,
+                    Some(first.id),
+                    "received — the hook delivered it into my turn unprompted, so the round trip works",
+                )
+                .unwrap();
+        }
+        (f, dir)
     }
 
     #[test]
     fn the_board_takes_the_place_of_the_rows_and_says_who_is_answered() {
-        let (f, log) = a_board("ui-board");
+        let (f, dir) = a_board("ui-board", true);
         let mut app = App::new(f.0.clone());
-        app.board_log = log;
+        app.board_dir = dir;
         app.open_board();
         let lines = render_board(&mut app, 44, 24);
         let text = lines.join("\n");
 
-        assert!(text.contains("board · tmp + all"), "{text}");
+        assert!(text.contains("board · tmp"), "{text}");
         assert!(!text.contains("WORKING"), "the rows give way: {text}");
-        assert!(
-            text.contains("SAVRAS · live") || text.contains("SAVRAS"),
-            "the header stays"
-        );
-        // Marked with who it answers, and which lane it is in.
-        assert!(text.contains("ROADMAP ↳ SAVRAS-8 · all"), "{text}");
+        assert!(text.contains("SAVRAS"), "the header stays: {text}");
+        assert!(text.contains("ROADMAP ↳ SAVRAS-8"), "{text}");
+        assert!(!text.contains("· all"), "there is no lane to name: {text}");
         // Wrapped at the panel's width rather than clipped at it.
         assert!(text.contains("unprompted"), "{text}");
         assert!(text.contains("works"), "{text}");
@@ -1647,17 +1649,34 @@ mod tests {
     }
 
     #[test]
-    fn a_message_being_written_says_where_it_is_going() {
-        let (f, log) = a_board("ui-board-compose");
+    fn a_repository_without_a_board_says_so_and_offers_to_make_one() {
+        let (f, dir) = a_board("ui-board-none", false);
         let mut app = App::new(f.0.clone());
-        app.board_log = log;
+        app.board_dir = dir;
+        app.open_board();
+        let lines = render_board(&mut app, 44, 24);
+        let text = lines.join("\n");
+
+        assert!(text.contains("tmp has no board"), "{text}");
+        assert!(text.contains("c create a board"), "{text}");
+        assert!(!text.contains("p post"), "nowhere to post: {text}");
+        for line in &lines {
+            assert!(line.chars().count() <= 44, "overflowed: {line:?}");
+        }
+    }
+
+    #[test]
+    fn a_message_being_written_says_where_it_is_going() {
+        let (f, dir) = a_board("ui-board-compose", true);
+        let mut app = App::new(f.0.clone());
+        app.board_dir = dir;
         app.open_board();
         let view = app.board.as_mut().unwrap();
         view.compose(true);
         view.type_text("on it");
         let text = render_board(&mut app, 44, 24).join("\n");
 
-        assert!(text.contains("to all · answering ROADMAP"), "{text}");
+        assert!(text.contains("to tmp · answering ROADMAP"), "{text}");
         assert!(text.contains("› on it"), "{text}");
         assert!(text.contains("enter post · esc cancel"), "{text}");
     }

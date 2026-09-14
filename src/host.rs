@@ -998,6 +998,12 @@ fn event_loop(
     machines: Vec<String>,
 ) -> Result<()> {
     let mut app = App::new(session.jobs_dir.clone());
+    // Opening the boards is what splits the old machine-wide log, once. The
+    // panel is one of the two things that start up at the owner's hand, so it
+    // is one of the two places this happens.
+    if let Err(e) = crate::board::Boards::open() {
+        app.error = Some(format!("the board: {e}"));
+    }
     app.set_group_by(group_by);
     // The shell Savras opened with stays as the first tab either way, so
     // whatever this lands on, ctrl-w takes you back to a prompt.
@@ -1979,6 +1985,11 @@ fn board_key(bytes: &[u8], app: &mut App) -> Action {
             app.close_board();
             return Action::Nothing;
         }
+        // A board is the owner's to make, and the panel is the owner.
+        [b'c'] => {
+            app.create_board();
+            return Action::Nothing;
+        }
         _ => {}
     }
     if let Some(view) = app.board.as_mut() {
@@ -1987,7 +1998,6 @@ fn board_key(bytes: &[u8], app: &mut App) -> Action {
             [b'k'] | [ESC, b'[', b'A'] => view.step(-1),
             [b'g'] => view.jump(false),
             [b'G'] => view.jump(true),
-            [b'a'] => view.toggle_everywhere(),
             [b'p'] => view.compose(false),
             [b'r'] => view.compose(true),
             _ => {}
@@ -2473,18 +2483,24 @@ mod tests {
     }
 
     #[test]
-    fn the_board_is_read_and_answered_from_the_panel() {
+    fn the_board_is_made_read_and_answered_from_the_panel() {
         let f =
             Fixture::new("board-keys").job("aaa", r#"{"state":"working","name":"X","cwd":"/tmp"}"#);
-        let log = f.0.parent().unwrap().join("board.jsonl");
-        let asked =
-            crate::board::post_to(&log, "ROADMAP", crate::board::EVERYWHERE, None, "anyone?")
-                .unwrap();
+        let dir = f.0.parent().unwrap().join("boards");
+        let boards = crate::board::Boards::at(dir.clone());
+        let repo = crate::board::topic_of(std::path::Path::new("/tmp"));
         let mut app = App::new(f.0.clone());
-        app.board_log = log.clone();
+        app.board_dir = dir;
 
         panel_key(b"b", &mut app, None);
         assert!(app.board.is_some(), "b opens the board");
+        // No board yet: `p` has nowhere to write to, and `c` makes one.
+        panel_key(b"p", &mut app, None);
+        assert!(app.board.as_ref().unwrap().compose.is_none());
+        panel_key(b"c", &mut app, None);
+        assert!(boards.exists(&repo), "c creates the board");
+        let asked = boards.post("ROADMAP", &repo, None, "anyone?").unwrap();
+        app.refresh();
         // Reading it, q is leaving the board — the nearer thing — and the
         // keyboard stays with the panel.
         assert!(matches!(panel_key(b"q", &mut app, None), Action::Nothing));
@@ -2510,7 +2526,7 @@ mod tests {
         );
         panel_key(b"\r", &mut app, None);
 
-        let answer = crate::board::read_from(&log, None, 10).pop().unwrap();
+        let answer = boards.read(&repo, 10).pop().unwrap();
         assert_eq!(answer.text, "qb yes  soon");
         assert_eq!(answer.from, crate::board::OWNER);
         assert_eq!(answer.re.as_deref(), Some(asked.id.as_str()));
@@ -2521,7 +2537,7 @@ mod tests {
         panel_key(b"never mind", &mut app, None);
         panel_key(b"\x1b", &mut app, None);
         assert!(app.board.as_ref().unwrap().compose.is_none());
-        assert_eq!(crate::board::read_from(&log, None, 10).len(), 2);
+        assert_eq!(boards.count(&repo), 2);
     }
 
     #[test]

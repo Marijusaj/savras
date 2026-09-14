@@ -1,4 +1,5 @@
-//! The board: what one agent says, where every other agent can read it.
+//! The board: what the agents working in one repository say to each other,
+//! where the others — and the owner — can read it.
 //!
 //! Claude Code already has `SendMessage`, and it is point-to-point: you must
 //! name the recipient, and the recipient must be running. That covers a lead
@@ -7,41 +8,45 @@
 //! which is the one capability every CLI agent has. Codex cannot `SendMessage`
 //! a Claude Code session; it can run `svr board post`.
 //!
+//! # A board is something a repository has
+//!
+//! **Only where the owner made one.** A repository has a board when its file
+//! exists, and not otherwise: the owner creates it, cleans it, deletes it and
+//! creates it again, and an agent can read and post to one that is there and do
+//! nothing else. There is no lane across repositories. The file existing *is*
+//! the board being on — there is no list of enabled repositories beside it that
+//! could disagree. See `docs/decisions/2026-09-14-board-scope.md`.
+//!
 //! # The constraint that shapes all of this
 //!
-//! **Nothing can put words into a session that is already running.** Savras
-//! learned this in M2.3 and worked around it by briefing an agent through its
-//! *opening prompt*. The same wall stands here: the board can be written at
-//! any moment and can only be *read* when an agent chooses to read it. So the
-//! board's own job is to be a well-behaved store, and being noticed is the
-//! harness's job — a `UserPromptSubmit` hook running [`unread`] prepends what
-//! is new to a turn that was going to happen anyway. See [`install_text`].
+//! **Nothing can put words into a session that is already running.** The board
+//! can be written at any moment and can only be *read* when an agent chooses to
+//! read it. So the board's own job is to be a well-behaved store, and being
+//! noticed is the harness's job — a `UserPromptSubmit` hook running
+//! `svr board unread --hook` prepends what is new to a turn that was going to
+//! happen anyway, and says nothing at all in a repository with no board.
 //!
 //! # Facts, not conclusions
 //!
-//! The log holds messages. Everything else is derived: threads come from
-//! `re`, "unread" comes from a per-reader cursor, and the rendered board comes
-//! from both. Nothing summarised is stored, so a changed definition is a
-//! changed function rather than a migration over history.
+//! A board holds messages. Everything else is derived: threads come from `re`,
+//! "unread" from a per-reader cursor, and the rendered board from both.
 //!
 //! # Append-only, and why that is the whole storage design
 //!
-//! `board.jsonl` is opened `O_APPEND` and written one line at a time. Two
-//! agents posting at the same instant need no lock, because the kernel makes
-//! the offset update atomic — and a file that is only ever appended to cannot
-//! be caught mid-rewrite, which is exactly the failure M2.1 spent a milestone
-//! closing on `state.json`. A torn line is still conceivable for a very large
-//! write, so [`LIMIT`] caps a message well under the page size rather than
-//! leaving it to luck, and a line that does not parse is skipped rather than
-//! killing the read.
+//! A board is opened `O_APPEND` and written one line at a time. Two agents
+//! posting at the same instant need no lock, because the kernel makes the offset
+//! update atomic — and a file that is only ever appended to cannot be caught
+//! mid-rewrite. [`LIMIT`] caps a message well under the page size, and a line
+//! that does not parse is skipped rather than killing the read. Cleaning a board
+//! truncates it, which an appending writer survives: its next line lands at the
+//! new end.
 //!
-//! Savras still writes nothing to `~/.claude/` and still disturbs no running
-//! session. The board is its own file, beside `machines` in its own config
-//! directory.
+//! Savras still writes nothing to `~/.claude/` and nothing into a repository.
+//! The boards are its own files, beside `machines` in its own config directory.
 
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -50,18 +55,12 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// The global lane: posted to with `--all`, and read by everyone whatever
-/// repository they are in.
-///
-/// A path can never collide with this, because a topic is always absolute.
-pub const EVERYWHERE: &str = "*";
-
 /// The longest a message may be.
 ///
-/// This is a storage decision rather than a stylistic one — see the module
-/// note on append atomicity. It is also about the reader: the hook puts
-/// unread messages into somebody's context on every turn, and an agent that
-/// can paste a megabyte into that is an agent that empties everyone's window.
+/// A storage decision rather than a stylistic one — see the module note on
+/// append atomicity. It is also about the reader: the hook puts unread messages
+/// into somebody's context on every turn, and an agent that can paste a
+/// megabyte into that is an agent that empties everyone's window.
 pub const LIMIT: usize = 2000;
 
 /// How many messages a bare `read` shows, and the most a hook will inject.
@@ -74,7 +73,7 @@ pub const WINDOW: usize = 30;
 /// not a suggestion from a peer.
 pub const OWNER: &str = "owner";
 
-/// One thing said on the board.
+/// One thing said on a board.
 ///
 /// Serialised one per line. Unknown fields are kept out of the way rather than
 /// rejected, so an older `svr` can read a newer board.
@@ -84,7 +83,9 @@ pub struct Message {
     pub at: DateTime<Utc>,
     /// The display name of the session that posted, as resolved at post time.
     pub from: String,
-    /// The repository this belongs to, or [`EVERYWHERE`].
+    /// The repository this was said in. Redundant with the file it is in, and
+    /// kept because a message read on its own — `--json`, a migrated log — must
+    /// still say where it belongs.
     pub topic: String,
     /// The message this answers, when it answers one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -93,65 +94,410 @@ pub struct Message {
 }
 
 impl Message {
-    /// Whether a reader sitting in `topic` should see this.
-    ///
-    /// Pure, and the whole of the scoping rule: your own repository, plus the
-    /// global lane. Per-repo keeps a `BOOKS` agent out of a `SAVRAS`
-    /// conversation it cannot help with; the lane is how something that
-    /// genuinely concerns everyone gets said once.
-    pub fn concerns(&self, topic: &str) -> bool {
-        self.topic == EVERYWHERE || self.topic == topic
-    }
-
     /// The one line an agent reads.
     ///
     /// Machine-shaped rather than pretty — but still plain text, because a
     /// board you cannot `tail` is a board you cannot debug. The id leads so
     /// that replying is a copy rather than a lookup.
     pub fn line(&self) -> String {
-        let lane = if self.topic == EVERYWHERE {
-            " (all)".to_string()
-        } else {
-            String::new()
-        };
         let re = match &self.re {
             Some(id) => format!(" re:{id}"),
             None => String::new(),
         };
         format!(
-            "[{}] {} {}{}{}: {}",
+            "[{}] {} {}{}: {}",
             self.id,
             self.at.format("%H:%M"),
             self.from,
-            lane,
             re,
             self.text
         )
     }
 }
 
-// --- where it lives ------------------------------------------------------
+// --- who may do what -----------------------------------------------------
 
-/// The board's directory, beside `machines`.
-pub fn dir() -> Result<PathBuf> {
+/// Proof that the owner, not an agent, is asking.
+///
+/// Creating, cleaning and deleting a board each take one, and there are only
+/// two ways to get one: the panel, which runs at the owner's keyboard, and a
+/// command line that carries no agent's marks. So the rule is not a sentence
+/// in an agent's instructions, which an agent can ignore; it is the type of an
+/// argument, which nothing can call past.
+pub struct Owner(());
+
+impl Owner {
+    /// The panel is the owner: it is the thing at their keyboard.
+    pub fn at_the_panel() -> Self {
+        Owner(())
+    }
+
+    /// The command line's claim to be the owner, refused under an agent.
+    ///
+    /// Claude Code marks every shell it starts, and that mark is what is read.
+    /// An agent could unset the variables and pass, and that is the honest
+    /// limit of asking the environment; the panel has no such gap. Other
+    /// clients that mark nothing are not recognised as agents.
+    pub fn from_env() -> Result<Self> {
+        match agent_marker(|key| std::env::var(key).ok()) {
+            Some(marker) => anyhow::bail!(
+                "only the owner creates, cleans or deletes a board, and this is \
+                 running under an agent ({marker} is set) — use the board in the \
+                 panel, or a terminal of your own"
+            ),
+            None => Ok(Owner(())),
+        }
+    }
+}
+
+/// Where the machine's boards are kept, without opening them.
+///
+/// [`Boards::open`] also migrates the machine-wide log, which is right for a
+/// command or a panel starting up and wrong for anything that merely wants
+/// the path — a test building an `App` must never be what moves the owner's
+/// real board.
+pub fn default_dir() -> Result<PathBuf> {
     let dirs = directories::ProjectDirs::from("", "", "savras")
         .context("no config directory for savras on this system")?;
     Ok(dirs.config_dir().join("board"))
 }
 
-/// The log itself.
-pub fn log_path() -> Result<PathBuf> {
-    Ok(dir()?.join("board.jsonl"))
+/// The variable that says this process belongs to an agent, if one does.
+fn agent_marker(var: impl Fn(&str) -> Option<String>) -> Option<&'static str> {
+    const MARKERS: [&str; 3] = ["CLAUDECODE", "CLAUDE_CODE_AGENT", "CLAUDE_JOB_DIR"];
+    MARKERS
+        .into_iter()
+        .find(|key| var(key).is_some_and(|value| !value.trim().is_empty()))
 }
 
-/// Where a reader's cursor is kept.
+// --- the boards ----------------------------------------------------------
+
+/// Every board on this machine, and the only way to any of them.
 ///
-/// One small file per reader holding the id it has seen up to. A cursor is a
-/// fact about a reader, which is why it lives here and not as a flag written
-/// back onto the message — a read flag on a message has N writers and one
-/// truth, and they drift.
-fn cursor_path(reader: &str) -> Result<PathBuf> {
-    Ok(dir()?.join("cursors").join(sanitize(reader)))
+/// Each is a file named for its repository, so which boards exist is a
+/// directory listing and nothing has to be kept in step with it.
+pub struct Boards {
+    dir: PathBuf,
+}
+
+impl Boards {
+    /// The machine's boards, in Savras's config directory beside `machines`.
+    ///
+    /// The first open after upgrading from the machine-wide log splits it into
+    /// a board per repository it held — see [`Boards::migrate`].
+    pub fn open() -> Result<Self> {
+        let boards = Boards::at(default_dir()?);
+        boards.migrate()?;
+        Ok(boards)
+    }
+
+    /// The boards kept under `dir` — which is the real directory everywhere but
+    /// in a test, and a test that wrote to the real one would be talking to
+    /// agents.
+    pub fn at(dir: PathBuf) -> Self {
+        Boards { dir }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    fn file(&self, repo: &str) -> PathBuf {
+        self.dir
+            .join("repos")
+            .join(format!("{}.jsonl", encode(repo)))
+    }
+
+    /// Where the readers' places on one board are kept: a small file per
+    /// reader, holding the id it has seen up to. A cursor is a fact about a
+    /// reader, which is why it is not a flag written back onto the message.
+    fn seen(&self, repo: &str) -> PathBuf {
+        self.dir.join("seen").join(encode(repo))
+    }
+
+    /// Whether this repository has a board.
+    pub fn exists(&self, repo: &str) -> bool {
+        self.file(repo).is_file()
+    }
+
+    /// The repositories that have a board, by path.
+    pub fn list(&self) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(self.dir.join("repos")) else {
+            return Vec::new();
+        };
+        let mut repos: Vec<String> = entries
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let name = entry.file_name().into_string().ok()?;
+                decode(name.strip_suffix(".jsonl")?)
+            })
+            .collect();
+        repos.sort();
+        repos
+    }
+
+    /// Give a repository a board. `false` when it already had one, which is
+    /// not an error: the board the owner asked for exists either way.
+    pub fn create(&self, _owner: &Owner, repo: &str) -> Result<bool> {
+        let path = self.file(repo);
+        if path.is_file() {
+            return Ok(false);
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating the board directory {}", parent.display()))?;
+        }
+        OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .with_context(|| format!("creating the board at {}", path.display()))?;
+        Ok(true)
+    }
+
+    /// Remove every message and keep the board, so its agents go on posting to
+    /// it. Returns how many were removed.
+    pub fn clean(&self, _owner: &Owner, repo: &str) -> Result<usize> {
+        let path = self.file(repo);
+        anyhow::ensure!(path.is_file(), "{} has no board to clean", topic_name(repo));
+        let gone = self.count(repo);
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_len(0))
+            .with_context(|| format!("emptying the board at {}", path.display()))?;
+        // Every place a reader held was a message that is gone.
+        let _ = fs::remove_dir_all(self.seen(repo));
+        Ok(gone)
+    }
+
+    /// Remove the board itself: its agents' posts are refused and their hooks
+    /// go quiet until the owner creates it again. `false` when there was none.
+    pub fn delete(&self, _owner: &Owner, repo: &str) -> Result<bool> {
+        let path = self.file(repo);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                let _ = fs::remove_dir_all(self.seen(repo));
+                Ok(true)
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e).with_context(|| format!("deleting the board at {}", path.display())),
+        }
+    }
+
+    /// Append a message to a repository's board, and return it.
+    ///
+    /// Every caller gets the same treatment — the panel, the CLI and the hook
+    /// all arrive here, so identity, ordering, truncation and the timestamp are
+    /// decided once. The file is opened without `create`: a board is made by its
+    /// owner, never by a post, and a board deleted a moment ago stays deleted.
+    pub fn post(&self, from: &str, repo: &str, re: Option<String>, text: &str) -> Result<Message> {
+        let text = text.trim();
+        anyhow::ensure!(!text.is_empty(), "a message with no words in it");
+
+        let path = self.file(repo);
+        let mut file = match OpenOptions::new().append(true).open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == ErrorKind::NotFound => anyhow::bail!("{}", no_board(repo)),
+            Err(e) => {
+                return Err(e).with_context(|| format!("opening the board at {}", path.display()))
+            }
+        };
+
+        let message = Message {
+            id: new_id(),
+            at: Utc::now(),
+            from: from.to_string(),
+            topic: repo.to_string(),
+            re,
+            text: truncate(text, LIMIT),
+        };
+        let mut line = serde_json::to_string(&message).context("encoding the message")?;
+        line.push('\n');
+        // One `write_all` of one line, on a handle opened `O_APPEND`: the kernel
+        // orders it against every other writer, so no lock is needed.
+        file.write_all(line.as_bytes())
+            .context("writing to the board")?;
+        Ok(message)
+    }
+
+    /// Every message on a board, oldest first. No board is no messages.
+    ///
+    /// A line that does not parse is skipped, not fatal: several processes
+    /// write a board, and one bad line must not silence the rest.
+    fn all(&self, repo: &str) -> Vec<Message> {
+        fs::read_to_string(self.file(repo))
+            .map(|text| parse(&text))
+            .unwrap_or_default()
+    }
+
+    /// The last `limit` messages on a board, oldest first. Moves no cursor:
+    /// this is looking, and the panel reads through it for exactly that reason.
+    pub fn read(&self, repo: &str, limit: usize) -> Vec<Message> {
+        let mut messages = self.all(repo);
+        let cut = messages.len().saturating_sub(limit);
+        messages.split_off(cut)
+    }
+
+    pub fn count(&self, repo: &str) -> usize {
+        self.all(repo).len()
+    }
+
+    /// What `reader` has not seen on this board, and the cursor that would
+    /// mark it seen.
+    ///
+    /// Split from the writing of the cursor so that "what is new" can be asked
+    /// without answering it — the hook wants both, a person debugging wants only
+    /// the first, and a reader whose turn is abandoned should not have silently
+    /// lost the messages.
+    pub fn unread(&self, reader: &str, repo: &str, limit: usize) -> (Vec<Message>, Option<String>) {
+        let messages = self.all(repo);
+        // An unknown place — a cleaned board, a new reader — starts from the
+        // window rather than replaying the whole history at somebody.
+        let start = self
+            .cursor(reader, repo)
+            .and_then(|id| messages.iter().position(|m| m.id == id))
+            .map_or(messages.len().saturating_sub(limit), |at| at + 1);
+        let tail = &messages[start.min(messages.len())..];
+        let mark = tail.last().map(|m| m.id.clone());
+        let cut = tail.len().saturating_sub(limit);
+        (tail[cut..].to_vec(), mark)
+    }
+
+    fn cursor(&self, reader: &str, repo: &str) -> Option<String> {
+        let id = fs::read_to_string(self.seen(repo).join(sanitize(reader))).ok()?;
+        let id = id.trim();
+        (!id.is_empty()).then(|| id.to_string())
+    }
+
+    /// Record that `reader` has seen this board up to `id`.
+    pub fn mark_seen(&self, reader: &str, repo: &str, id: &str) -> Result<()> {
+        let dir = self.seen(repo);
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        let path = dir.join(sanitize(reader));
+        fs::write(&path, id).with_context(|| format!("writing the cursor at {}", path.display()))
+    }
+
+    /// Split the machine-wide log M5 kept into a board per repository in it.
+    ///
+    /// The old log is renamed out of the way *first*: the hook runs on every
+    /// agent's turn, so two processes can arrive here together, and only the
+    /// one whose rename succeeds does the work. It is renamed, not removed, so
+    /// nothing said is lost if this goes wrong. Messages to the global lane,
+    /// which no longer exists, stay only in that renamed file.
+    ///
+    /// Each reader's place is carried across — to the last message on each new
+    /// board that it had already been shown — so the first turn after the
+    /// upgrade does not replay what an agent was already told.
+    fn migrate(&self) -> Result<()> {
+        let old = self.dir.join("board.jsonl");
+        if !old.is_file() {
+            return Ok(());
+        }
+        let claimed = self
+            .dir
+            .join(format!("board.jsonl.migrating-{}", std::process::id()));
+        if fs::rename(&old, &claimed).is_err() {
+            return Ok(()); // somebody else got there first
+        }
+
+        let messages = parse(&fs::read_to_string(&claimed).unwrap_or_default());
+        let places = old_places(&self.dir.join("cursors"));
+
+        let mut by_repo: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (at, message) in messages.iter().enumerate() {
+            if message.topic.starts_with('/') {
+                by_repo.entry(&message.topic).or_default().push(at);
+            }
+        }
+
+        for (repo, indices) in &by_repo {
+            let path = self.file(repo);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut file = OpenOptions::new().append(true).create(true).open(&path)?;
+            for &at in indices {
+                let mut line = serde_json::to_string(&messages[at])?;
+                line.push('\n');
+                file.write_all(line.as_bytes())?;
+            }
+            for (reader, id) in &places {
+                let Some(seen) = messages.iter().position(|m| &m.id == id) else {
+                    continue;
+                };
+                if let Some(&last) = indices.iter().rev().find(|&&at| at <= seen) {
+                    self.mark_seen(reader, repo, &messages[last].id)?;
+                }
+            }
+        }
+
+        fs::rename(&claimed, self.dir.join("board.jsonl.before-per-repo"))?;
+        let _ = fs::rename(
+            self.dir.join("cursors"),
+            self.dir.join("cursors.before-per-repo"),
+        );
+        Ok(())
+    }
+}
+
+/// The readers' places in the machine-wide log, as `(reader, id)`.
+fn old_places(dir: &Path) -> Vec<(String, String)> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let reader = entry.file_name().into_string().ok()?;
+            let id = fs::read_to_string(entry.path()).ok()?.trim().to_string();
+            (!id.is_empty()).then_some((reader, id))
+        })
+        .collect()
+}
+
+/// What an agent is told when it posts where there is no board.
+fn no_board(repo: &str) -> String {
+    format!(
+        "{} has no board. A board is made by the owner, in the panel or with \
+         `svr board create`; until then there is nobody here to read it.",
+        topic_name(repo)
+    )
+}
+
+/// A repository path as a file name, reversibly.
+///
+/// Every byte that is not a letter, a digit, `.`, `-` or `_` becomes `%XX`, so
+/// the name holds no separator and decodes back to exactly the path — which is
+/// what lets the directory listing be the list of boards.
+fn encode(repo: &str) -> String {
+    let mut out = String::with_capacity(repo.len());
+    for byte in repo.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// [`encode`], backwards. `None` for a name this did not make.
+fn decode(name: &str) -> Option<String> {
+    let bytes = name.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            let hex = std::str::from_utf8(bytes.get(at + 1..at + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// A reader key is a filename, so it may not be a path or a surprise.
@@ -226,18 +572,17 @@ fn name_from_job_dir() -> Option<String> {
 
 // --- what a message belongs to -------------------------------------------
 
-/// The topic a directory posts under: the repository it is in.
+/// The repository a directory belongs to: the one whose board it posts to.
 ///
 /// The git root rather than the working directory, so a post from `src/` and a
 /// post from the root are the same conversation. A directory that is not in a
-/// repository is its own topic — which is right for a scratch directory and
-/// costs nothing.
+/// repository is its own — which is right for a scratch directory and costs
+/// nothing.
 ///
 /// A worktree resolves to the repository it was cut from, not to itself. Two
 /// agents in two worktrees of one project are the likeliest pair on the
 /// machine to have something to say to each other — they are the same work on
-/// two branches — and filing them under separate topics would put a wall
-/// between exactly the two that needed none.
+/// two branches — and two boards would put a wall between exactly those two.
 pub fn topic_of(cwd: &Path) -> String {
     let mut at = cwd;
     loop {
@@ -261,8 +606,7 @@ pub fn topic_of(cwd: &Path) -> String {
 /// The repository a worktree's marker file points back to.
 ///
 /// `None` for anything we do not recognise — a submodule, a future format —
-/// and the caller falls back to the directory itself. A topic we cannot work
-/// out must never be a post we lose.
+/// and the caller falls back to the directory itself.
 fn main_repo_of(marker: &Path) -> Option<String> {
     let text = fs::read_to_string(marker).ok()?;
     let target = text
@@ -273,11 +617,8 @@ fn main_repo_of(marker: &Path) -> Option<String> {
     (!root.is_empty()).then(|| root.to_string())
 }
 
-/// What a topic is called when it is shown.
+/// What a repository is called when it is shown.
 pub fn topic_name(topic: &str) -> String {
-    if topic == EVERYWHERE {
-        return "all".to_string();
-    }
     Path::new(topic)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -285,56 +626,6 @@ pub fn topic_name(topic: &str) -> String {
 }
 
 // --- reading and writing -------------------------------------------------
-
-/// Append a message, and return it.
-///
-/// Every caller gets the same treatment — the panel, the CLI and the hook all
-/// arrive here, so identity, ordering, truncation and the timestamp are
-/// decided once rather than by whoever wrote the caller.
-pub fn post(from: &str, topic: &str, re: Option<String>, text: &str) -> Result<Message> {
-    post_to(&log_path()?, from, topic, re, text)
-}
-
-/// [`post`], to the board at `path` — which is the real board everywhere but in
-/// a test, and a test that posted to the real one would be talking to agents.
-pub fn post_to(
-    path: &Path,
-    from: &str,
-    topic: &str,
-    re: Option<String>,
-    text: &str,
-) -> Result<Message> {
-    let text = text.trim();
-    anyhow::ensure!(!text.is_empty(), "a message with no words in it");
-    let text = truncate(text, LIMIT);
-
-    let message = Message {
-        id: new_id(),
-        at: Utc::now(),
-        from: from.to_string(),
-        topic: topic.to_string(),
-        re,
-        text,
-    };
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("creating the board directory {}", parent.display()))?;
-    }
-    let mut line = serde_json::to_string(&message).context("encoding the message")?;
-    line.push('\n');
-    let mut file = OpenOptions::new()
-        .append(true)
-        .create(true)
-        .open(path)
-        .with_context(|| format!("opening the board at {}", path.display()))?;
-    // One `write_all` of one line, on a handle opened `O_APPEND`: the kernel
-    // orders it against every other writer, so no lock is needed and none is
-    // taken. See the module note.
-    file.write_all(line.as_bytes())
-        .context("writing to the board")?;
-    Ok(message)
-}
 
 /// Cut a message to `limit`, on a character boundary, saying that it was cut.
 fn truncate(text: &str, limit: usize) -> String {
@@ -354,9 +645,8 @@ fn truncate(text: &str, limit: usize) -> String {
 /// The first cut mixed the clock's nanoseconds into it and collided about half
 /// the time, because `SystemTime` on macOS does not actually advance that
 /// fast: two posts in the same millisecond read the same nanoseconds and got
-/// the same id. Entropy that is not there cannot be borrowed. A counter is
-/// exact within a process and the pid separates processes, so a collision now
-/// needs two machines' worth of coincidence rather than a fast loop.
+/// the same id. A counter is exact within a process and the pid separates
+/// processes.
 fn new_id() -> String {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let now = SystemTime::now()
@@ -371,27 +661,7 @@ fn new_id() -> String {
     )
 }
 
-/// Every message on the board, oldest first.
-///
-/// A line that does not parse is skipped, not fatal. The board is written by
-/// several processes and read by all of them; one bad line must not be able to
-/// silence the rest, which is the same call M2.1 made about a half-written
-/// `state.json` and for the same reason.
-pub fn all() -> Result<Vec<Message>> {
-    Ok(all_in(&log_path()?))
-}
-
-/// [`all`], from the board at `path`.
-fn all_in(path: &Path) -> Vec<Message> {
-    let Ok(text) = fs::read_to_string(path) else {
-        // No board yet is an empty board, not an error. The first `post`
-        // creates it.
-        return Vec::new();
-    };
-    parse(&text)
-}
-
-/// The parsing half of [`all`], separated so it can be tested without a disk.
+/// Messages from the text of a board, skipping any line that does not parse.
 pub fn parse(text: &str) -> Vec<Message> {
     text.lines()
         .filter(|line| !line.trim().is_empty())
@@ -399,107 +669,38 @@ pub fn parse(text: &str) -> Vec<Message> {
         .collect()
 }
 
-/// The last `limit` messages that concern `topic`, oldest first.
-pub fn read(topic: Option<&str>, limit: usize) -> Result<Vec<Message>> {
-    Ok(read_from(&log_path()?, topic, limit))
-}
-
-/// [`read`], from the board at `path`. Moves no cursor: this is looking, and
-/// the panel reads through it for exactly that reason.
-pub fn read_from(path: &Path, topic: Option<&str>, limit: usize) -> Vec<Message> {
-    let mut messages = all_in(path);
-    if let Some(topic) = topic {
-        messages.retain(|m| m.concerns(topic));
-    }
-    let cut = messages.len().saturating_sub(limit);
-    messages.split_off(cut)
-}
-
-/// What `reader` has not seen yet, and the cursor that would mark it seen.
-///
-/// Split from the writing of the cursor so that "what is new" can be asked
-/// without answering it — the hook wants both, a person debugging wants only
-/// the first, and a reader whose turn is abandoned should not have silently
-/// lost the messages.
-pub fn unread(reader: &str, topic: &str, limit: usize) -> Result<(Vec<Message>, Option<String>)> {
-    let seen = cursor(reader)?;
-    let messages = all()?;
-
-    // Everything after the cursor. An unknown cursor — a board that was
-    // trimmed, or a reader from another machine — means start from the window
-    // rather than replaying the whole history at somebody.
-    let start = match &seen {
-        Some(id) => match messages.iter().position(|m| &m.id == id) {
-            Some(at) => at + 1,
-            None => messages.len().saturating_sub(limit),
-        },
-        None => messages.len().saturating_sub(limit),
-    };
-
-    let tail = &messages[start.min(messages.len())..];
-    // The cursor advances past everything, including what this reader is not
-    // shown: a message for another repository is not news it is still owed.
-    let mark = tail.last().map(|m| m.id.clone());
-    let mut mine: Vec<Message> = tail.iter().filter(|m| m.concerns(topic)).cloned().collect();
-    let cut = mine.len().saturating_sub(limit);
-    Ok((mine.split_off(cut), mark))
-}
-
-/// The id `reader` has seen up to.
-fn cursor(reader: &str) -> Result<Option<String>> {
-    let path = cursor_path(reader)?;
-    match fs::read_to_string(&path) {
-        Ok(text) => {
-            let id = text.trim().to_string();
-            Ok(if id.is_empty() { None } else { Some(id) })
-        }
-        Err(_) => Ok(None),
-    }
-}
-
-/// Record that `reader` has seen up to `id`.
-pub fn mark_seen(reader: &str, id: &str) -> Result<()> {
-    let path = cursor_path(reader)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    fs::write(&path, id).with_context(|| format!("writing the cursor at {}", path.display()))
-}
-
 /// The messages, as an agent reads them.
 ///
-/// Grouped by topic only when more than one is present, because a heading over
-/// a single group is noise in somebody's context window.
+/// Grouped by repository only when more than one is present — `read
+/// --all-topics` — because a heading over a single group is noise in somebody's
+/// context window.
 pub fn render(messages: &[Message]) -> String {
     if messages.is_empty() {
         return String::new();
     }
-    let lanes: Vec<&str> = {
-        let mut seen: Vec<&str> = Vec::new();
-        for m in messages {
-            if !seen.contains(&m.topic.as_str()) {
-                seen.push(&m.topic);
-            }
+    let mut repos: Vec<&str> = Vec::new();
+    for m in messages {
+        if !repos.contains(&m.topic.as_str()) {
+            repos.push(&m.topic);
         }
-        seen
-    };
-    if lanes.len() < 2 {
+    }
+    if repos.len() < 2 {
         return messages
             .iter()
             .map(Message::line)
             .collect::<Vec<_>>()
             .join("\n");
     }
-    let mut by_lane: HashMap<&str, Vec<String>> = HashMap::new();
+    let mut by_repo: HashMap<&str, Vec<String>> = HashMap::new();
     for m in messages {
-        by_lane.entry(&m.topic).or_default().push(m.line());
+        by_repo.entry(&m.topic).or_default().push(m.line());
     }
-    lanes
+    repos
         .iter()
-        .filter_map(|lane| {
-            by_lane
-                .get(lane)
-                .map(|lines| format!("{}:\n{}", topic_name(lane), lines.join("\n")))
+        .filter_map(|repo| {
+            by_repo
+                .get(repo)
+                .map(|lines| format!("{}:\n{}", topic_name(repo), lines.join("\n")))
         })
         .collect::<Vec<_>>()
         .join("\n\n")
@@ -507,19 +708,19 @@ pub fn render(messages: &[Message]) -> String {
 
 // --- being noticed -------------------------------------------------------
 
-/// What to put in `settings.json`, and the sentence that tells agents the
-/// board exists.
+/// What to put in `settings.json`, and the sentence that tells agents a board
+/// may exist.
 ///
 /// Printed rather than installed. This edits global configuration for every
 /// session on the machine, and a tool that does that without being watched is
 /// a tool you stop trusting — the same instinct that keeps Savras out of
 /// `~/.claude/` everywhere else.
 pub fn install_text() -> String {
-    r#"The board needs two things: a hook, so every session is told what is new,
-and a sentence, so every agent knows it can post.
+    r#"The board needs two things: a hook, so a session in a repository with a
+board is told what is new, and a sentence, so every agent knows it can post.
 
 1. In ~/.claude/settings.json, so each turn carries what was said since the
-   last one. No script file: the hook is the command.
+   last one. It prints nothing at all in a repository with no board.
 
     {
       "hooks": {
@@ -538,16 +739,20 @@ and a sentence, so every agent knows it can post.
 
     ## The board
 
-    Other agents are working alongside you and can read what you write on the
-    board. `svr board post "<message>"` says something to the agents in this
-    repository; `svr board post --all "<message>"` says it to every agent on
-    the machine. `svr board read` shows the recent conversation, and
-    `svr board post --re <id> "<message>"` answers one message in particular.
+    A repository may have a board, which the owner creates. Other agents
+    working in the same repository can read what you write there.
+    `svr board post "<message>"` says something to them, `svr board read`
+    shows the recent conversation, and `svr board post --re <id> "<message>"`
+    answers one message in particular. Where there is no board, posting says
+    so — leave it; making one is the owner's call.
 
     Post when you learn something another agent would otherwise have to
     rediscover, when you are about to change something shared, or when you are
     asked to. It is a conversation between agents, not a log — nobody is
     reading it out of duty.
+
+Boards themselves are the owner's: `svr board create` in a repository, or `b`
+on one of its sessions in the panel and then `c`.
 "#
     .to_string()
 }
@@ -559,8 +764,7 @@ and a sentence, so every agent knows it can post.
 /// Returns `Ok(false)` when the first argument is not `board`, so `main` can
 /// carry on parsing the panel's own options. The board is a plain command
 /// rather than a mode of the TUI because *bash* is the one thing every agent
-/// can do — no MCP server to configure, no plugin, nothing that a session
-/// started the wrong way is blind to.
+/// can do.
 pub fn dispatch(args: &[String]) -> Result<bool> {
     if args.first().map(String::as_str) != Some("board") {
         return Ok(false);
@@ -569,25 +773,35 @@ pub fn dispatch(args: &[String]) -> Result<bool> {
 }
 
 const USAGE: &str = "\
-svr board — what one agent says, where the others can read it
+svr board — what the agents in one repository say to each other
 
-    svr board post [options] <message>    say something
+    svr board post [options] <message>    say something on this repository's board
     svr board read [options]              the recent conversation
     svr board unread [options]            only what is new to you
+    svr board list                        the repositories that have a board
+
+The owner's, refused under an agent:
+    svr board create [--repo <path>]      give a repository a board
+    svr board clean --yes [--repo <path>] remove every message, keep the board
+    svr board delete --yes [--repo <path>] remove the board itself
+
     svr board install                     how to wire it into every session
-    svr board path                        where the board is kept
+    svr board path                        where the boards are kept
 
 Post options:
-    --all             the global lane: every agent, whatever repository
     --re <id>         answer one message in particular
     --as <name>       post under a name, when we cannot work out yours
 
 Read options:
-    --all-topics      every repository, not only this one
+    --all-topics      every board, not only this repository's
     --limit <n>       how many messages (default 30)
     --json            one message per line, as stored
     --hook            for UserPromptSubmit: a heading, or nothing at all
 ";
+
+/// What `--all` meets now that there is no lane across repositories.
+const NO_LANE: &str = "there is no global lane any more: a board belongs to one \
+                       repository, and posts reach the agents working in it";
 
 fn run(args: &[String]) -> Result<()> {
     let (command, rest) = args
@@ -602,20 +816,26 @@ fn run(args: &[String]) -> Result<()> {
         "post" => post_command(rest),
         "read" => read_command(rest, false),
         "unread" => read_command(rest, true),
+        "list" => list_command(),
+        "create" | "clean" | "delete" => owner_command(command, rest),
         "install" => {
             print!("{}", install_text());
             Ok(())
         }
         "path" => {
-            println!("{}", log_path()?.display());
+            println!("{}", Boards::open()?.dir().display());
             Ok(())
         }
         other => anyhow::bail!("no such board command: {other}\n\n{USAGE}"),
     }
 }
 
+fn here() -> Result<String> {
+    let cwd = std::env::current_dir().context("reading the current directory")?;
+    Ok(topic_of(&cwd))
+}
+
 fn post_command(args: &[String]) -> Result<()> {
-    let mut everywhere = false;
     let mut re = None;
     let mut as_name = None;
     let mut words: Vec<String> = Vec::new();
@@ -623,7 +843,10 @@ fn post_command(args: &[String]) -> Result<()> {
     let mut args = args.iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--all" => everywhere = true,
+            // Refused before anything is opened: the lane is gone, and a post
+            // that silently went to this repository instead would reach people
+            // the poster did not mean.
+            "--all" => anyhow::bail!("{NO_LANE}"),
             "--re" => re = Some(args.next().context("--re needs a message id")?.clone()),
             "--as" => as_name = Some(args.next().context("--as needs a name")?.clone()),
             "--" => {
@@ -637,14 +860,9 @@ fn post_command(args: &[String]) -> Result<()> {
     let text = words.join(" ");
     anyhow::ensure!(!text.trim().is_empty(), "nothing to post\n\n{USAGE}");
 
-    let cwd = std::env::current_dir().context("reading the current directory")?;
-    let topic = if everywhere {
-        EVERYWHERE.to_string()
-    } else {
-        topic_of(&cwd)
-    };
+    let repo = here()?;
     let from = whoami(as_name.as_deref());
-    let message = post(&from, &topic, re, &text)?;
+    let message = Boards::open()?.post(&from, &repo, re, &text)?;
     println!(
         "posted to {} as {} — id {}",
         topic_name(&message.topic),
@@ -678,23 +896,38 @@ fn read_command(args: &[String], only_new: bool) -> Result<()> {
         }
     }
 
-    let cwd = std::env::current_dir().context("reading the current directory")?;
-    let topic = topic_of(&cwd);
-    let reader = whoami(as_name.as_deref());
+    let boards = Boards::open()?;
+    let repo = here()?;
 
-    let messages = if only_new {
-        let (new, mark) = unread(&reader, &topic, limit)?;
+    let messages = if all_topics && !only_new {
+        let mut every: Vec<Message> = boards
+            .list()
+            .iter()
+            .flat_map(|repo| boards.read(repo, limit))
+            .collect();
+        every.sort_by_key(|m| m.at);
+        let cut = every.len().saturating_sub(limit);
+        every.split_off(cut)
+    } else if !boards.exists(&repo) {
+        // A hook writes into somebody's context, so where there is no board it
+        // says nothing at all. A person gets a sentence, because silence at a
+        // prompt reads as a broken command.
+        if !hook {
+            println!("{}", no_board(&repo));
+        }
+        return Ok(());
+    } else if only_new {
+        let reader = whoami(as_name.as_deref());
+        let (new, mark) = boards.unread(&reader, &repo, limit);
         // The cursor moves whether or not anything was shown: what has gone
         // past is past, and a hook that fails to advance replays the same
         // conversation into every turn for the rest of the session.
         if let Some(id) = mark {
-            mark_seen(&reader, &id)?;
+            boards.mark_seen(&reader, &repo, &id)?;
         }
         new
-    } else if all_topics {
-        read(None, limit)?
     } else {
-        read(Some(&topic), limit)?
+        boards.read(&repo, limit)
     };
 
     if as_json {
@@ -705,23 +938,97 @@ fn read_command(args: &[String], only_new: bool) -> Result<()> {
     }
 
     if messages.is_empty() {
-        // A hook writes into somebody's context, so it says nothing at all
-        // when there is nothing to say. A person gets a sentence, because
-        // silence at a prompt reads as a broken command.
         if !hook {
-            println!("nothing on the board for {}", topic_name(&topic));
+            println!("nothing on the board for {}", topic_name(&repo));
         }
         return Ok(());
     }
 
     if hook {
         println!(
-            "New on the agent board since your last turn — other agents \
-             working alongside you wrote these. Reply with `svr board post \
+            "New on this repository's agent board since your last turn — other \
+             agents working alongside you wrote these. Reply with `svr board post \
              --re <id> \"…\"` if one concerns you.\n"
         );
     }
     println!("{}", render(&messages));
+    Ok(())
+}
+
+fn list_command() -> Result<()> {
+    let boards = Boards::open()?;
+    let repos = boards.list();
+    if repos.is_empty() {
+        println!("no boards yet — the owner makes one with `svr board create`");
+    }
+    for repo in repos {
+        println!(
+            "{:<20} {:>4} messages  {}",
+            topic_name(&repo),
+            boards.count(&repo),
+            repo
+        );
+    }
+    Ok(())
+}
+
+/// `create`, `clean` and `delete`: the owner's, and refused under an agent
+/// before anything else is looked at.
+fn owner_command(which: &str, args: &[String]) -> Result<()> {
+    let mut sure = false;
+    let mut repo = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--yes" => sure = true,
+            "--repo" => {
+                let path = args.next().context("--repo needs a path")?;
+                repo = Some(topic_of(Path::new(path)));
+            }
+            other => anyhow::bail!("no such option: {other}\n\n{USAGE}"),
+        }
+    }
+
+    let owner = Owner::from_env()?;
+    let boards = Boards::open()?;
+    let repo = match repo {
+        Some(repo) => repo,
+        None => here()?,
+    };
+    let name = topic_name(&repo);
+
+    match which {
+        "create" => {
+            if boards.create(&owner, &repo)? {
+                println!("created a board for {name}");
+            } else {
+                println!("{name} already has a board");
+            }
+        }
+        // Neither can be taken back, so each says what it is about to do and
+        // waits for `--yes` — the command-line form of the panel's question.
+        "clean" if !sure => anyhow::bail!(
+            "this removes every message on {name}'s board for good ({} of them); \
+             run `svr board clean --yes` to do it",
+            boards.count(&repo)
+        ),
+        "clean" => {
+            let gone = boards.clean(&owner, &repo)?;
+            println!("cleaned {name}'s board: {gone} messages removed");
+        }
+        "delete" if !sure => anyhow::bail!(
+            "this deletes {name}'s board and its {} messages, and its agents can no \
+             longer post; run `svr board delete --yes` to do it",
+            boards.count(&repo)
+        ),
+        _ => {
+            if boards.delete(&owner, &repo)? {
+                println!("deleted {name}'s board");
+            } else {
+                println!("{name} has no board");
+            }
+        }
+    }
     Ok(())
 }
 
@@ -740,25 +1047,211 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_message_reaches_its_own_repository_and_the_global_lane() {
-        let here = msg("1", "SAVRAS", "/code/savras", "hello");
-        let there = msg("2", "BOOKS", "/code/books", "hello");
-        let everyone = msg("3", "SAVRAS", EVERYWHERE, "hello");
+    /// A board directory of the test's own, removed when it is dropped.
+    struct Scratch(PathBuf);
 
-        assert!(here.concerns("/code/savras"));
-        assert!(!here.concerns("/code/books"));
-        // The lane is the whole point of per-repo scoping being liveable:
-        // something that concerns everyone is said once, not once per repo.
-        assert!(everyone.concerns("/code/savras"));
-        assert!(everyone.concerns("/code/books"));
-        assert!(!there.concerns("/code/savras"));
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "savras-boards-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+
+        fn boards(&self) -> Boards {
+            Boards::at(self.0.clone())
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const SAVRAS: &str = "/code/savras";
+    const BOOKS: &str = "/code/books";
+
+    #[test]
+    fn a_repository_has_a_board_only_once_the_owner_makes_one() {
+        let s = Scratch::new("create");
+        let boards = s.boards();
+        let owner = Owner::at_the_panel();
+
+        let refused = boards.post("AGENT", SAVRAS, None, "hello").unwrap_err();
+        assert!(
+            refused.to_string().contains("has no board"),
+            "a post must not make a board: {refused}"
+        );
+        assert!(!boards.exists(SAVRAS));
+        assert!(boards.list().is_empty());
+
+        assert!(boards.create(&owner, SAVRAS).unwrap());
+        assert!(
+            !boards.create(&owner, SAVRAS).unwrap(),
+            "twice is not an error"
+        );
+        boards.post("AGENT", SAVRAS, None, "hello").unwrap();
+        assert_eq!(boards.list(), [SAVRAS]);
+        assert_eq!(boards.count(SAVRAS), 1);
+    }
+
+    #[test]
+    fn a_board_holds_only_its_own_repository() {
+        let s = Scratch::new("own");
+        let boards = s.boards();
+        let owner = Owner::at_the_panel();
+        boards.create(&owner, SAVRAS).unwrap();
+        boards.create(&owner, BOOKS).unwrap();
+        boards.post("SAVRAS-2", SAVRAS, None, "here").unwrap();
+        boards.post("BOOKS-1", BOOKS, None, "there").unwrap();
+
+        let read: Vec<String> = boards
+            .read(SAVRAS, 10)
+            .into_iter()
+            .map(|m| m.text)
+            .collect();
+        assert_eq!(read, ["here"]);
+        assert_eq!(boards.list(), [BOOKS, SAVRAS]);
+    }
+
+    #[test]
+    fn cleaning_empties_the_board_and_deleting_removes_it() {
+        let s = Scratch::new("lifecycle");
+        let boards = s.boards();
+        let owner = Owner::at_the_panel();
+        boards.create(&owner, SAVRAS).unwrap();
+        boards.post("A", SAVRAS, None, "one").unwrap();
+        let two = boards.post("A", SAVRAS, None, "two").unwrap();
+        boards.mark_seen("A", SAVRAS, &two.id).unwrap();
+
+        // Clean keeps the board, so its agents go on posting.
+        assert_eq!(boards.clean(&owner, SAVRAS).unwrap(), 2);
+        assert!(boards.exists(SAVRAS));
+        assert_eq!(boards.count(SAVRAS), 0);
+        boards.post("A", SAVRAS, None, "after").unwrap();
+        let (new, _) = boards.unread("A", SAVRAS, WINDOW);
+        assert_eq!(new.len(), 1, "a place on a cleaned board is forgotten");
+
+        // Delete stops them until the owner makes it again.
+        assert!(boards.delete(&owner, SAVRAS).unwrap());
+        assert!(!boards.delete(&owner, SAVRAS).unwrap());
+        assert!(boards.post("A", SAVRAS, None, "gone?").is_err());
+        assert!(boards.clean(&owner, SAVRAS).is_err());
+
+        assert!(boards.create(&owner, SAVRAS).unwrap());
+        assert_eq!(boards.count(SAVRAS), 0, "a new board, not the old one");
+    }
+
+    #[test]
+    fn a_place_on_one_board_says_nothing_about_another() {
+        let s = Scratch::new("places");
+        let boards = s.boards();
+        let owner = Owner::at_the_panel();
+        boards.create(&owner, SAVRAS).unwrap();
+        boards.create(&owner, BOOKS).unwrap();
+        let seen = boards.post("X", SAVRAS, None, "savras").unwrap();
+        boards.post("Y", BOOKS, None, "books").unwrap();
+        boards.mark_seen("READER", SAVRAS, &seen.id).unwrap();
+
+        assert!(boards.unread("READER", SAVRAS, WINDOW).0.is_empty());
+        assert_eq!(boards.unread("READER", BOOKS, WINDOW).0.len(), 1);
+    }
+
+    #[test]
+    fn a_repository_path_survives_being_a_file_name() {
+        for repo in [
+            "/Users/me/Code/savras",
+            "/Users/me/My Code/it's",
+            "/a%2Fb",
+            "/ž/日本",
+        ] {
+            let name = encode(repo);
+            assert!(!name.contains('/'), "{name}");
+            assert_eq!(decode(&name).as_deref(), Some(repo));
+        }
+        assert_eq!(decode("%zz"), None);
+        assert_eq!(decode("%4"), None);
+    }
+
+    #[test]
+    fn the_machine_wide_log_is_split_once_and_nobody_is_told_twice() {
+        let s = Scratch::new("migrate");
+        let log = [
+            msg("1", "SAVRAS-8", SAVRAS, "first in savras"),
+            msg("2", "RESEARCH", BOOKS, "first in books"),
+            msg("3", "SAVRAS-8", "*", "to everyone"),
+            msg("4", "ROADMAP", SAVRAS, "second in savras"),
+            msg("5", "RESEARCH", BOOKS, "second in books"),
+        ]
+        .iter()
+        .map(|m| serde_json::to_string(m).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(s.0.join("board.jsonl"), log).unwrap();
+        fs::create_dir_all(s.0.join("cursors")).unwrap();
+        // This reader had been shown up to message 3.
+        fs::write(s.0.join("cursors/SAVRAS-8"), "3").unwrap();
+
+        let boards = s.boards();
+        boards.migrate().unwrap();
+
+        assert_eq!(boards.list(), [BOOKS, SAVRAS]);
+        let savras: Vec<String> = boards.read(SAVRAS, 10).into_iter().map(|m| m.id).collect();
+        assert_eq!(savras, ["1", "4"], "the global lane went nowhere");
+        // Shown up to 3: message 1 on savras and 2 on books were already seen.
+        let ids = |repo| -> Vec<String> {
+            boards
+                .unread("SAVRAS-8", repo, WINDOW)
+                .0
+                .into_iter()
+                .map(|m| m.id)
+                .collect()
+        };
+        assert_eq!(ids(SAVRAS), ["4"]);
+        assert_eq!(ids(BOOKS), ["5"]);
+
+        assert!(!s.0.join("board.jsonl").exists());
+        assert!(s.0.join("board.jsonl.before-per-repo").is_file());
+        // Once: a second open finds nothing to split and doubles nothing.
+        boards.migrate().unwrap();
+        assert_eq!(boards.count(SAVRAS), 2);
+    }
+
+    #[test]
+    fn there_is_no_global_lane_to_post_to() {
+        let refused = run(&["post".into(), "--all".into(), "hello".into()]).unwrap_err();
+        assert!(refused.to_string().contains("no global lane"), "{refused}");
+    }
+
+    #[test]
+    fn an_agent_cannot_pass_for_the_owner() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |key: &str| {
+                pairs
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.to_string())
+            }
+        };
+        assert_eq!(
+            agent_marker(env(&[("CLAUDECODE", "1")])),
+            Some("CLAUDECODE")
+        );
+        assert_eq!(
+            agent_marker(env(&[("CLAUDE_JOB_DIR", "/x/jobs/abc")])),
+            Some("CLAUDE_JOB_DIR")
+        );
+        assert_eq!(agent_marker(env(&[("HOME", "/Users/me")])), None);
+        assert_eq!(agent_marker(env(&[("CLAUDECODE", "")])), None);
     }
 
     #[test]
     fn a_line_that_does_not_parse_does_not_silence_the_rest() {
-        // Several processes append to this file. One bad line must cost one
-        // message, not the board — the call M2.1 made about `state.json`.
         let good = serde_json::to_string(&msg("1", "A", "/r", "first")).unwrap();
         let also = serde_json::to_string(&msg("2", "B", "/r", "second")).unwrap();
         let text = format!("{good}\n{{ half a line\n\n{also}\n");
@@ -771,16 +1264,12 @@ mod tests {
 
     #[test]
     fn an_id_is_not_reused_within_a_millisecond() {
-        // Two agents posting at once is the normal case, not the rare one, and
-        // a duplicate id makes `--re` answer the wrong message.
         let ids: std::collections::HashSet<String> = (0..5000).map(|_| new_id()).collect();
         assert_eq!(ids.len(), 5000, "ids collided");
     }
 
     #[test]
     fn a_long_message_is_cut_rather_than_refused() {
-        // The cap is a storage decision, so it must not be a way to lose what
-        // somebody said — and the reader has to be told it was cut.
         let long = "x".repeat(LIMIT + 500);
         let cut = truncate(&long, LIMIT);
         assert!(cut.starts_with(&"x".repeat(LIMIT)));
@@ -794,17 +1283,12 @@ mod tests {
         let deep = tmp.join("src").join("inner");
         fs::create_dir_all(&deep).unwrap();
         fs::create_dir_all(tmp.join(".git")).unwrap();
-
-        // A post from `src/inner` and a post from the root are the same
-        // conversation, or the board splits along a directory nobody chose.
         assert_eq!(topic_of(&deep), topic_of(&tmp));
         fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn a_worktree_posts_under_the_repository_it_was_cut_from() {
-        // Two agents in two worktrees of one project are the likeliest pair on
-        // the machine to need each other; separate topics would wall them off.
         let main = std::env::temp_dir().join(format!("savras-wt-{}", std::process::id()));
         let tree = main.join(".claude").join("worktrees").join("board");
         fs::create_dir_all(tree.join("src")).unwrap();
@@ -813,15 +1297,12 @@ mod tests {
             format!("gitdir: {}/.git/worktrees/board\n", main.display()),
         )
         .unwrap();
-
         assert_eq!(topic_of(&tree.join("src")), main.to_string_lossy());
         fs::remove_dir_all(&main).ok();
     }
 
     #[test]
     fn a_marker_file_we_do_not_understand_falls_back_to_itself() {
-        // A submodule, or a format we have not met. The topic must still be
-        // *something*: a post lost over a parse is worse than one filed oddly.
         let odd = std::env::temp_dir().join(format!("savras-odd-{}", std::process::id()));
         fs::create_dir_all(&odd).unwrap();
         fs::write(odd.join(".git"), "nothing we recognise\n").unwrap();
@@ -833,40 +1314,34 @@ mod tests {
     fn a_directory_outside_a_repository_is_its_own_topic() {
         let tmp = std::env::temp_dir().join(format!("savras-bare-{}", std::process::id()));
         fs::create_dir_all(&tmp).unwrap();
-        // Walking to `/` and finding nothing must not put every scratch
-        // directory on the machine into one shared conversation.
         assert!(topic_of(&tmp).ends_with(tmp.file_name().unwrap().to_str().unwrap()));
         fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]
     fn a_name_is_resolved_rather_than_claimed() {
-        // `--as` is the explicit case and wins; with nothing to go on the
-        // poster is still identified, because refusing a post over a label
-        // would lose the message.
         assert_eq!(whoami(Some("AGENT-2")), "AGENT-2");
         assert!(!whoami(None).is_empty());
     }
 
     #[test]
-    fn one_topic_is_shown_without_a_heading_over_it() {
+    fn one_repository_is_shown_without_a_heading_over_it() {
         let messages = vec![msg("1", "A", "/r", "first"), msg("2", "B", "/r", "second")];
         let out = render(&messages);
         assert!(out.contains("A: first"));
         assert!(out.contains("B: second"));
-        // A heading over a single group is noise in somebody's context window.
         assert!(!out.contains("r:\n"));
     }
 
     #[test]
-    fn two_topics_are_told_apart() {
+    fn two_repositories_are_told_apart() {
         let messages = vec![
-            msg("1", "A", "/code/savras", "local"),
-            msg("2", "B", EVERYWHERE, "everyone"),
+            msg("1", "A", SAVRAS, "local"),
+            msg("2", "B", BOOKS, "there"),
         ];
         let out = render(&messages);
         assert!(out.contains("savras:"));
-        assert!(out.contains("all:"));
+        assert!(out.contains("books:"));
     }
 
     #[test]
@@ -877,14 +1352,6 @@ mod tests {
     }
 
     #[test]
-    fn the_global_lane_is_marked_where_it_is_read() {
-        // Otherwise a message to every agent on the machine reads exactly like
-        // one to this repository, and gets answered as if it were.
-        assert!(msg("1", "A", EVERYWHERE, "hi").line().contains("(all)"));
-        assert!(!msg("1", "A", "/r", "hi").line().contains("(all)"));
-    }
-
-    #[test]
     fn a_reader_key_cannot_escape_its_directory() {
         assert_eq!(sanitize("../../etc/passwd"), "______etc_passwd");
         assert_eq!(sanitize("SAVRAS-2"), "SAVRAS-2");
@@ -892,12 +1359,14 @@ mod tests {
     }
 
     #[test]
-    fn the_installation_says_both_halves() {
-        // A hook with no instruction is a board nobody posts to; an
-        // instruction with no hook is a board nobody reads.
+    fn the_installation_says_both_halves_and_no_lane() {
         let text = install_text();
         assert!(text.contains("UserPromptSubmit"));
         assert!(text.contains("svr board unread --hook"));
         assert!(text.contains("svr board post"));
+        assert!(
+            !text.contains("--all"),
+            "the lane is gone from the instructions too"
+        );
     }
 }

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use ratatui::widgets::ListState;
 
-use crate::board::{self, Message};
+use crate::board::{self, Boards, Message, Owner};
 use crate::job::{self, Job, Snapshot, Status};
 
 /// How many messages the board screen holds. More than a hook injects, because
@@ -124,24 +124,26 @@ pub struct App {
     switch_label: Option<String>,
     /// The board, while it is on screen in place of the rows.
     pub board: Option<BoardView>,
-    /// Where the board is kept. A field of its own so a test can point it at a
-    /// board of its own rather than the one the machine's agents are reading.
-    pub board_log: PathBuf,
+    /// Where the boards are kept. A field of its own so a test can point it at
+    /// boards of its own rather than the ones the machine's agents are reading.
+    pub board_dir: PathBuf,
     pub should_quit: bool,
 }
 
-/// The board, as the panel shows it.
+/// A repository's board, as the panel shows it.
 ///
 /// Reading it here moves nobody's cursor. Unread is what the hook uses to
 /// decide what goes into an agent's turn, and the owner glancing at the panel
 /// must not be what decides that an agent has already been told.
 pub struct BoardView {
-    log: PathBuf,
-    /// The repository of the session the board was opened on, when there was
-    /// one to ask about. A session on another machine has no path here.
-    pub topic: Option<String>,
-    /// Every repository, rather than `topic` and the global lane.
-    pub everywhere: bool,
+    dir: PathBuf,
+    /// The repository of the session the board was opened on. `None` when no
+    /// session of this machine's was under the cursor — a pane of your own, or
+    /// a session on another machine, whose path means nothing here.
+    pub repo: Option<String>,
+    /// Whether that repository has a board. Making one is the owner's call, so
+    /// the screen for a repository without one says so and offers to.
+    pub exists: bool,
     /// Oldest first, in the order they were said.
     pub messages: Vec<Message>,
     /// The message the cursor is on, by index into `messages`.
@@ -158,11 +160,11 @@ pub struct Compose {
 }
 
 impl BoardView {
-    fn new(log: PathBuf, topic: Option<String>) -> Self {
+    fn new(dir: PathBuf, repo: Option<String>) -> Self {
         let mut view = Self {
-            log,
-            everywhere: topic.is_none(),
-            topic,
+            dir,
+            repo,
+            exists: false,
             messages: Vec::new(),
             selected: None,
             compose: None,
@@ -171,16 +173,21 @@ impl BoardView {
         view
     }
 
-    /// Read the log again, keeping the cursor on its message — or on the
+    fn boards(&self) -> Boards {
+        Boards::at(self.dir.clone())
+    }
+
+    /// Read the board again, keeping the cursor on its message — or on the
     /// newest, if that is where it was, so an answer arriving is an answer you
     /// see rather than one that lands below the fold.
     pub fn reload(&mut self) {
-        let scope = if self.everywhere {
-            None
-        } else {
-            self.topic.as_deref()
+        let (exists, messages) = match &self.repo {
+            Some(repo) => {
+                let boards = self.boards();
+                (boards.exists(repo), boards.read(repo, BOARD_WINDOW))
+            }
+            None => (false, Vec::new()),
         };
-        let messages = board::read_from(&self.log, scope, BOARD_WINDOW);
         let on_newest =
             self.selected.is_none() || self.selected == self.messages.len().checked_sub(1);
         let kept = match self.selected.and_then(|i| self.messages.get(i)) {
@@ -189,14 +196,14 @@ impl BoardView {
         };
         self.selected = kept.or(messages.len().checked_sub(1));
         self.messages = messages;
+        self.exists = exists;
     }
 
-    /// What the screen is showing, as a name.
-    pub fn lane(&self) -> String {
-        match (&self.topic, self.everywhere) {
-            (Some(topic), false) => format!("{} + all", board::topic_name(topic)),
-            _ => "every repository".to_string(),
-        }
+    /// Which repository's board this is, as a name.
+    pub fn name(&self) -> String {
+        self.repo
+            .as_deref()
+            .map_or_else(|| "no repository".to_string(), board::topic_name)
     }
 
     /// Move the cursor by `delta` messages, stopping at the ends.
@@ -218,17 +225,12 @@ impl BoardView {
         };
     }
 
-    /// Between the repository and every repository. With no repository to
-    /// narrow to there is only the one view, and the key does nothing.
-    pub fn toggle_everywhere(&mut self) {
-        if self.topic.is_some() {
-            self.everywhere = !self.everywhere;
-            self.reload();
-        }
-    }
-
     /// Start writing: a new message, or an answer to the one under the cursor.
+    /// Where there is no board there is nowhere for it to go, so nothing starts.
     pub fn compose(&mut self, reply: bool) {
+        if !self.exists {
+            return;
+        }
         let re = match (reply, self.selected.and_then(|i| self.messages.get(i))) {
             (false, _) => None,
             (true, Some(m)) => Some(m.clone()),
@@ -267,32 +269,19 @@ impl BoardView {
         self.compose = None;
     }
 
-    /// Where a message written now would go: an answer goes where its question
-    /// was asked, whichever view you answered it from, and anything else goes
-    /// where you are reading.
-    fn destination(&self, re: Option<&Message>) -> String {
-        match (re, &self.topic, self.everywhere) {
-            (Some(m), _, _) => m.topic.clone(),
-            (None, Some(topic), false) => topic.clone(),
-            _ => board::EVERYWHERE.to_string(),
-        }
-    }
-
-    /// [`Self::destination`] for the message being written, as a name.
-    pub fn destination_name(&self) -> String {
-        let re = self.compose.as_ref().and_then(|c| c.re.as_ref());
-        board::topic_name(&self.destination(re))
-    }
-
     /// Post what has been written, as the owner. On failure the words are kept:
-    /// a message you typed and lost to an error is one you type twice.
+    /// a message you typed and lost to an error — an empty one, or a board
+    /// deleted while you wrote — is one you type twice.
     fn send(&mut self) -> Result<Message> {
         let Some(compose) = self.compose.take() else {
             anyhow::bail!("nothing is being written");
         };
-        let topic = self.destination(compose.re.as_ref());
+        let Some(repo) = self.repo.clone() else {
+            self.compose = Some(compose);
+            anyhow::bail!("there is no repository here to post to");
+        };
         let re = compose.re.as_ref().map(|m| m.id.clone());
-        match board::post_to(&self.log, board::OWNER, &topic, re, &compose.text) {
+        match self.boards().post(board::OWNER, &repo, re, &compose.text) {
             Ok(message) => {
                 // Onto what was just said, wherever the cursor had wandered.
                 self.selected = None;
@@ -304,6 +293,18 @@ impl BoardView {
                 Err(e)
             }
         }
+    }
+
+    /// Give this repository a board, as the owner — which the panel is. Returns
+    /// the repository's name when one was made, and `None` when there was no
+    /// repository to make it for or it already had one.
+    fn create(&mut self) -> Result<Option<String>> {
+        let Some(repo) = self.repo.clone() else {
+            return Ok(None);
+        };
+        let made = self.boards().create(&Owner::at_the_panel(), &repo)?;
+        self.reload();
+        Ok(made.then(|| board::topic_name(&repo)))
     }
 }
 
@@ -348,7 +349,9 @@ impl App {
             nested: HashSet::new(),
             switch_label: None,
             board: None,
-            board_log: board::log_path().unwrap_or_default(),
+            // The path only: opening the boards migrates the old log, and that
+            // is for a panel starting up, not for every `App` a test builds.
+            board_dir: board::default_dir().unwrap_or_default(),
             should_quit: false,
         };
         app.refresh();
@@ -507,23 +510,35 @@ impl App {
         }
     }
 
-    /// Show the board for the session under the cursor: its repository and the
-    /// global lane.
+    /// Show the board of the repository the session under the cursor is in —
+    /// or say that it has none.
     ///
     /// With no session of this machine's there — a pane of your own, or a
-    /// session on another machine — it opens on every repository, because
-    /// there is nothing here to narrow it by. A remote `cwd` is never asked
-    /// about: see `Job::repo` for what that costs.
+    /// session on another machine — there is no repository to show one for. A
+    /// remote `cwd` is never asked about: see `Job::repo` for what that costs.
     pub fn open_board(&mut self) {
-        let topic = match self.selected_job() {
+        let repo = match self.selected_job() {
             Some(job) if job.machine.is_none() => Some(board::topic_of(&job.cwd)),
             _ => None,
         };
-        self.board = Some(BoardView::new(self.board_log.clone(), topic));
+        self.board = Some(BoardView::new(self.board_dir.clone(), repo));
     }
 
     pub fn close_board(&mut self) {
         self.board = None;
+    }
+
+    /// Make a board for the repository on screen — the panel's half of
+    /// `svr board create`, and the owner's to do because the panel is the owner.
+    pub fn create_board(&mut self) {
+        let Some(view) = self.board.as_mut() else {
+            return;
+        };
+        match view.create() {
+            Ok(Some(name)) => self.error = Some(format!("created a board for {name}")),
+            Ok(None) => {}
+            Err(e) => self.error = Some(format!("could not create the board: {e}")),
+        }
     }
 
     /// Post the message being written, and say where it went — or why not.
@@ -1145,9 +1160,12 @@ mod tests {
         assert_eq!(app.front_name().as_deref(), Some("shell 2"));
     }
 
-    /// A session in a repository, and a board beside the fixture holding one
-    /// message for that repository, one for another, and one for everyone.
-    fn with_a_board(tag: &str) -> (Fixture, PathBuf) {
+    const BOOKS: &str = "/elsewhere/books";
+
+    /// A session in a repository, and boards of the fixture's own: another
+    /// repository's, holding a message, and — when `made` — this repository's,
+    /// holding one too.
+    fn with_a_board(tag: &str, made: bool) -> (Fixture, PathBuf, String) {
         let f = Fixture::new(tag);
         let root = f.0.parent().unwrap().to_path_buf();
         let repo = root.join("savras");
@@ -1159,19 +1177,19 @@ mod tests {
                 repo.display()
             ),
         );
-        let log = root.join("board.jsonl");
+        let dir = root.join("boards");
         let here = repo.to_string_lossy().to_string();
-        board::post_to(&log, "ROADMAP", &here, None, "the ubuntu leg hangs").unwrap();
-        board::post_to(&log, "BOOKS", "/elsewhere/books", None, "not for savras").unwrap();
-        board::post_to(
-            &log,
-            "SAVRAS-2",
-            board::EVERYWHERE,
-            None,
-            "holding the lock",
-        )
-        .unwrap();
-        (f, log)
+        let boards = Boards::at(dir.clone());
+        let owner = Owner::at_the_panel();
+        boards.create(&owner, BOOKS).unwrap();
+        boards.post("BOOKS", BOOKS, None, "not for savras").unwrap();
+        if made {
+            boards.create(&owner, &here).unwrap();
+            boards
+                .post("ROADMAP", &here, None, "the ubuntu leg hangs")
+                .unwrap();
+        }
+        (f, dir, here)
     }
 
     fn on_board(app: &App) -> Vec<String> {
@@ -1185,54 +1203,80 @@ mod tests {
     }
 
     #[test]
-    fn the_board_opens_on_the_selected_sessions_repository_and_the_global_lane() {
-        let (f, log) = with_a_board("board-open");
+    fn the_board_is_the_selected_sessions_repositorys_and_nobody_elses() {
+        let (f, dir, here) = with_a_board("board-open", true);
         let mut app = App::new(f.0.clone());
-        app.board_log = log;
+        app.board_dir = dir;
         app.open_board();
 
-        assert_eq!(on_board(&app), ["the ubuntu leg hangs", "holding the lock"]);
         let view = app.board.as_ref().unwrap();
-        assert_eq!(view.lane(), "savras + all");
+        assert_eq!(view.repo.as_deref(), Some(here.as_str()));
+        assert!(view.exists);
+        assert_eq!(view.name(), "savras");
+        assert_eq!(on_board(&app), ["the ubuntu leg hangs"]);
         // On the newest, which is what you opened it to see.
-        assert_eq!(view.selected, Some(1));
-
-        app.board.as_mut().unwrap().toggle_everywhere();
-        assert_eq!(on_board(&app).len(), 3);
-        assert_eq!(app.board.as_ref().unwrap().lane(), "every repository");
+        assert_eq!(view.selected, Some(0));
     }
 
     #[test]
-    fn with_no_session_of_this_machines_selected_the_board_is_every_repository() {
-        let (f, log) = with_a_board("board-shell");
+    fn a_repository_without_a_board_is_offered_one_and_the_panel_makes_it() {
+        let (f, dir, here) = with_a_board("board-make", false);
         let mut app = App::new(f.0.clone());
-        app.board_log = log;
+        app.board_dir = dir.clone();
+        app.open_board();
+
+        assert!(!app.board.as_ref().unwrap().exists);
+        assert!(on_board(&app).is_empty());
+        app.board.as_mut().unwrap().compose(false);
+        assert!(
+            app.board.as_ref().unwrap().compose.is_none(),
+            "there is nowhere for a message to go"
+        );
+
+        app.create_board();
+        assert_eq!(app.error.as_deref(), Some("created a board for savras"));
+        assert!(Boards::at(dir).exists(&here));
+        assert!(app.board.as_ref().unwrap().exists);
+    }
+
+    #[test]
+    fn with_no_session_of_this_machines_selected_there_is_no_board_to_show() {
+        let (f, dir, _) = with_a_board("board-shell", true);
+        let mut app = App::new(f.0.clone());
+        app.board_dir = dir.clone();
         app.set_tabs(Front::Shell(0), Vec::new(), shells(1));
         app.select_shell(0);
         app.open_board();
 
-        assert!(app.board.as_ref().unwrap().everywhere);
-        assert_eq!(on_board(&app).len(), 3);
-        // There is no repository to narrow to, so the key has nowhere to go.
-        app.board.as_mut().unwrap().toggle_everywhere();
-        assert!(app.board.as_ref().unwrap().everywhere);
+        let view = app.board.as_ref().unwrap();
+        assert!(view.repo.is_none());
+        assert!(!view.exists);
+        assert!(
+            view.messages.is_empty(),
+            "no other repository's board shows"
+        );
+        // And there is nothing to make one for.
+        app.create_board();
+        assert!(app.error.is_none());
+        assert_eq!(Boards::at(dir).list().len(), 2);
     }
 
     #[test]
-    fn the_owner_posts_where_they_are_reading_and_answers_go_where_the_question_was() {
-        let (f, log) = with_a_board("board-post");
+    fn the_owner_posts_to_the_repository_they_are_reading() {
+        let (f, dir, here) = with_a_board("board-post", true);
+        let boards = Boards::at(dir.clone());
         let mut app = App::new(f.0.clone());
-        app.board_log = log.clone();
+        app.board_dir = dir;
         app.open_board();
 
         let view = app.board.as_mut().unwrap();
         view.compose(false);
         view.type_text("looks good\nship it");
         app.send_board();
-        let posted = board::read_from(&log, None, 10).pop().unwrap();
+        let posted = boards.read(&here, 10).pop().unwrap();
         assert_eq!(posted.from, board::OWNER);
         assert_eq!(posted.text, "looks good ship it");
-        assert_eq!(board::topic_name(&posted.topic), "savras");
+        assert_eq!(posted.topic, here);
         assert_eq!(app.error.as_deref(), Some("posted to savras"));
         let view = app.board.as_ref().unwrap();
         assert_eq!(
@@ -1242,33 +1286,23 @@ mod tests {
         );
         assert_eq!(view.selected, Some(view.messages.len() - 1));
 
-        // From every repository, an answer still goes where its question was.
-        let books = board::read_from(&log, None, 10)[1].clone();
+        // An answer carries what it answers, on the same board.
+        let first = boards.read(&here, 10)[0].id.clone();
         let view = app.board.as_mut().unwrap();
-        view.toggle_everywhere();
         view.jump(false);
-        view.step(1);
         view.compose(true);
         view.type_text("on it");
         app.send_board();
-        let answer = board::read_from(&log, None, 10).pop().unwrap();
-        assert_eq!(answer.topic, books.topic);
-        assert_eq!(answer.re.as_deref(), Some(books.id.as_str()));
-
-        // And a new message from there is for every repository.
-        let view = app.board.as_mut().unwrap();
-        view.compose(false);
-        view.type_text("to everyone");
-        app.send_board();
-        let everyone = board::read_from(&log, None, 10).pop().unwrap();
-        assert_eq!(everyone.topic, board::EVERYWHERE);
+        let answer = boards.read(&here, 10).pop().unwrap();
+        assert_eq!(answer.re.as_deref(), Some(first.as_str()));
+        assert_eq!(boards.count(BOOKS), 1, "nothing reached another repository");
     }
 
     #[test]
     fn a_message_that_cannot_be_posted_keeps_its_words() {
-        let (f, log) = with_a_board("board-empty");
+        let (f, dir, here) = with_a_board("board-unsent", true);
         let mut app = App::new(f.0.clone());
-        app.board_log = log.clone();
+        app.board_dir = dir.clone();
         app.open_board();
         app.board.as_mut().unwrap().compose(false);
         app.board.as_mut().unwrap().type_text("   ");
@@ -1280,20 +1314,34 @@ mod tests {
         );
         assert!(app.error.as_deref().unwrap().starts_with("could not post"));
         assert_eq!(
-            board::read_from(&log, None, 10).len(),
-            3,
+            Boards::at(dir.clone()).count(&here),
+            1,
             "nothing was posted"
         );
+
+        // A board deleted while you wrote takes nothing you typed with it.
+        let view = app.board.as_mut().unwrap();
+        view.cancel();
+        view.compose(false);
+        view.type_text("still here");
+        Boards::at(dir)
+            .delete(&Owner::at_the_panel(), &here)
+            .unwrap();
+        app.send_board();
+        let kept = app.board.as_ref().unwrap().compose.as_ref().unwrap();
+        assert_eq!(kept.text, "still here");
+        assert!(app.error.as_deref().unwrap().contains("has no board"));
     }
 
     #[test]
     fn a_message_arriving_while_you_read_is_shown_and_followed_from_the_bottom() {
-        let (f, log) = with_a_board("board-arrive");
+        let (f, dir, here) = with_a_board("board-arrive", true);
+        let boards = Boards::at(dir.clone());
         let mut app = App::new(f.0.clone());
-        app.board_log = log.clone();
+        app.board_dir = dir;
         app.open_board();
 
-        board::post_to(&log, "ROADMAP", board::EVERYWHERE, None, "green now").unwrap();
+        boards.post("ROADMAP", &here, None, "green now").unwrap();
         app.refresh();
         let view = app.board.as_ref().unwrap();
         assert_eq!(view.messages.last().unwrap().text, "green now");
@@ -1301,7 +1349,7 @@ mod tests {
 
         // Scrolled back to read something, the cursor stays where you put it.
         app.board.as_mut().unwrap().jump(false);
-        board::post_to(&log, "ROADMAP", board::EVERYWHERE, None, "and again").unwrap();
+        boards.post("ROADMAP", &here, None, "and again").unwrap();
         app.refresh();
         assert_eq!(app.board.as_ref().unwrap().selected, Some(0));
     }
@@ -1310,24 +1358,37 @@ mod tests {
     fn reading_the_board_writes_nothing() {
         // Unread belongs to the agents' hook. The panel looking must not be
         // what tells it an agent has already seen something.
-        let (f, log) = with_a_board("board-looking");
-        let before = std::fs::read(&log).unwrap();
-        let dir = log.parent().unwrap().to_path_buf();
-        let entries = || std::fs::read_dir(&dir).unwrap().count();
-        let count = entries();
+        fn tree(dir: &std::path::Path) -> Vec<(PathBuf, Vec<u8>)> {
+            let mut files = Vec::new();
+            let mut todo = vec![dir.to_path_buf()];
+            while let Some(at) = todo.pop() {
+                for entry in std::fs::read_dir(&at).unwrap() {
+                    let path = entry.unwrap().path();
+                    if path.is_dir() {
+                        todo.push(path);
+                    } else {
+                        let bytes = std::fs::read(&path).unwrap();
+                        files.push((path, bytes));
+                    }
+                }
+            }
+            files.sort();
+            files
+        }
+
+        let (f, dir, _) = with_a_board("board-looking", true);
+        let before = tree(&dir);
 
         let mut app = App::new(f.0.clone());
-        app.board_log = log.clone();
+        app.board_dir = dir.clone();
         app.open_board();
         let view = app.board.as_mut().unwrap();
-        view.toggle_everywhere();
         view.step(-1);
         view.jump(true);
         app.refresh();
         app.close_board();
 
-        assert_eq!(std::fs::read(&log).unwrap(), before);
-        assert_eq!(entries(), count, "no cursor file appeared beside the board");
+        assert_eq!(tree(&dir), before, "the boards are exactly as they were");
     }
 
     #[test]

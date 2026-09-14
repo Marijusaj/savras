@@ -101,10 +101,11 @@ keys, with the panel focused:
   x          close the selected tab, yours or a session's
   a          start a parallel agent under this session's lead
   s          group by repository or by status
-  b          the agent board, for the selected session's repository:
+  b          the board of the selected session's repository:
              p post, r reply to the message under the cursor,
-             a every repository, esc back. You post as `owner`,
-             and reading marks nothing seen for the agents
+             c create it if the repository has none, esc back.
+             You post as `owner`, and reading marks nothing seen
+             for the agents
   < >        narrow or widen the panel     [ ]  put it left or right
   d          delete the selected session for good, after asking:
              `claude stop` then `claude rm`, which x does not do.
@@ -539,6 +540,10 @@ fn event_loop(
 ) -> Result<()> {
     let mut app = App::new(jobs_dir.clone());
     app.set_group_by(group_by);
+    // See `host::event_loop`: starting up is when the old log is split, once.
+    if let Err(e) = board::Boards::open() {
+        app.error = Some(format!("the board: {e}"));
+    }
     // The panel App::new already loaded is the state of the world, not news.
     ping.poll(&app.snapshot, None);
 
@@ -658,13 +663,16 @@ fn board_key(app: &mut App, key: KeyEvent) {
         app.close_board();
         return;
     }
+    if key.code == KeyCode::Char('c') {
+        app.create_board();
+        return;
+    }
     if let Some(view) = app.board.as_mut() {
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => view.step(1),
             KeyCode::Up | KeyCode::Char('k') => view.step(-1),
             KeyCode::Char('g') | KeyCode::Home => view.jump(false),
             KeyCode::Char('G') | KeyCode::End => view.jump(true),
-            KeyCode::Char('a') => view.toggle_everywhere(),
             KeyCode::Char('p') => view.compose(false),
             KeyCode::Char('r') => view.compose(true),
             _ => {}
