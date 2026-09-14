@@ -15,6 +15,10 @@ env:
 
 jobs:
   test:
+    # A whole run takes a few minutes. A pane test that waits on a panel that
+    # never goes quiet once held a runner for the full six-hour default, and a
+    # red mark after six hours says nothing a red mark after twenty does not.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
