@@ -67,6 +67,13 @@ pub const LIMIT: usize = 2000;
 /// How many messages a bare `read` shows, and the most a hook will inject.
 pub const WINDOW: usize = 30;
 
+/// The name a post from the panel carries.
+///
+/// The panel is the person at the keyboard rather than an agent, and the
+/// agents reading need to tell the two apart: an instruction from the owner is
+/// not a suggestion from a peer.
+pub const OWNER: &str = "owner";
+
 /// One thing said on the board.
 ///
 /// Serialised one per line. Unknown fields are kept out of the way rather than
@@ -285,6 +292,18 @@ pub fn topic_name(topic: &str) -> String {
 /// arrive here, so identity, ordering, truncation and the timestamp are
 /// decided once rather than by whoever wrote the caller.
 pub fn post(from: &str, topic: &str, re: Option<String>, text: &str) -> Result<Message> {
+    post_to(&log_path()?, from, topic, re, text)
+}
+
+/// [`post`], to the board at `path` — which is the real board everywhere but in
+/// a test, and a test that posted to the real one would be talking to agents.
+pub fn post_to(
+    path: &Path,
+    from: &str,
+    topic: &str,
+    re: Option<String>,
+    text: &str,
+) -> Result<Message> {
     let text = text.trim();
     anyhow::ensure!(!text.is_empty(), "a message with no words in it");
     let text = truncate(text, LIMIT);
@@ -298,7 +317,6 @@ pub fn post(from: &str, topic: &str, re: Option<String>, text: &str) -> Result<M
         text,
     };
 
-    let path = log_path()?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("creating the board directory {}", parent.display()))?;
@@ -308,7 +326,7 @@ pub fn post(from: &str, topic: &str, re: Option<String>, text: &str) -> Result<M
     let mut file = OpenOptions::new()
         .append(true)
         .create(true)
-        .open(&path)
+        .open(path)
         .with_context(|| format!("opening the board at {}", path.display()))?;
     // One `write_all` of one line, on a handle opened `O_APPEND`: the kernel
     // orders it against every other writer, so no lock is needed and none is
@@ -360,13 +378,17 @@ fn new_id() -> String {
 /// silence the rest, which is the same call M2.1 made about a half-written
 /// `state.json` and for the same reason.
 pub fn all() -> Result<Vec<Message>> {
-    let path = log_path()?;
-    let Ok(text) = fs::read_to_string(&path) else {
+    Ok(all_in(&log_path()?))
+}
+
+/// [`all`], from the board at `path`.
+fn all_in(path: &Path) -> Vec<Message> {
+    let Ok(text) = fs::read_to_string(path) else {
         // No board yet is an empty board, not an error. The first `post`
         // creates it.
-        return Ok(Vec::new());
+        return Vec::new();
     };
-    Ok(parse(&text))
+    parse(&text)
 }
 
 /// The parsing half of [`all`], separated so it can be tested without a disk.
@@ -379,12 +401,18 @@ pub fn parse(text: &str) -> Vec<Message> {
 
 /// The last `limit` messages that concern `topic`, oldest first.
 pub fn read(topic: Option<&str>, limit: usize) -> Result<Vec<Message>> {
-    let mut messages = all()?;
+    Ok(read_from(&log_path()?, topic, limit))
+}
+
+/// [`read`], from the board at `path`. Moves no cursor: this is looking, and
+/// the panel reads through it for exactly that reason.
+pub fn read_from(path: &Path, topic: Option<&str>, limit: usize) -> Vec<Message> {
+    let mut messages = all_in(path);
     if let Some(topic) = topic {
         messages.retain(|m| m.concerns(topic));
     }
     let cut = messages.len().saturating_sub(limit);
-    Ok(messages.split_off(cut))
+    messages.split_off(cut)
 }
 
 /// What `reader` has not seen yet, and the cursor that would mark it seen.

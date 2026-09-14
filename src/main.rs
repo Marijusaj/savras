@@ -101,6 +101,10 @@ keys, with the panel focused:
   x          close the selected tab, yours or a session's
   a          start a parallel agent under this session's lead
   s          group by repository or by status
+  b          the agent board, for the selected session's repository:
+             p post, r reply to the message under the cursor,
+             a every repository, esc back. You post as `owner`,
+             and reading marks nothing seen for the agents
   < >        narrow or widen the panel     [ ]  put it left or right
   d          delete the selected session for good, after asking:
              `claude stop` then `claude rm`, which x does not do.
@@ -596,7 +600,12 @@ fn event_loop(
 /// and solo is the panel with nothing beside it. Starting an agent needs no
 /// pane, so `a` belongs in both.
 fn handle_key(app: &mut App, key: KeyEvent, starting: &std::sync::mpsc::Sender<Result<String>>) {
+    if app.board.is_some() {
+        board_key(app, key);
+        return;
+    }
     match key.code {
+        KeyCode::Char('b') => app.open_board(),
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true
@@ -611,6 +620,55 @@ fn handle_key(app: &mut App, key: KeyEvent, starting: &std::sync::mpsc::Sender<R
         }
         KeyCode::Char('a') => agents::add(app, starting),
         _ => {}
+    }
+}
+
+/// The board's keys in `svr solo` — the side panel's, read off crossterm's
+/// events rather than raw bytes. See `host::board_key`.
+fn board_key(app: &mut App, key: KeyEvent) {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    if control && key.code == KeyCode::Char('c') {
+        app.should_quit = true;
+        return;
+    }
+    let Some(composing) = app.board.as_ref().map(|v| v.compose.is_some()) else {
+        return;
+    };
+
+    if composing {
+        if key.code == KeyCode::Enter {
+            app.send_board();
+            return;
+        }
+        if let Some(view) = app.board.as_mut() {
+            match key.code {
+                KeyCode::Esc => view.cancel(),
+                KeyCode::Backspace => view.backspace(),
+                KeyCode::Char(c) if !control => view.type_text(&c.to_string()),
+                _ => {}
+            }
+        }
+        return;
+    }
+
+    if matches!(
+        key.code,
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('b')
+    ) {
+        app.close_board();
+        return;
+    }
+    if let Some(view) = app.board.as_mut() {
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => view.step(1),
+            KeyCode::Up | KeyCode::Char('k') => view.step(-1),
+            KeyCode::Char('g') | KeyCode::Home => view.jump(false),
+            KeyCode::Char('G') | KeyCode::End => view.jump(true),
+            KeyCode::Char('a') => view.toggle_everywhere(),
+            KeyCode::Char('p') => view.compose(false),
+            KeyCode::Char('r') => view.compose(true),
+            _ => {}
+        }
     }
 }
 

@@ -1896,7 +1896,13 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: Option<&Confirm>) -> Actio
         Some(Confirm::Where(_)) => return Action::Nothing,
         None => {}
     }
+    if app.board.is_some() {
+        return board_key(bytes, app);
+    }
     match bytes {
+        // What the agents have been saying to each other, for the session
+        // under the cursor. See `App::open_board`.
+        [b'b'] => app.open_board(),
         [b'j'] | [ESC, b'[', b'B'] => app.step(1),
         [b'k'] | [ESC, b'[', b'A'] => app.step(-1),
         [b'g'] => app.jump(false),
@@ -1930,6 +1936,62 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: Option<&Confirm>) -> Actio
         // panel, closing the whole window is rarely what was meant.
         [ESC] | [b'q'] => return Action::Focus(Focus::Work),
         _ => {}
+    }
+    Action::Nothing
+}
+
+/// The panel's keys while the board is on screen.
+///
+/// Reading, the keys move, post, and leave — and `q` and esc leave the board
+/// rather than the panel, because that is the nearer thing to be leaving.
+/// Writing, every key is a letter, `q` and `b` included, until enter or esc.
+fn board_key(bytes: &[u8], app: &mut App) -> Action {
+    let Some(composing) = app.board.as_ref().map(|v| v.compose.is_some()) else {
+        return Action::Nothing;
+    };
+
+    if composing {
+        // A paste arrives wrapped in markers when the terminal brackets it,
+        // and the words inside are words like any other.
+        let text = String::from_utf8_lossy(bytes)
+            .replace("\x1b[200~", "")
+            .replace("\x1b[201~", "");
+        if matches!(text.as_bytes(), [b'\r'] | [b'\n']) {
+            app.send_board();
+            return Action::Nothing;
+        }
+        if let Some(view) = app.board.as_mut() {
+            match text.as_bytes() {
+                [ESC] => view.cancel(),
+                [0x7f] | [0x08] => view.backspace(),
+                // An arrow, or any other sequence: nothing a line of text uses.
+                [ESC, ..] => {}
+                _ => view.type_text(&text),
+            }
+        }
+        return Action::Nothing;
+    }
+
+    match bytes {
+        [REPAINT] => return Action::Repaint,
+        [b'Q'] => return Action::ConfirmQuit,
+        [ESC] | [b'q'] | [b'b'] => {
+            app.close_board();
+            return Action::Nothing;
+        }
+        _ => {}
+    }
+    if let Some(view) = app.board.as_mut() {
+        match bytes {
+            [b'j'] | [ESC, b'[', b'B'] => view.step(1),
+            [b'k'] | [ESC, b'[', b'A'] => view.step(-1),
+            [b'g'] => view.jump(false),
+            [b'G'] => view.jump(true),
+            [b'a'] => view.toggle_everywhere(),
+            [b'p'] => view.compose(false),
+            [b'r'] => view.compose(true),
+            _ => {}
+        }
     }
     Action::Nothing
 }
@@ -2408,6 +2470,58 @@ mod tests {
                 "{answer:?} must not delete a session"
             );
         }
+    }
+
+    #[test]
+    fn the_board_is_read_and_answered_from_the_panel() {
+        let f =
+            Fixture::new("board-keys").job("aaa", r#"{"state":"working","name":"X","cwd":"/tmp"}"#);
+        let log = f.0.parent().unwrap().join("board.jsonl");
+        let asked =
+            crate::board::post_to(&log, "ROADMAP", crate::board::EVERYWHERE, None, "anyone?")
+                .unwrap();
+        let mut app = App::new(f.0.clone());
+        app.board_log = log.clone();
+
+        panel_key(b"b", &mut app, None);
+        assert!(app.board.is_some(), "b opens the board");
+        // Reading it, q is leaving the board — the nearer thing — and the
+        // keyboard stays with the panel.
+        assert!(matches!(panel_key(b"q", &mut app, None), Action::Nothing));
+        assert!(app.board.is_none());
+
+        panel_key(b"b", &mut app, None);
+        panel_key(b"r", &mut app, None);
+        // Writing, every key is a letter, including the ones that are keys; a
+        // bracketed paste is its words, and its line breaks are spaces.
+        for key in [
+            &b"q"[..],
+            b"b",
+            b"\x1b[200~ yes\r\nsoon\x1b[201~",
+            b"x",
+            b"\x7f",
+            b"\x1b[A",
+        ] {
+            assert!(matches!(panel_key(key, &mut app, None), Action::Nothing));
+        }
+        assert!(
+            app.board.as_ref().unwrap().compose.is_some(),
+            "still writing"
+        );
+        panel_key(b"\r", &mut app, None);
+
+        let answer = crate::board::read_from(&log, None, 10).pop().unwrap();
+        assert_eq!(answer.text, "qb yes  soon");
+        assert_eq!(answer.from, crate::board::OWNER);
+        assert_eq!(answer.re.as_deref(), Some(asked.id.as_str()));
+        assert!(app.board.as_ref().unwrap().compose.is_none());
+
+        // Esc abandons a message without posting it.
+        panel_key(b"p", &mut app, None);
+        panel_key(b"never mind", &mut app, None);
+        panel_key(b"\x1b", &mut app, None);
+        assert!(app.board.as_ref().unwrap().compose.is_none());
+        assert_eq!(crate::board::read_from(&log, None, 10).len(), 2);
     }
 
     #[test]

@@ -8,7 +8,8 @@ use ratatui::{
 };
 
 use crate::agents;
-use crate::app::{App, Row, Tab};
+use crate::app::{App, BoardView, Compose, Row, Tab};
+use crate::board;
 use crate::job::{age, Deploy, Job, Status};
 
 /// Keep the summary as long as this many columns are left for it. Claude
@@ -19,6 +20,8 @@ const MIN_SUMMARY: usize = 8;
 const WRAPS: u16 = 60;
 /// At this width and above, the key footer has room for the rarer keys too.
 const ROOMY: u16 = 58;
+/// And at this one, for the board as well.
+const WIDE: u16 = 68;
 /// Below this height the detail footer is dropped to keep rows visible.
 const SHORT: u16 = 16;
 
@@ -44,6 +47,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 
 /// Draw the panel into `area`.
 pub fn draw_in(frame: &mut Frame, area: Rect, app: &mut App, hint: Hint<'_>) {
+    // The board takes the place of the rows and the detail, not of the header:
+    // what is waiting on you is still worth a line while you read.
+    if app.board.is_some() {
+        let chunks = Layout::vertical([
+            Constraint::Length(2), // header
+            Constraint::Min(1),    // board
+            Constraint::Length(1), // keys
+        ])
+        .split(area);
+        draw_header(frame, chunks[0], app);
+        draw_board(frame, chunks[1], app);
+        draw_footer(frame, chunks[2], app, hint);
+        return;
+    }
+
     let show_detail = area.height >= SHORT && app.selected_job().is_some();
 
     let chunks = Layout::vertical([
@@ -494,6 +512,199 @@ fn age_color(job: &Job) -> Color {
     }
 }
 
+/// The board, in place of the rows: what the agents said to each other, and
+/// what you are saying back.
+///
+/// Oldest at the top and newest at the bottom, the way a conversation reads,
+/// with the view held at the bottom unless the cursor has gone above it.
+fn draw_board(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(view) = app.board.as_ref() else {
+        return;
+    };
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(if view.compose.is_some() { 2 } else { 0 }),
+    ])
+    .split(area);
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                "board",
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate(
+                    &format!(" · {}", view.lane()),
+                    (area.width as usize).saturating_sub(5),
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])),
+        chunks[0],
+    );
+
+    if view.messages.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "Nothing on the board yet.",
+                Style::default().fg(Color::DarkGray),
+            ))),
+            chunks[1],
+        );
+    } else {
+        let (lines, selected) = board_lines(view, chunks[1].width as usize);
+        let mut top = lines.len().saturating_sub(chunks[1].height as usize);
+        if let Some(start) = selected {
+            top = top.min(start);
+        }
+        frame.render_widget(
+            Paragraph::new(lines).scroll((top.min(u16::MAX as usize) as u16, 0)),
+            chunks[1],
+        );
+    }
+
+    if let Some(compose) = &view.compose {
+        draw_compose(frame, chunks[2], view, compose);
+    }
+}
+
+/// Every message as the lines it takes at this width, and the line the
+/// selected one starts on.
+///
+/// An answer is marked with who it answers rather than moved under its
+/// question: the list keeps the order things were said in, and a thread
+/// rebuilt out of order hides that the answer came an hour later.
+fn board_lines(view: &BoardView, width: usize) -> (Vec<Line<'static>>, Option<usize>) {
+    let mut lines = Vec::new();
+    let mut selected = None;
+    for (i, m) in view.messages.iter().enumerate() {
+        let start = lines.len();
+        let mut head = vec![
+            Span::styled(
+                m.at.with_timezone(&chrono::Local)
+                    .format("%H:%M ")
+                    .to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+            // The owner in the colour Savras wears, so what you said stands
+            // apart from what the agents said.
+            Span::styled(
+                m.from.clone(),
+                Style::default()
+                    .fg(if m.from == board::OWNER {
+                        Color::Magenta
+                    } else {
+                        Color::White
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        if let Some(re) = &m.re {
+            let whom = view
+                .messages
+                .iter()
+                .find(|q| &q.id == re)
+                .map_or_else(|| "earlier".to_string(), |q| q.from.clone());
+            head.push(Span::styled(
+                format!(" ↳ {whom}"),
+                Style::default().fg(Color::Indexed(140)),
+            ));
+        }
+        // Which lane, whenever the screen holds more than one: a message to
+        // every agent must not read like one to this repository.
+        let lane = if m.topic == board::EVERYWHERE {
+            Some("all".to_string())
+        } else if view.everywhere {
+            Some(board::topic_name(&m.topic))
+        } else {
+            None
+        };
+        if let Some(lane) = lane {
+            head.push(Span::styled(
+                format!(" · {lane}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(head));
+        for row in wrap(&m.text, width.saturating_sub(2)) {
+            lines.push(Line::from(Span::styled(
+                format!("  {row}"),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+        if view.selected == Some(i) {
+            for line in &mut lines[start..] {
+                *line = std::mem::take(line).style(Style::default().bg(Color::Indexed(236)));
+            }
+            selected = Some(start);
+        }
+    }
+    (lines, selected)
+}
+
+/// The message being written: where it is going, then the end of the words,
+/// which is where you are typing.
+fn draw_compose(frame: &mut Frame, area: Rect, view: &BoardView, compose: &Compose) {
+    let width = area.width as usize;
+    let whither = match &compose.re {
+        Some(m) => format!("to {} · answering {}", view.destination_name(), m.from),
+        None => format!("to {} as {}", view.destination_name(), board::OWNER),
+    };
+    let chars: Vec<char> = compose.text.chars().collect();
+    let shown: String = chars[chars.len().saturating_sub(width.saturating_sub(3))..]
+        .iter()
+        .collect();
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                truncate(&whither, width),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(vec![
+                Span::styled("› ", Style::default().fg(Color::Yellow)),
+                Span::raw(shown),
+                Span::styled("▏", Style::default().fg(Color::Yellow)),
+            ]),
+        ]),
+        area,
+    );
+}
+
+/// Word-wrap to `width` columns, breaking a word only when it is longer than a
+/// whole line. Counted in characters, like every other width here.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    for word in text.split_whitespace() {
+        let mut word: Vec<char> = word.chars().collect();
+        let used = row.chars().count();
+        if used > 0 && used + 1 + word.len() > width {
+            rows.push(std::mem::take(&mut row));
+        }
+        while word.len() > width {
+            if !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+            }
+            rows.push(word.drain(..width).collect());
+        }
+        if !row.is_empty() {
+            row.push(' ');
+        }
+        row.extend(word);
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
 fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
     let Some(job) = app.selected_job() else {
         return;
@@ -577,13 +788,34 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
             truncate(err, area.width as usize),
             Style::default().fg(Color::Red),
         ),
+        // The board has keys of its own, and while a message is being written
+        // every letter is a letter — so the footer says how to get out.
+        (None, Hint::Focused | Hint::Standalone)
+            if app.board.as_ref().is_some_and(|v| v.compose.is_some()) =>
+        {
+            Span::styled(
+                truncate("enter post · esc cancel", area.width as usize),
+                Style::default().fg(Color::DarkGray),
+            )
+        }
+        (None, Hint::Focused | Hint::Standalone) if app.board.is_some() => Span::styled(
+            truncate(
+                if area.width >= ROOMY {
+                    "p post · r reply · a all repos · esc back"
+                } else {
+                    "p post · r reply · a all · esc back"
+                },
+                area.width as usize,
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
         (None, Hint::Standalone) => Span::styled(
             // Solo has no working pane, so nothing here opens or closes one.
             // `a` is the exception worth the width: starting an agent needs no
             // pane, and a key nobody is told about is a key nobody presses.
             truncate(
                 if area.width >= ROOMY {
-                    "↑↓ move · s group · a agent · r refresh · q quit"
+                    "↑↓ move · b board · s group · a agent · q quit"
                 } else {
                     "↑↓ move · a agent · q quit"
                 },
@@ -605,13 +837,21 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
                 // there is none to start for a session on another box. A key
                 // you press to no effect reads as a broken key.
                 match (
-                    area.width >= ROOMY,
+                    area.width,
                     app.selected_job()
                         .is_some_and(|job| job.machine_tag().is_some()),
                 ) {
-                    (true, false) => "enter open · n tab · d delete · x close · a agent · Q quit",
-                    (true, true) => "enter open · n tab · d delete · x close · Q quit",
-                    (false, _) => "enter open · d delete · x close · Q quit",
+                    (w, false) if w >= WIDE => {
+                        "enter open · n tab · b board · d delete · x close · a agent · Q quit"
+                    }
+                    (w, true) if w >= WIDE => {
+                        "enter open · n tab · b board · d delete · x close · Q quit"
+                    }
+                    (w, false) if w >= ROOMY => {
+                        "enter open · n tab · d delete · x close · a agent · Q quit"
+                    }
+                    (w, true) if w >= ROOMY => "enter open · n tab · d delete · x close · Q quit",
+                    _ => "enter open · d delete · x close · Q quit",
                 },
                 area.width as usize,
             ),
@@ -1341,6 +1581,95 @@ mod tests {
         let text = lines.join("\n");
         assert!(!text.contains("claude --resume"));
         assert!(text.contains("ROADMAP"), "rows must survive a short pane");
+    }
+
+    /// The panel with its board open, focused, as plain lines.
+    fn render_board(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|frame| draw_in(frame, frame.area(), app, Hint::Focused))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// A session, and the two messages this feature was first tested with.
+    fn a_board(tag: &str) -> (Fixture, std::path::PathBuf) {
+        let f = Fixture::new(tag).job(
+            "aaa",
+            r#"{"state":"working","name":"SAVRAS-8","cwd":"/tmp"}"#,
+        );
+        let log = f.0.parent().unwrap().join("board.jsonl");
+        let first = board::post_to(&log, "SAVRAS-8", board::EVERYWHERE, None, "msg").unwrap();
+        board::post_to(
+            &log,
+            "ROADMAP",
+            board::EVERYWHERE,
+            Some(first.id),
+            "received — the hook delivered it into my turn unprompted, so the round trip works",
+        )
+        .unwrap();
+        (f, log)
+    }
+
+    #[test]
+    fn the_board_takes_the_place_of_the_rows_and_says_who_is_answered() {
+        let (f, log) = a_board("ui-board");
+        let mut app = App::new(f.0.clone());
+        app.board_log = log;
+        app.open_board();
+        let lines = render_board(&mut app, 44, 24);
+        let text = lines.join("\n");
+
+        assert!(text.contains("board · tmp + all"), "{text}");
+        assert!(!text.contains("WORKING"), "the rows give way: {text}");
+        assert!(
+            text.contains("SAVRAS · live") || text.contains("SAVRAS"),
+            "the header stays"
+        );
+        // Marked with who it answers, and which lane it is in.
+        assert!(text.contains("ROADMAP ↳ SAVRAS-8 · all"), "{text}");
+        // Wrapped at the panel's width rather than clipped at it.
+        assert!(text.contains("unprompted"), "{text}");
+        assert!(text.contains("works"), "{text}");
+        assert!(text.contains("p post"), "the keys are offered: {text}");
+        for line in &lines {
+            assert!(line.chars().count() <= 44, "overflowed: {line:?}");
+        }
+    }
+
+    #[test]
+    fn a_message_being_written_says_where_it_is_going() {
+        let (f, log) = a_board("ui-board-compose");
+        let mut app = App::new(f.0.clone());
+        app.board_log = log;
+        app.open_board();
+        let view = app.board.as_mut().unwrap();
+        view.compose(true);
+        view.type_text("on it");
+        let text = render_board(&mut app, 44, 24).join("\n");
+
+        assert!(text.contains("to all · answering ROADMAP"), "{text}");
+        assert!(text.contains("› on it"), "{text}");
+        assert!(text.contains("enter post · esc cancel"), "{text}");
+    }
+
+    #[test]
+    fn a_long_word_is_broken_and_a_short_line_is_not() {
+        assert_eq!(
+            wrap("the round trip works", 10),
+            ["the round", "trip works"]
+        );
+        assert_eq!(wrap("abcdefghij-klm", 5), ["abcde", "fghij", "-klm"]);
+        assert!(wrap("anything", 0).is_empty());
     }
 
     #[test]
