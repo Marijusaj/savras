@@ -101,11 +101,14 @@ keys, with the panel focused:
   x          close the selected tab, yours or a session's
   a          start a parallel agent under this session's lead
   s          group by repository or by status
-  b          the board of the selected session's repository:
-             p post, r reply to the message under the cursor,
-             c create it if the repository has none, esc back.
-             You post as `owner`, and reading marks nothing seen
-             for the agents
+  b          the board of the selected session's repository, as a tab:
+             type to post, ↑↓ to pick a message to answer, enter to
+             send — or to create the board, where there is none.
+             A board's row sits first under its repository: enter
+             opens it, c empties it and d deletes it, both after
+             asking, x closes its tab. You post as `owner`, and
+             reading marks nothing seen for the agents. In `svr solo`
+             the board opens in the panel instead
   < >        narrow or widen the panel     [ ]  put it left or right
   d          delete the selected session for good, after asking:
              `claude stop` then `claude rm`, which x does not do.
@@ -611,6 +614,9 @@ fn handle_key(app: &mut App, key: KeyEvent, starting: &std::sync::mpsc::Sender<R
     }
     match key.code {
         KeyCode::Char('b') => app.open_board(),
+        // Solo has no working pane for a board tab, so a board row opens the
+        // board where the rows are.
+        KeyCode::Enter if app.selected_board().is_some() => app.open_board(),
         KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true

@@ -637,15 +637,57 @@ opening the boards been where the path came from.
 
 ---
 
-## Next
+### M5.3 · The board as a tab
+**A board is a row under its repository, and a tab in the working pane.**
 
-**M5.3 · The board as a tab** — decided in the same interrogation: a board row
-under its repository's heading when the board exists, opening as a tab in the
-working pane, flippable like any other, with clean and delete behind the
-panel's confirm prompt. Every tab in `host.rs` is assumed to be a pty today — a
-tab with no session id *is* a shell — so this is an explicit pane kind threaded
-through drawing, routing, resizing, flipping and closing, and the compose line
-kept safe from ctrl-w/s/t. Until then `b` shows the board in place of the rows.
+```
+ panel (grouped by repository)        working pane
+ ▷ zsh                                 board · savras · 12 messages
+ savras                                18:35 SAVRAS-8
+   ▶ board                    12  ──▶    msg
+   ✳ SAVRAS-8  WORKING …               18:37 ROADMAP ↳ SAVRAS-8
+   ✳ ROADMAP   WORKING …                 received — the hook delivered it…
+ processore                            to savras as owner
+   ≡ board                     9       › _
+   ✳ RESEARCH  DONE    …               type to post · ↑↓ pick a message to answer · enter send
+```
+
+The second half of the same interrogation. A board's row sits first under its
+repository's heading while the board exists — none in status grouping, which
+has no heading to put it under. Enter or `b` opens it as a tab; `c` on the row
+empties it and `d` deletes it, each behind the panel's confirm prompt; `x`
+closes the tab. Flipping stops at it on the way down the list like any row.
+
+**Beside the terminal tabs, not among them.** Every tab in `Tabs` is a pty: a
+tab with no session id *is* a shell, and the event loop reaches for the front
+tab's `Work` for its mouse mode, its exit, its keys and its screen — about
+twenty-five places that would each have had to ask "pty or board". So open
+boards are kept beside the tabs, with one field saying whether a board covers
+the working pane. The terminal tab in front stays in front underneath; showing
+a board covers it, going to any terminal tab uncovers it, and nothing in the
+pty tabs learned that boards exist. While a board covers the pane there is no
+mouse mode to mirror, no dead banner, and no session in front to spare a ping.
+
+**Typing writes.** A board tab is a line to write in under a conversation, so
+every printable key is a letter and enter sends. Nothing picked is a new
+message; ↑ picks one to answer and ↓ past the newest lets go; esc drops the
+words, then the pick. Enter in a repository with no board creates one — the
+panel is the owner. ctrl-g and the flip keys still belong to the pane, but a
+bracketed paste is routed to the board before them, so a ctrl-w inside pasted
+text is text.
+
+Which repository a group's sessions are in is a walk up for `.git`, so it is
+kept per directory; whether its board exists, and the count on it, is asked on
+every rebuild, since that is what changes. `svr solo` has no working pane, so
+there the board still opens in place of the rows.
+
+Found while building: the pane tests ran every `svr` under the developer's own
+`HOME`, and since M5.2 a panel starting up opens — and would migrate — the
+boards there. Each pane now gets a `HOME` of its own.
+
+---
+
+## Next
 
 Wire it up, which is the owner's half of M5: `svr board install` prints the
 `settings.json` hook and the sentence for `CLAUDE.md` and `AGENTS.md`, and

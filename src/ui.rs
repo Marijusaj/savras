@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::agents;
-use crate::app::{App, BoardView, Compose, Row, Tab};
+use crate::app::{App, BoardRow, BoardView, Compose, Row, Tab};
 use crate::board;
 use crate::job::{age, Deploy, Job, Status};
 
@@ -220,6 +220,15 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
                     .fg(Color::Blue)
                     .add_modifier(Modifier::BOLD),
             ))),
+            Row::Board(i) => match app.board_rows.get(*i) {
+                Some(board) => ListItem::new(board_line(
+                    board,
+                    app.board_tab(&board.repo),
+                    name_width,
+                    area.width,
+                )),
+                None => ListItem::new(Line::from("")),
+            },
             Row::Shell(i) => ListItem::new(shell_line(
                 &app.shell_name(*i),
                 app.shell_detail(*i),
@@ -244,6 +253,34 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
 
     let list = List::new(items).highlight_style(Style::default().bg(Color::Indexed(236)));
     frame.render_stateful_widget(list, area, &mut app.list_state);
+}
+
+/// A repository's board, first under its heading.
+///
+/// Marked like any tab — filled in front, hollow behind — because it is one,
+/// and with its own glyph when it is not open, so a board never reads as a
+/// session. The count is flush right, where a session's age sits.
+fn board_line(board: &BoardRow, tab: Tab, name_width: u16, total_width: u16) -> Line<'static> {
+    let mark = match tab {
+        Tab::Front => Span::styled(
+            "▶ ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Tab::Behind => Span::styled("▷ ", Style::default().fg(Color::Indexed(245))),
+        Tab::None => Span::styled("≡ ", Style::default().fg(Color::Blue)),
+    };
+    let name = pad("board", (name_width as usize).max(5));
+    let count = board.count.to_string();
+    let gap =
+        (total_width as usize).saturating_sub(2 + name.chars().count() + count.chars().count());
+    Line::from(vec![
+        mark,
+        Span::styled(name, Style::default().fg(Color::Blue)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(count, Style::default().fg(Color::DarkGray)),
+    ])
 }
 
 /// One pane of your own: the shell Savras started with, or one you added.
@@ -528,6 +565,59 @@ fn draw_board(frame: &mut Frame, area: Rect, app: &App) {
     ])
     .split(area);
 
+    draw_board_title(frame, chunks[0], view);
+    draw_messages(frame, chunks[1], view, "Press c to create one");
+    if let Some(compose) = &view.compose {
+        draw_compose(frame, chunks[2], view, compose);
+    }
+}
+
+/// A repository's board as a tab in the working pane.
+///
+/// The conversation fills the pane, the line being written sits under it with
+/// the terminal's own cursor in it, and the last line says what the keys do —
+/// because this is the one tab where typing is not typing into a program.
+pub fn draw_board_tab(frame: &mut Frame, area: Rect, view: &BoardView, focused: bool) {
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(1),
+        Constraint::Length(if view.exists { 2 } else { 0 }),
+        Constraint::Length(1),
+    ])
+    .split(area);
+
+    draw_board_title(frame, chunks[0], view);
+    draw_messages(frame, chunks[1], view, "Press enter to create one");
+    if view.exists {
+        draw_tab_compose(frame, chunks[2], view, focused);
+    }
+    let hint = match (&view.repo, view.exists) {
+        (Some(_), true) => {
+            "type to post · ↑↓ pick a message to answer · enter send · esc clear · ctrl-g panel"
+                .to_string()
+        }
+        (Some(_), false) => format!("enter creates a board for {} · ctrl-g panel", view.name()),
+        (None, _) => "ctrl-g panel".to_string(),
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            truncate(&hint, chunks[3].width as usize),
+            Style::default().fg(Color::DarkGray),
+        ))),
+        chunks[3],
+    );
+}
+
+/// `board · savras`, and how much is on it.
+fn draw_board_title(frame: &mut Frame, area: Rect, view: &BoardView) {
+    let mut said = format!(" · {}", view.name());
+    if view.exists {
+        said.push_str(&format!(
+            " · {} message{}",
+            view.messages.len(),
+            if view.messages.len() == 1 { "" } else { "s" }
+        ));
+    }
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -537,16 +627,18 @@ fn draw_board(frame: &mut Frame, area: Rect, app: &App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                truncate(
-                    &format!(" · {}", view.name()),
-                    (area.width as usize).saturating_sub(5),
-                ),
+                truncate(&said, (area.width as usize).saturating_sub(5)),
                 Style::default().fg(Color::DarkGray),
             ),
         ])),
-        chunks[0],
+        area,
     );
+}
 
+/// The conversation, oldest at the top and newest at the bottom, held at the
+/// bottom unless the cursor has gone above it — or, where there is nothing to
+/// show, a sentence saying why. `create` is how this screen makes a board.
+fn draw_messages(frame: &mut Frame, area: Rect, view: &BoardView, create: &str) {
     if !view.exists || view.messages.is_empty() {
         // A repository without a board is the common case, and a blank screen
         // would read as a board nobody has written on. Say which it is.
@@ -555,8 +647,8 @@ fn draw_board(frame: &mut Frame, area: Rect, app: &App) {
                           repository to show a board for."
                 .to_string(),
             (Some(_), false) => format!(
-                "{} has no board. Press c to create one, and the agents working \
-                 there can read it and post to it.",
+                "{} has no board. {create}, and the agents working there can read \
+                 it and post to it.",
                 view.name()
             ),
             (Some(_), true) => "Nothing on the board yet.".to_string(),
@@ -565,22 +657,54 @@ fn draw_board(frame: &mut Frame, area: Rect, app: &App) {
             Paragraph::new(said)
                 .style(Style::default().fg(Color::DarkGray))
                 .wrap(Wrap { trim: true }),
-            chunks[1],
+            area,
         );
-    } else {
-        let (lines, selected) = board_lines(view, chunks[1].width as usize);
-        let mut top = lines.len().saturating_sub(chunks[1].height as usize);
-        if let Some(start) = selected {
-            top = top.min(start);
-        }
-        frame.render_widget(
-            Paragraph::new(lines).scroll((top.min(u16::MAX as usize) as u16, 0)),
-            chunks[1],
-        );
+        return;
     }
+    let (lines, selected) = board_lines(view, area.width as usize);
+    let mut top = lines.len().saturating_sub(area.height as usize);
+    if let Some(start) = selected {
+        top = top.min(start);
+    }
+    frame.render_widget(
+        Paragraph::new(lines).scroll((top.min(u16::MAX as usize) as u16, 0)),
+        area,
+    );
+}
 
-    if let Some(compose) = &view.compose {
-        draw_compose(frame, chunks[2], view, compose);
+/// The line being written in a board tab — always there, since typing is how
+/// the tab is used — with what it will be: a new message, or an answer to the
+/// one picked. The cursor is the terminal's own, so it blinks where you type.
+fn draw_tab_compose(frame: &mut Frame, area: Rect, view: &BoardView, focused: bool) {
+    let width = area.width as usize;
+    let text = view.compose.as_ref().map_or("", |c| c.text.as_str());
+    let answering = match &view.compose {
+        Some(compose) => compose.re.as_ref(),
+        None => view.selected.and_then(|i| view.messages.get(i)),
+    };
+    let whither = match answering {
+        Some(m) => format!("to {} · answering {}", view.name(), m.from),
+        None => format!("to {} as {}", view.name(), board::OWNER),
+    };
+    let room = width.saturating_sub(3);
+    let chars: Vec<char> = text.chars().collect();
+    let shown: String = chars[chars.len().saturating_sub(room)..].iter().collect();
+    let shown_width = shown.chars().count() as u16;
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                truncate(&whither, width),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(vec![
+                Span::styled("› ", Style::default().fg(Color::Yellow)),
+                Span::raw(shown),
+            ]),
+        ]),
+        area,
+    );
+    if focused && area.height >= 2 && area.width > 2 {
+        frame.set_cursor_position((area.x + 2 + shown_width, area.y + 1));
     }
 }
 
@@ -818,6 +942,14 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
                 } else {
                     "↑↓ move · a agent · q quit"
                 },
+                area.width as usize,
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+        // A board row has verbs of its own, and none of a session's.
+        (None, Hint::Focused) if app.selected_board().is_some() => Span::styled(
+            truncate(
+                "enter open · c clean · d delete · x close",
                 area.width as usize,
             ),
             Style::default().fg(Color::DarkGray),
@@ -1679,6 +1811,67 @@ mod tests {
         assert!(text.contains("to tmp · answering ROADMAP"), "{text}");
         assert!(text.contains("› on it"), "{text}");
         assert!(text.contains("enter post · esc cancel"), "{text}");
+    }
+
+    #[test]
+    fn a_board_row_sits_under_its_repository_and_says_how_much_is_on_it() {
+        let (_f, dir) = a_board("ui-board-row", true);
+        let mut app = App::new(_f.0.clone());
+        app.board_dir = dir;
+        app.set_group_by(crate::app::GroupBy::Repo);
+        let lines = render_board(&mut app, 44, 24);
+
+        let heading = lines
+            .iter()
+            .position(|l| l.trim() == "tmp")
+            .unwrap_or_else(|| panic!("no heading for tmp: {lines:#?}"));
+        let row = &lines[heading + 1];
+        assert!(row.starts_with("≡ board"), "{lines:#?}");
+        assert!(row.ends_with('2'), "two messages, flush right: {row:?}");
+        assert!(row.chars().count() <= 44, "{row:?}");
+    }
+
+    /// A board as a tab, drawn alone into a terminal of its own.
+    fn render_tab(view: &BoardView, w: u16, h: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|frame| draw_board_tab(frame, frame.area(), view, true))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_board_tab_is_a_conversation_with_a_line_to_write_in_under_it() {
+        let (_f, dir) = a_board("ui-board-tab", true);
+        let repo = board::topic_of(std::path::Path::new("/tmp"));
+        let mut view = BoardView::new(dir.clone(), Some(repo));
+
+        let text = render_tab(&view, 70, 16).join("\n");
+        assert!(text.contains("board · tmp · 2 messages"), "{text}");
+        assert!(text.contains("ROADMAP ↳ SAVRAS-8"), "{text}");
+        assert!(text.contains("to tmp as owner"), "{text}");
+        assert!(text.contains("type to post"), "the keys are said: {text}");
+
+        // Picked, the line says who it answers, and the words are under it.
+        view.step(-1);
+        view.type_text("on it");
+        let text = render_tab(&view, 70, 16).join("\n");
+        assert!(text.contains("answering ROADMAP"), "{text}");
+        assert!(text.contains("› on it"), "{text}");
+
+        let none = BoardView::new(dir, Some("/nowhere/books".to_string()));
+        let text = render_tab(&none, 70, 16).join("\n");
+        assert!(text.contains("books has no board"), "{text}");
+        assert!(text.contains("enter creates a board for books"), "{text}");
     }
 
     #[test]

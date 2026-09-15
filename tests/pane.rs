@@ -282,12 +282,62 @@ fn ctrl_l_paints_the_screen_again_rather_than_waiting_for_an_answer() {
     );
 }
 
+#[test]
+fn a_board_opens_as_a_tab_and_what_is_typed_there_is_posted() {
+    // The unit tests have every piece; this is the loop they are wired into.
+    // A row that appears when the owner makes a board, enter putting the board
+    // in the working pane rather than a terminal, and the keys going to it
+    // rather than to the program underneath — `j` and `q` included, which the
+    // panel would otherwise take.
+    let mut pane = Pane::start_watching("board-tab", "cat", true);
+    pane.wait_for("OTHER");
+
+    // `--repo`, not the working directory: on macOS `/tmp` is a link, and the
+    // directory a process is started in comes back as `/private/tmp`, which is
+    // not the `/tmp` the session says it is in.
+    let made = pane.board(&["create", "--repo", "/tmp"]);
+    assert!(made.contains("created a board for tmp"), "{made}");
+    let row = pane.wait_for("\u{2261} board");
+    assert!(
+        row.contains("\u{2261} board"),
+        "the board never got a row under its repository; the panel drew:\n{row}"
+    );
+
+    pane.press_for(b"\x07", "enter open");
+    pane.press(b"g");
+    let on_row = pane.press_for(b"j", "c clean");
+    assert!(
+        on_row.contains("c clean"),
+        "the cursor never reached the board row; the panel drew:\n{on_row}"
+    );
+
+    let tab = pane.press_for(b"\r", "type to post");
+    assert!(
+        tab.contains("type to post"),
+        "enter on the board row should have opened it in the pane; it drew:\n{tab}"
+    );
+
+    pane.press_for(b"just a quick note", "just a quick note");
+    let sent = pane.press_for(b"\r", "posted to tmp");
+    assert!(sent.contains("posted to tmp"), "{sent}");
+
+    let read = pane.board(&["read", "--all-topics"]);
+    assert!(read.contains("owner: just a quick note"), "{read}");
+}
+
 /// A real `svr` hosting a command of the test's choosing, in a real pty.
 struct Pane {
     dir: PathBuf,
     rx: std::sync::mpsc::Receiver<Vec<u8>>,
     writer: Box<dyn std::io::Write + Send>,
     child: Box<dyn Child + Send + Sync>,
+    /// What a person looking at this terminal would see.
+    ///
+    /// The renderer sends only the cells that changed, so a phrase whose space
+    /// was already a space arrives as two words with a cursor move between
+    /// them — `c`, then `ESC[40;86H`, then `clean` — and is never in the byte
+    /// stream whole. Needles are looked for here as well, where it is.
+    screen: std::cell::RefCell<vt100::Parser>,
 }
 
 impl Pane {
@@ -322,6 +372,7 @@ impl Pane {
         // panel finds the second by looking next to the first.
         std::fs::create_dir_all(dir.join("jobs")).unwrap();
         std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        std::fs::create_dir_all(dir.join("home")).unwrap();
         if sessions {
             std::fs::create_dir_all(dir.join("jobs/aaaaaaaa")).unwrap();
             std::fs::write(
@@ -355,6 +406,11 @@ impl Pane {
         command.arg(dir.join("jobs"));
         command.args(["--", "sh", "-c", script]);
         command.env("SAVRAS_TEST_DIR", &dir);
+        // A home of its own. A panel starting up opens the boards in its config
+        // directory — and the first time, migrates them — so a test run under
+        // the developer's `HOME` was a test that could rewrite their boards.
+        command.env("HOME", dir.join("home"));
+        command.env_remove("XDG_CONFIG_HOME");
         command.env_remove("TMUX");
         // Savras refuses to run inside its own pane, and these tests are run
         // from one as often as not — the panel is where the work happens. The
@@ -383,6 +439,7 @@ impl Pane {
             rx,
             writer,
             child,
+            screen: std::cell::RefCell::new(vt100::Parser::new(ROWS, COLS, 0)),
         }
     }
 
@@ -405,6 +462,36 @@ impl Pane {
         self.wait_for(needle)
     }
 
+    /// Send keys and let the screen settle, for a key whose effect has nothing
+    /// new to say. The panel reads one key per read, so two keys written back
+    /// to back can arrive as one read and be taken for neither.
+    fn press(&mut self, keys: &[u8]) {
+        self.writer.write_all(keys).unwrap();
+        self.writer.flush().unwrap();
+        self.read_for(1);
+    }
+
+    /// `svr board …`, as the owner would run it in a terminal of their own —
+    /// no agent's marks in the environment — against this pane's boards.
+    fn board(&self, args: &[&str]) -> String {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_svr"))
+            .arg("board")
+            .args(args)
+            .current_dir(&self.dir)
+            .env("HOME", self.dir.join("home"))
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("CLAUDECODE")
+            .env_remove("CLAUDE_CODE_AGENT")
+            .env_remove("CLAUDE_JOB_DIR")
+            .output()
+            .unwrap();
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    }
+
     /// Keep reading for a while longer, for the tests that assert the panel
     /// does *not* draw something: absence needs a settled screen, not the
     /// first frame that happens to arrive.
@@ -413,10 +500,27 @@ impl Pane {
         let mut seen = String::new();
         while Instant::now() < deadline {
             if let Ok(chunk) = self.rx.recv_timeout(Duration::from_millis(250)) {
-                seen.push_str(&String::from_utf8_lossy(&chunk));
+                self.take(&chunk, &mut seen);
             }
         }
-        seen
+        self.said(seen)
+    }
+
+    /// A chunk of output: onto the screen, and onto what was received.
+    fn take(&self, chunk: &[u8], seen: &mut String) {
+        self.screen.borrow_mut().process(chunk);
+        seen.push_str(&String::from_utf8_lossy(chunk));
+    }
+
+    /// Whether the terminal is showing `needle` right now.
+    fn on_screen(&self, needle: &str) -> bool {
+        self.screen.borrow().screen().contents().contains(needle)
+    }
+
+    /// The screen as it stands, then the bytes that built it: the first is
+    /// what an assertion should read, and the second is what explains it.
+    fn said(&self, seen: String) -> String {
+        format!("{}\n{seen}", self.screen.borrow().screen().contents())
     }
 
     /// Read until the panel draws `needle`, or ten seconds pass.
@@ -429,16 +533,21 @@ impl Pane {
     fn wait_for(&self, needle: &str) -> String {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut seen = String::new();
-        while !seen.contains(needle) {
+        // A needle the screen was showing before anything arrived is not an
+        // answer: `new tab` sits in the footer all along, and would be found
+        // before the key meant to draw the question had done anything. Then
+        // only a fresh arrival counts.
+        let already = self.on_screen(needle);
+        while !(seen.contains(needle) || (!already && self.on_screen(needle))) {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
             }
             if let Ok(chunk) = self.rx.recv_timeout(left.min(Duration::from_millis(250))) {
-                seen.push_str(&String::from_utf8_lossy(&chunk));
+                self.take(&chunk, &mut seen);
             }
         }
-        seen
+        self.said(seen)
     }
 }
 
