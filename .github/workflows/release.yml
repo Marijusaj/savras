@@ -19,6 +19,11 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Anything that can push a tag to this repository could otherwise ship a
+    # formula to everyone who has installed savras — and agents push tags. The
+    # environment holds the tap key and waits for the owner to approve the run,
+    # so a tag proposes a release rather than being one.
+    environment: release
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
