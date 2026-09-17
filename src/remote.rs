@@ -126,6 +126,9 @@ fn stream(host: &str, tx: &mpsc::Sender<News>) -> std::io::Result<String> {
         .args(["-o", "ControlPath=~/.ssh/savras-%r@%h:%p"])
         .args(["-o", "ControlPersist=10m"])
         .args(["-o", "ServerAliveInterval=30"])
+        // `--` first: a machines file holding a name like `-oProxyCommand=…`
+        // would otherwise be read as an option and run a command locally.
+        .arg("--")
         .arg(host)
         .arg(script())
         .stdin(Stdio::null())
@@ -150,8 +153,20 @@ fn stream(host: &str, tx: &mpsc::Sender<News>) -> std::io::Result<String> {
 
     let out = child.stdout.take().expect("stdout was piped");
     let mut batch = Vec::new();
-    for line in BufReader::new(out).lines() {
-        let line = line?;
+    // One session's json, generously. Taken rather than read, because the far
+    // side is a machine we do not run: a host that answers with one endless
+    // line and no newline would otherwise grow this buffer until the panel is
+    // killed for it. Past the cap the line is truncated, so it fails to parse
+    // and is skipped like any other document we cannot read.
+    const MOST: u64 = 256 * 1024;
+    let mut out = BufReader::new(out);
+    loop {
+        let mut line = String::new();
+        let read = std::io::Read::take(&mut out, MOST).read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+        let line = line.trim_end().to_string();
         if line.trim() == TICK {
             let jobs = std::mem::take(&mut batch);
             if tx.send(News::Running(host.to_string(), jobs)).is_err() {

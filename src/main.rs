@@ -486,6 +486,11 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
 
 /// Plain-text snapshot: useful in scripts, status lines, and anywhere without
 /// a TTY.
+/// Model-written text, safe to hand to a terminal.
+fn plain(s: &str) -> String {
+    s.chars().filter(|c| !c.is_control()).collect()
+}
+
 fn print_once(jobs_dir: &std::path::Path) -> Result<()> {
     let snapshot = job::load(jobs_dir)?;
     if snapshot.is_empty() {
@@ -510,12 +515,16 @@ fn print_once(jobs_dir: &std::path::Path) -> Result<()> {
         for j in group {
             // The same age the panel shows: how long the session has been
             // open, not how recently it spoke. See `Job::created_at`.
+            // The name and the summary are written by a model, into a file
+            // this reads, and printed straight at a terminal. An escape
+            // sequence in either would be obeyed rather than shown — the TUI
+            // drops them already, and `--once` has to do it for itself.
             println!(
                 "  {:<12} {:<7} {:>4}  {}",
-                j.name,
+                plain(&j.name),
                 j.word(),
                 job::age(j.created_at.or(j.updated_at), now),
-                j.summary
+                plain(&j.summary)
             );
         }
     }
