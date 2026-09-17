@@ -294,6 +294,8 @@ pub fn start(name: &str, briefing: &str, cwd: &Path) -> Result<String> {
 pub fn stop_remote(host: &str, pid: u32) -> Result<String> {
     let out = Command::new("ssh")
         .args(["-o", "BatchMode=yes"])
+        // See `remote::watch`: a host name is not allowed to be an option.
+        .arg("--")
         .arg(host)
         .arg("kill")
         .arg(pid.to_string())

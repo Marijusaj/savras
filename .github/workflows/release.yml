@@ -4,6 +4,9 @@
 # Needs one secret, TAP_DEPLOY_KEY: the private half of an SSH deploy key that
 # has write access to Marijusaj/homebrew-tap and to nothing else. GITHUB_TOKEN
 # cannot push to another repository.
+#
+# This is the one job that can reach that key, so the third-party action it runs
+# is pinned to a commit rather than to a tag a repository can move under us.
 name: Release
 
 on:
@@ -16,8 +19,13 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
+    # Anything that can push a tag to this repository could otherwise ship a
+    # formula to everyone who has installed savras — and agents push tags. The
+    # environment holds the tap key and waits for the owner to approve the run,
+    # so a tag proposes a release rather than being one.
+    environment: release
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
 
       # A tag that disagrees with Cargo.toml would ship a formula whose test
       # fails: `svr --version` prints the crate version, not the tag.
@@ -55,7 +63,8 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$TAP_DEPLOY_KEY" > ~/.ssh/tap_key
           chmod 600 ~/.ssh/tap_key
-          ssh-keyscan github.com >> ~/.ssh/known_hosts
+          # github.com's published key, rather than whatever answers first.
+          echo "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl" >> ~/.ssh/known_hosts
           export GIT_SSH_COMMAND="ssh -i ~/.ssh/tap_key -o IdentitiesOnly=yes"
           git clone git@github.com:Marijusaj/homebrew-tap.git tap
           mkdir -p tap/Formula

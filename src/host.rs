@@ -1799,6 +1799,8 @@ pub fn remote_shell(host: &str, tmux: &str) -> Vec<String> {
         "ControlPath=~/.ssh/savras-%r@%h:%p".to_string(),
         "-o".to_string(),
         "ControlPersist=10m".to_string(),
+        // See `remote::watch`: a host name is not allowed to be an option.
+        "--".to_string(),
         host.to_string(),
         format!("tmux new-session -A -s {}", crate::sh::quote(tmux)),
     ]

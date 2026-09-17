@@ -167,6 +167,8 @@ impl Remote {
         ssh.push("ControlPath=~/.ssh/savras-%r@%h:%p".into());
         ssh.push("-o".into());
         ssh.push("ControlPersist=10m".into());
+        // See `remote::watch`: a host name is not allowed to be an option.
+        ssh.push("--".into());
         ssh.push(self.host.clone());
         ssh.push(match self.tmux.as_deref().and_then(split_target) {
             // `\;` and not `;`: the remote shell has to hand tmux a literal
