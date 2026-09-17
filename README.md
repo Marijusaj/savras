@@ -78,7 +78,17 @@ Savras does something rather than looking, and it is worth knowing about.
 
 ## Install
 
-Not packaged yet — that is milestone M3. For now:
+With Homebrew:
+
+```sh
+brew install marijusaj/tap/savras
+```
+
+`brew upgrade` installs each version into its own Cellar directory and moves the
+symlink, so a panel that is running keeps its binary. `claude` has to be on your
+PATH; tmux comes with the formula.
+
+From source:
 
 ```sh
 git clone https://github.com/Marijusaj/savras && cd savras
