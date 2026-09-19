@@ -919,6 +919,49 @@ impl App {
         }
     }
 
+    /// Where to land once this session is gone: the next session down in its
+    /// own repository, else the one above it there, else the nearest session
+    /// on the panel — below first, as a list closing up over a removed line.
+    ///
+    /// Asked before it goes, because afterwards there is no row to measure
+    /// from. Left to itself the cursor kept the old row *number*, which after
+    /// a delete is a different row, often in another repository — and the
+    /// tab in front fell back to whichever one was opened before it. Both are
+    /// orders you cannot see, so both looked random.
+    pub fn successor(&self, short: &str) -> Option<String> {
+        let sessions: Vec<(usize, &Job)> = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(at, row)| match row {
+                Row::Job(i) => Some((at, self.snapshot.jobs.get(*i)?)),
+                _ => None,
+            })
+            .collect();
+        let (here, gone) = sessions.iter().find(|(_, job)| job.short == short)?;
+        let repo = gone.repo();
+        let others = || sessions.iter().filter(|(_, job)| job.short != short);
+        let below = others()
+            .filter(|(at, job)| at > here && job.repo() == repo)
+            .map(|(_, job)| job)
+            .next();
+        let above = || {
+            others()
+                .filter(|(at, job)| at < here && job.repo() == repo)
+                .map(|(_, job)| job)
+                .next_back()
+        };
+        let nearest = || {
+            others()
+                .min_by_key(|(at, _)| (at.abs_diff(*here), *at < *here))
+                .map(|(_, job)| job)
+        };
+        below
+            .or_else(above)
+            .or_else(nearest)
+            .map(|job| job.short.clone())
+    }
+
     /// The session at the top of the list — Needs input before Working before
     /// Completed, so it is the one most likely to be why you opened Savras.
     pub fn first_job(&self) -> Option<&Job> {
@@ -1328,6 +1371,36 @@ mod tests {
             app.rows[..3],
             [Row::Shell(0), Row::Shell(1), Row::Shell(2)]
         ));
+    }
+
+    #[test]
+    fn a_deleted_session_is_replaced_by_its_neighbour_in_the_repository() {
+        // gamma: ASK · beta: RUN, FIN · alpha: OLD
+        let f = across_repos();
+        let mut app = App::new(f.0.clone());
+        app.set_group_by(GroupBy::Repo);
+
+        // The next one down in its repository, else the one above there.
+        assert_eq!(app.successor("aaa").as_deref(), Some("ccc"));
+        assert_eq!(app.successor("ccc").as_deref(), Some("aaa"));
+        // Alone in its repository: the nearest session on the panel, below
+        // before above when both are as near.
+        assert_eq!(app.successor("bbb").as_deref(), Some("aaa"));
+        assert_eq!(app.successor("ddd").as_deref(), Some("ccc"));
+        assert_eq!(app.successor("zzz"), None);
+
+        // Grouped by status the repository still decides first: RUN's
+        // neighbour is FIN, a group away, not ASK right above it.
+        app.set_group_by(GroupBy::Status);
+        assert_eq!(app.successor("aaa").as_deref(), Some("ccc"));
+    }
+
+    #[test]
+    fn the_last_session_has_nowhere_to_go() {
+        let f = Fixture::new("app-last")
+            .job("aaa", r#"{"state":"working","name":"ONLY","cwd":"/tmp"}"#);
+        let app = App::new(f.0.clone());
+        assert_eq!(app.successor("aaa"), None);
     }
 
     #[test]
