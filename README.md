@@ -4,6 +4,30 @@ A side panel that sees every Claude Code session you have running.
 
 Named for the god of divination, who sees all things as they are.
 
+![The savras panel: sessions grouped by status, then by repository](assets/savras.gif)
+
+## At a glance
+
+- **What it is:** a terminal UI (`svr`) that lists every Claude Code session on
+  the machine as `WAITING`, `WORKING`, `DONE` or `FAILED`, with its pull
+  request, context used and age. It hosts your working terminal beside the
+  list, with tabs.
+- **Install:** `brew install marijusaj/tap/savras`, or `cargo install savras`.
+  macOS and Linux. Needs `claude` on the PATH.
+- **Run:** `svr` (panel plus a working pane), `svr solo` (panel only),
+  `svr --once` (plain text, for scripts, status lines and agents).
+- **Reads:** `~/.claude/jobs/*/state.json`, the session transcripts, and
+  `~/.claude/gh-pr-status-cache.json`. It never writes under `~/.claude/`.
+- **Runs, only when you ask:** `claude attach`/`--resume` to open a session,
+  `claude --bg` to start a parallel agent (`a`), `claude stop` and `claude rm`
+  to delete one (`d d`), and `ssh` for machines listed with `--machine`.
+- **For agents:** `svr board post|read|unread` is a per-repository message
+  board between sessions; `svr --once` lists the sessions. The
+  [Claude Code plugin](#the-claude-code-plugin) teaches agents both.
+- **License:** MIT.
+
+The rest of this README explains each of these in detail.
+
 ```
 SAVRAS  ◦ live
 1 needs input · 2 working · 4 done
@@ -67,8 +91,8 @@ Claude Code already writes the state of every session to
 `~/.claude/jobs/<id>/state.json`. Savras watches that directory and renders it.
 
 Reading is all it does to the sessions it watches. It never writes to
-`~/.claude/`, never touches the network, and cannot disturb a session that is
-already running. If a Claude Code upgrade changes the format the panel degrades
+`~/.claude/`, touches the network only to ssh to machines you name, and cannot
+disturb a session that is already running. If a Claude Code upgrade changes the format the panel degrades
 rather than breaks — unparseable jobs are skipped, unknown fields ignored.
 
 One exception, and it is deliberate: [parallel agents](#parallel-agents) lets
