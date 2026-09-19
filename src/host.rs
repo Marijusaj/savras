@@ -648,6 +648,23 @@ fn process_name(pid: i32) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
+/// The directory a process is standing in, asked the way `process_name` asks:
+/// `/proc` where there is one, and otherwise `lsof`, which is what macOS has.
+/// It is asked once per ctrl-t, never per frame, so the fork is affordable.
+fn process_cwd(pid: i32) -> Option<PathBuf> {
+    if let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) {
+        return Some(cwd);
+    }
+    let out = Command::new("lsof")
+        .args(["-a", "-d", "cwd", "-Fn", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix('n'))
+        .map(PathBuf::from)
+}
+
 /// The sessions you have open, and which one is in front.
 ///
 /// The whole of "tabs" is that a hidden session is *not* stopped: it keeps its
@@ -1445,7 +1462,8 @@ fn event_loop(
                     Action::NewTab if !hosts.is_empty() => {
                         confirming = Some(Confirm::Where(hosts.clone()));
                     }
-                    Action::NewTab | Action::NewTabHere => match new_tab(&mut session, &app) {
+                    Action::NewTab | Action::NewTabHere => match new_tab(&mut session, &app, focus)
+                    {
                         Ok(()) => {
                             session.boards.hide();
                             focus = Focus::Work;
@@ -1724,9 +1742,20 @@ fn jog_new_panes(session: &mut Session) -> bool {
 /// and whatever followed `--` otherwise — in the directory Savras was started
 /// in. `Origin::Opened`, so leaving it closes the tab rather than Savras: only
 /// the shell you *arrived* in still takes the panel with it.
-fn new_tab(session: &mut Session, app: &App) -> Result<()> {
+fn new_tab(session: &mut Session, app: &App, focus: Focus) -> Result<()> {
     let (cols, rows) = session.work_size();
-    let cwd = new_tab_cwd(session.tabs.short(), app);
+    let front = session.tabs.front();
+    // A tab on another machine is a local ssh client, standing wherever
+    // Savras was: its directory says nothing about where you are.
+    let pane = || match front.remote {
+        Some(_) => None,
+        None => front
+            .work
+            .master
+            .process_group_leader()
+            .and_then(process_cwd),
+    };
+    let cwd = new_tab_cwd(session.tabs.short(), pane, focus, app);
     let command = session.command.clone();
     // Spawn before touching the tab list, so a failure changes nothing.
     let work = Work::spawn(&command, Some(&cwd), cols, rows, Origin::Opened)?;
@@ -1820,7 +1849,21 @@ pub fn remote_shell(host: &str, tmux: &str) -> Vec<String> {
 /// A session on another machine is skipped rather than used: its directory is
 /// on that machine, and a local shell cannot start there — see `Job::repo`
 /// for what asking costs.
-fn new_tab_cwd(front: Option<&str>, app: &App) -> PathBuf {
+///
+/// Between those, `pane`: the directory of whatever the pane has in the
+/// foreground. Knowing which session a pane holds rests on Claude Code's
+/// terminal title, and a machine where that title is switched off, or where
+/// `claude` is not a background job, knows none of them — so ctrl-t opened
+/// every tab where Savras was started, while the pane you were typing in stood
+/// in the repository all along. It goes before the cursor when you are in the
+/// pane and after it when you are in the panel, because that is where you are
+/// looking.
+fn new_tab_cwd(
+    front: Option<&str>,
+    pane: impl FnOnce() -> Option<PathBuf>,
+    focus: Focus,
+    app: &App,
+) -> PathBuf {
     let here = |job: Option<&crate::job::Job>| -> Option<PathBuf> {
         let job = job?;
         if job.machine_tag().is_some() {
@@ -1832,9 +1875,12 @@ fn new_tab_cwd(front: Option<&str>, app: &App) -> PathBuf {
 
     let front = front.and_then(|short| app.snapshot.jobs.iter().find(|job| job.short == short));
 
-    here(front)
-        .or_else(|| here(app.selected_job()))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    let pane = || pane().filter(|cwd| cwd.is_dir());
+    let found = here(front).or_else(|| match focus {
+        Focus::Work => pane().or_else(|| here(app.selected_job())),
+        Focus::Panel => here(app.selected_job()).or_else(pane),
+    });
+    found.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 /// Where one press of a switch key lands.
@@ -3558,12 +3604,26 @@ mod tests {
         let mut app = App::new(f.0.clone());
         app.refresh();
 
+        let none = || None;
         // The session in the pane wins: that is the one you are in.
-        assert_eq!(new_tab_cwd(Some("aaa"), &app), repo);
+        assert_eq!(new_tab_cwd(Some("aaa"), none, Focus::Work, &app), repo);
 
         // With no session in the pane, the row under the cursor answers.
         app.select("aaa");
-        assert_eq!(new_tab_cwd(None, &app), repo);
+        assert_eq!(new_tab_cwd(None, none, Focus::Work, &app), repo);
+
+        // A pane nobody could name still stands somewhere, and that beats the
+        // cursor while you are in it — and loses to it while you are in the
+        // panel, looking at a row.
+        let elsewhere = std::env::temp_dir();
+        let pane = || Some(elsewhere.clone());
+        assert_eq!(new_tab_cwd(None, pane, Focus::Work, &app), elsewhere);
+        assert_eq!(new_tab_cwd(None, pane, Focus::Panel, &app), repo);
+        // It never beats the session the pane is known to hold, nor names a
+        // directory that is gone.
+        assert_eq!(new_tab_cwd(Some("aaa"), pane, Focus::Work, &app), repo);
+        let gone = || Some(PathBuf::from("/nowhere/at/all"));
+        assert_eq!(new_tab_cwd(None, gone, Focus::Work, &app), repo);
 
         // A directory that is not on this machine is skipped rather than
         // used — a local shell cannot start there, and asking is expensive.
@@ -3581,11 +3641,33 @@ mod tests {
         app.set_remote("claude-box".to_string(), vec![far]);
         app.select("claude-box:42");
         assert_ne!(
-            new_tab_cwd(Some("claude-box:42"), &app),
+            new_tab_cwd(Some("claude-box:42"), || None, Focus::Work, &app),
             PathBuf::from("/home/ubuntu/Code/thing")
         );
 
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_process_says_where_it_is_standing() {
+        // A real process in a real directory, because the answer comes from
+        // `/proc` on one system and `lsof` on the other, and a fake of either
+        // would prove only the fake.
+        let dir = std::env::temp_dir().join(format!("savras-pcwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .current_dir(&dir)
+            .spawn()
+            .unwrap();
+        let cwd = process_cwd(child.id() as i32);
+        child.kill().ok();
+        child.wait().ok();
+        assert_eq!(
+            cwd.map(|p| p.canonicalize().unwrap()),
+            Some(dir.canonicalize().unwrap())
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
