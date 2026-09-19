@@ -1,0 +1,14 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "Savras",
+  "description": "A terminal side panel (svr) that sees every Claude Code session you have running, with a per-repository message board agents use to coordinate.",
+  "folders": [],
+  "excludeFolders": ["docs", "tests", "src", "packaging", "scripts", "target"],
+  "excludeFiles": [],
+  "rules": [
+    "Install with `brew install marijusaj/tap/savras` or `cargo install savras`; the binary is `svr`.",
+    "`svr --once` prints every Claude Code session as plain text and exits; use it from scripts and agents, never the interactive `svr`.",
+    "`svr board post \"<message>\"` and `svr board read` are how agents in the same repository talk; a board exists only where the owner ran `svr board create`, and agents must not create one.",
+    "Savras reads ~/.claude/jobs/*/state.json and never writes under ~/.claude/."
+  ]
+}
