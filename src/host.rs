@@ -1382,6 +1382,10 @@ fn event_loop(
                             app.error = Some(said);
                         }
                         if let Some(Confirm::Delete { short, name, on }) = &was_confirming {
+                            // Where you land is decided now, while the row is
+                            // still there to be next to. See `App::successor`.
+                            let next = app.successor(short);
+                            let was_front = session.tabs.short() == Some(short.as_str());
                             delete_session(
                                 &mut session,
                                 &mut app,
@@ -1390,6 +1394,20 @@ fn event_loop(
                                 name.clone(),
                                 on.clone(),
                             );
+                            // The session you were in is replaced by its
+                            // neighbour, opened as flipping would open it; one
+                            // you were only looking at from the panel moves
+                            // just the cursor. The keys stay in the panel,
+                            // where the next `d` or `esc` is pressed.
+                            match next {
+                                Some(next) if was_front => {
+                                    if let Err(e) = open_short(&mut session, &mut app, &next) {
+                                        app.error = Some(format!("could not open: {e}"));
+                                    }
+                                }
+                                Some(next) => app.select(&next),
+                                None => {}
+                            }
                         }
                     }
                     Action::Focus(next) => focus = next,
