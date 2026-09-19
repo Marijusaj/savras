@@ -539,6 +539,12 @@ struct Pane {
     /// process, so it is asked once per pid rather than once per frame — and
     /// the pid only changes when you start or leave a program.
     running: Option<(i32, String)>,
+    /// Where the foreground process was standing, the pid it was asked of,
+    /// and when. On macOS the asking is an `lsof`, about 10ms, so it is kept
+    /// until the program changes or a refresh has passed — a `cd` inside the
+    /// same shell changes nothing else a pane can see — and
+    /// [`Tabs::named_shells`] re-asks at most one pane per frame.
+    standing: Option<(i32, Instant, Option<PathBuf>)>,
     /// Whether Savras opened this pane *onto a session*, as opposed to it
     /// being a pane of your own that may turn out to have one running in it.
     /// Only the second kind is re-examined: the first cannot stop being what
@@ -587,6 +593,22 @@ impl Pane {
         Shell {
             name: name.unwrap_or_else(|| fallback.to_string()),
             detail: self.title(),
+            cwd: self.standing.as_ref().and_then(|(_, _, cwd)| cwd.clone()),
+        }
+    }
+
+    /// Whether where this pane is standing is worth asking again: never for a
+    /// tab on another machine, whose local process is an ssh client standing
+    /// wherever Savras was; otherwise when it has not been asked, the program
+    /// in front has changed, or a refresh has gone by.
+    fn stale(&self) -> Option<i32> {
+        if self.remote.is_some() {
+            return None;
+        }
+        let pid = self.work.master.process_group_leader()?;
+        match &self.standing {
+            Some((was, at, _)) if *was == pid && at.elapsed() < REFRESH => None,
+            _ => Some(pid),
         }
     }
 
@@ -714,6 +736,7 @@ impl Tabs {
                 work,
                 redraw: None,
                 running: None,
+                standing: None,
                 drew: false,
                 opened: false,
                 remote: None,
@@ -849,7 +872,22 @@ impl Tabs {
     /// just themselves. The number is the pane's place in the list rather than
     /// a count of collisions, so it does not shift when an unrelated pane
     /// opens or closes.
+    ///
+    /// Each also says where it is standing, which is what files it under a
+    /// repository. One pane is asked per call at most, the one gone longest
+    /// without: an `lsof` each for seven panes would be a frame lost, and a
+    /// pane that moved is on the right heading a frame or two later instead.
     fn named_shells(&mut self, fallback: &str) -> Vec<Shell> {
+        let oldest = self
+            .open
+            .iter_mut()
+            .filter(|t| t.short.is_none())
+            .filter_map(|t| Some((t.stale()?, t)))
+            .min_by_key(|(_, t)| t.standing.as_ref().map(|(_, at, _)| *at));
+        if let Some((pid, pane)) = oldest {
+            pane.standing = Some((pid, Instant::now(), process_cwd(pid)));
+        }
+
         let mut named: Vec<Shell> = Vec::new();
         for pane in self.open.iter_mut().filter(|t| t.short.is_none()) {
             let mut shell = pane.shell(fallback);
@@ -1674,6 +1712,7 @@ fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool>
         // at another width. Jog it into repainting at this one.
         redraw: Some(Instant::now() + REDRAW_AFTER),
         running: None,
+        standing: None,
         drew: false,
         opened: true,
         remote: None,
@@ -1765,6 +1804,7 @@ fn new_tab(session: &mut Session, app: &App, focus: Focus) -> Result<()> {
         work,
         redraw: Some(Instant::now() + REDRAW_AFTER),
         running: None,
+        standing: None,
         drew: false,
         opened: false,
         remote: None,
@@ -1808,6 +1848,7 @@ fn new_remote_tab(session: &mut Session, host: &str) -> Result<()> {
         work,
         redraw: Some(Instant::now() + REDRAW_AFTER),
         running: None,
+        standing: None,
         drew: false,
         opened: false,
         remote: Some((host.to_string(), name)),
@@ -1886,8 +1927,8 @@ fn new_tab_cwd(
 /// Where one press of a switch key lands.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Stop {
-    /// One of your own panes. They sit in front of the first session, in the
-    /// order you opened them, which is the order the panel lists them in.
+    /// One of your own panes, wherever the panel draws it: at the top, or
+    /// under the repository it is standing in.
     Shell(usize),
     Session(String),
     /// A repository's board, where its row is.
@@ -3080,6 +3121,7 @@ mod tests {
             work,
             redraw: None,
             running: None,
+            standing: None,
             drew: false,
             opened: true,
             remote: None,
@@ -3204,6 +3246,7 @@ mod tests {
                     format!("shell {}", i + 1)
                 },
                 detail: String::new(),
+                cwd: None,
             })
             .collect()
     }

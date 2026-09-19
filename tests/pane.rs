@@ -304,8 +304,9 @@ fn a_board_opens_as_a_tab_and_what_is_typed_there_is_posted() {
     );
 
     pane.press_for(b"\x07", "enter open");
-    pane.press(b"g");
-    let on_row = pane.press_for(b"j", "c clean");
+    // The board is the first row: the pane of your own is standing in its
+    // scratch directory, so it has gone under a heading of its own, last.
+    let on_row = pane.press_for(b"g", "c clean");
     assert!(
         on_row.contains("c clean"),
         "the cursor never reached the board row; the panel drew:\n{on_row}"

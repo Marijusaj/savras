@@ -524,7 +524,10 @@ fn named(cwd: &Path) -> String {
         .unwrap_or_else(|| cwd.to_string_lossy().to_string())
 }
 
-fn repo_of(cwd: &Path) -> String {
+/// The repository a directory on this machine is in, by name — what
+/// [`Job::repo`] calls a local session's repository, so a pane of your own
+/// standing in the same place lands under the same heading.
+pub fn repo_of(cwd: &Path) -> String {
     let root = match git_dir(cwd).as_deref().and_then(repo_root) {
         Some(root) => PathBuf::from(root),
         // Not in a repository at all: the directory is all there is to go on,
