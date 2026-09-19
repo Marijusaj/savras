@@ -3831,7 +3831,7 @@ mod tests {
         // process is signalled, and the row goes when it stops answering.
         let asking = Confirm::Delete {
             short: "claude-box:915226".into(),
-            name: "autodad-f9".into(),
+            name: "webapp-f9".into(),
             on: Some(("claude-box".into(), 915226)),
         };
         let said = asking.question();
