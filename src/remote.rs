@@ -295,22 +295,22 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = r#"{"pid":33629,"sessionId":"19092e9b-844b-4839-adfc-ca6ea52ab51e",
-        "cwd":"/home/ubuntu/Code/autodad-assistant","startedAt":1788810611484,
-        "version":"2.1.263","kind":"interactive","tmux":"autodad:@2.%2",
-        "name":"autodad-assistant-9c","nameSource":"derived","status":"busy",
+        "cwd":"/home/ubuntu/Code/web-app","startedAt":1788810611484,
+        "version":"2.1.263","kind":"interactive","tmux":"webapp:@2.%2",
+        "name":"web-app-9c","nameSource":"derived","status":"busy",
         "updatedAt":1788812639121,"statusUpdatedAt":1788812639121}"#;
 
     #[test]
     fn a_remote_session_becomes_a_row() {
         let job = read_one("claude-box", SAMPLE).unwrap();
-        assert_eq!(job.name, "autodad-assistant-9c");
+        assert_eq!(job.name, "web-app-9c");
         assert_eq!(job.status, Status::Working);
         // Keyed by machine as well as pid: two boxes can hold the same number.
         assert_eq!(job.short, "claude-box:33629");
         assert_eq!(job.machine.as_ref().unwrap().host, "claude-box");
         assert_eq!(
             job.machine.as_ref().unwrap().tmux.as_deref(),
-            Some("autodad:@2.%2")
+            Some("webapp:@2.%2")
         );
     }
 
@@ -327,10 +327,10 @@ mod tests {
     #[test]
     fn a_session_from_a_machine_is_grouped_under_that_machine() {
         // The user has a checkout of the same repository on both machines, and
-        // two rows called `autodad-assistant` under one heading would say the
+        // two rows called `web-app` under one heading would say the
         // work was in one place when it is in two.
         let job = read_one("claude-box", SAMPLE).unwrap();
-        assert_eq!(job.repo(), "claude-box:autodad-assistant");
+        assert_eq!(job.repo(), "claude-box:web-app");
     }
 
     #[test]

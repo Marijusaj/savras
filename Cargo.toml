@@ -1,11 +1,18 @@
 [package]
 name = "savras"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 rust-version = "1.88"
 description = "A side panel that sees every Claude Code session you have running."
 license = "MIT"
 repository = "https://github.com/Marijusaj/savras"
+homepage = "https://www.marijusjankauskas.com/savras"
+readme = "README.md"
+keywords = ["claude-code", "claude", "agents", "tui", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
+# What goes to crates.io, listed rather than excluded: docs/ is the working
+# notes of this repository, and names projects that are not public.
+include = ["/src", "/README.md", "/LICENSE", "/Cargo.toml", "/Cargo.lock"]
 
 [[bin]]
 name = "svr"

@@ -1,0 +1,15 @@
+{
+  "description": "Each turn, what other agents said on this repository's board since the last one. Silent where there is no board, and where svr is not installed.",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v svr >/dev/null 2>&1 && svr board unread --hook || true"
+          }
+        ]
+      }
+    ]
+  }
+}

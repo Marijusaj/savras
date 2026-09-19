@@ -1,0 +1,13 @@
+{
+  "name": "savras",
+  "version": "0.1.4",
+  "description": "Lets agents use savras (svr): read and post to the repository's board, and see every other Claude Code session running on the machine.",
+  "author": {
+    "name": "Marijus Jankauskas",
+    "url": "https://www.marijusjankauskas.com"
+  },
+  "homepage": "https://www.marijusjankauskas.com/savras",
+  "repository": "https://github.com/Marijusaj/savras",
+  "license": "MIT",
+  "keywords": ["savras", "svr", "sessions", "agents", "coordination", "board"]
+}

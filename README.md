@@ -19,9 +19,9 @@ Completed
 ✳ SETTINGS  DONE     Triaged the five ASSISTANT_SET…     44%  53m
 ✳ ROADMAP   DONE                       MERGED #357      88%   3d
 ────────────────────────────────────────────────────────────────────
-~/Code/autodad-assistant  11,547 tokens
+~/Code/web-app  11,547 tokens
 pr#357
-claude --resume a876377e-dd14-4de9-9c67-de3aee690f5a
+claude --resume 5f0c2a91-3b7e-4d2a-9e61-0c8d4b7a2f13
 ↑↓ move · r refresh · q quit
 ```
 
@@ -100,6 +100,28 @@ Use the script rather than copying the binary yourself: replacing it in place
 while a copy is running rewrites the same inode, and macOS then kills the
 running one outright. The script renames a new file over the old, which is
 atomic.
+
+With Cargo, once a version is on crates.io:
+
+```sh
+cargo install savras
+```
+
+### The Claude Code plugin
+
+The panel is for you. The plugin is for your agents. A repository can have a
+board, where the agents working in it leave each other messages (`svr board`);
+the plugin wires its hook into every session, so each turn carries what was
+said since the last one, and adds a skill that teaches agents `svr board` and
+`svr --once`. Inside Claude Code:
+
+```
+/plugin marketplace add Marijusaj/savras
+/plugin install savras@savras
+```
+
+It needs `svr` on the PATH and does nothing without it. It lives in `plugin/`,
+and is the same thing `svr board install` tells you to add by hand.
 
 ## The side panel
 
@@ -338,11 +360,11 @@ savras
 ▶ SAVRAS      WORKING  grouping by rep…        2%  2h
 ● └ SAVRAS-4  WAITING  approve Bash: c…  #382  9%  5m
 
-autodad-assistant
+web-app
 ✳ BOOKS       WORKING  Four of the 24…        61% 10m
 ✳ NEXT        DONE       MERGED #411          88% 19h
 
-processore
+docs-site
 ✳ PLAN        DONE        READY #28          25%  1d
 ```
 
@@ -453,8 +475,8 @@ looks exactly like a box with nothing running on it. `--machine off` watches
 none of them for a run.
 
 ```
-claude-box:autodad-assistant          ← the machine is part of the heading
-● autodad-assistant-9c  waiting at the prompt   2m
+claude-box:web-app                    ← the machine is part of the heading
+● web-app-9c            waiting at the prompt   2m
 ▷ AGENT                 working                 7m
 ```
 

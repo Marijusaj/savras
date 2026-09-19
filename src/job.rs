@@ -1125,12 +1125,12 @@ mod tests {
         .remove(0);
         job.machine = Some(Remote {
             host: "claude-box".to_string(),
-            tmux: Some("autodad:@2.%2".to_string()),
+            tmux: Some("webapp:@2.%2".to_string()),
             pid: Some(4242),
         });
         assert_eq!(
             job.open_command_line(),
-            "ssh claude-box · tmux autodad:@2.%2"
+            "ssh claude-box · tmux webapp:@2.%2"
         );
     }
 
@@ -1141,7 +1141,7 @@ mod tests {
         // own json says which window.
         let remote = Remote {
             host: "claude-box".to_string(),
-            tmux: Some("autodad:@2.%2".to_string()),
+            tmux: Some("webapp:@2.%2".to_string()),
             pid: Some(4242),
         };
         let command = remote.open_command();
@@ -1156,7 +1156,7 @@ mod tests {
         // terminal, and a second client would force both to the smaller size.
         // Quoted only where quoting says something: an ordinary session name
         // is one word already, and the command is meant to be readable.
-        assert!(script.contains("new-session -t autodad"), "{script}");
+        assert!(script.contains("new-session -t webapp"), "{script}");
         assert!(script.contains("select-window -t @2"), "{script}");
         // And it takes itself away when the tab closes, so the panel does not
         // litter the machine with grouped sessions.

@@ -1,0 +1,18 @@
+{
+  "name": "savras",
+  "owner": {
+    "name": "Marijus Jankauskas",
+    "url": "https://www.marijusjankauskas.com/savras"
+  },
+  "metadata": {
+    "description": "Savras for Claude Code: the board hook, and a skill that teaches agents the svr commands."
+  },
+  "plugins": [
+    {
+      "name": "savras",
+      "source": "./plugin",
+      "description": "Lets agents use savras (svr): read and post to the repository's board, and see every other Claude Code session running on the machine.",
+      "category": "productivity"
+    }
+  ]
+}
