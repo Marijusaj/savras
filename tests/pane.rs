@@ -304,8 +304,9 @@ fn a_board_opens_as_a_tab_and_what_is_typed_there_is_posted() {
     );
 
     pane.press_for(b"\x07", "enter open");
-    pane.press(b"g");
-    let on_row = pane.press_for(b"j", "c clean");
+    // The board is the first row: the pane of your own is standing in its
+    // scratch directory, so it has gone under a heading of its own, last.
+    let on_row = pane.press_for(b"g", "c clean");
     assert!(
         on_row.contains("c clean"),
         "the cursor never reached the board row; the panel drew:\n{on_row}"
@@ -460,15 +461,6 @@ impl Pane {
         self.writer.write_all(keys).unwrap();
         self.writer.flush().unwrap();
         self.wait_for(needle)
-    }
-
-    /// Send keys and let the screen settle, for a key whose effect has nothing
-    /// new to say. The panel reads one key per read, so two keys written back
-    /// to back can arrive as one read and be taken for neither.
-    fn press(&mut self, keys: &[u8]) {
-        self.writer.write_all(keys).unwrap();
-        self.writer.flush().unwrap();
-        self.read_for(1);
     }
 
     /// `svr board …`, as the owner would run it in a terminal of their own —

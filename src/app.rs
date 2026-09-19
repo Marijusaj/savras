@@ -22,9 +22,9 @@ pub enum Row {
     Repo(usize),
     Job(usize),
     /// A pane of your own — the shell Savras started with, and any you have
-    /// added since. They sit at the head of the list because that is where
-    /// flipping already put them, and a stop you cannot see is a stop you
-    /// cannot use.
+    /// added since. They sit at the head of the list, or grouped by repository
+    /// at the head of the repository they are standing in — flipping walks the
+    /// rows, so it meets them wherever they are drawn.
     Shell(usize),
     /// A repository's board, first under its heading, indexing
     /// [`App::board_rows`]. Only when the repository has one, and only when
@@ -44,6 +44,11 @@ pub enum Row {
 pub struct Shell {
     pub name: String,
     pub detail: String,
+    /// Where the program in the pane is standing, on this machine, once that
+    /// has been asked. It is what puts the pane under a repository's heading;
+    /// a pane on another machine, or one not asked yet, has none and sits at
+    /// the top.
+    pub cwd: Option<PathBuf>,
 }
 
 /// What the panel groups its rows by.
@@ -422,10 +427,16 @@ impl App {
     /// The standalone panel has no working pane, so it never calls this and
     /// every session stays [`Tab::None`].
     pub fn set_tabs(&mut self, front: Front, open: Vec<String>, shells: Vec<Shell>) {
-        let was = self.shells.len();
         self.front = Some(front);
         self.tabs = open;
-        let changed = was != shells.len();
+        // A pane that moved to another directory may have moved repository,
+        // so where each one stands is part of the shape — not only how many.
+        let changed = self.shells.len() != shells.len()
+            || self
+                .shells
+                .iter()
+                .zip(&shells)
+                .any(|(was, is)| was.cwd != is.cwd);
         self.shells = shells;
         if changed {
             // The rows changed shape, and the cursor has to survive it.
@@ -689,9 +700,13 @@ impl App {
         self.nested.clear();
         self.board_rows.clear();
         // Your own panes first, unheaded: one shell needs no group and several
-        // read as a list on their own.
+        // read as a list on their own. Grouped by repository, a pane that says
+        // where it is standing goes under that repository instead, beside the
+        // sessions working there — see `rows_by_repo`.
         for i in 0..self.shells.len() {
-            self.rows.push(Row::Shell(i));
+            if self.group_by == GroupBy::Status || self.shell_repo(i).is_none() {
+                self.rows.push(Row::Shell(i));
+            }
         }
         match self.group_by {
             GroupBy::Status => self.rows_by_status(),
@@ -745,7 +760,10 @@ impl App {
                 .filter(|(_, j)| j.repo() == repo)
                 .map(|(i, _)| i)
                 .collect();
-            if group.is_empty() {
+            let shells: Vec<usize> = (0..self.shells.len())
+                .filter(|&i| self.shell_repo(i).as_deref() == Some(repo.as_str()))
+                .collect();
+            if group.is_empty() && shells.is_empty() {
                 continue;
             }
             if !self.rows.is_empty() {
@@ -754,10 +772,13 @@ impl App {
             self.rows.push(Row::Repo(g));
             // The repository's board, first under its heading — where it is
             // found before the sessions talking on it.
-            if let Some(board) = self.board_for(&group) {
+            if let Some(board) = self.board_for(&group, &shells) {
                 self.rows.push(Row::Board(self.board_rows.len()));
                 self.board_rows.push(board);
             }
+            // Your own panes standing here, ahead of the sessions — as they are
+            // ahead of everything when they sit at the top of the list.
+            self.rows.extend(shells.into_iter().map(Row::Shell));
             // A lead, then its own agents under it. Recorded here rather than
             // asked again while drawing: it is the same derivation, and two of
             // them is how the row and the indent come to disagree.
@@ -778,13 +799,13 @@ impl App {
     /// directory — rows are rebuilt on every refresh, and that answer changes
     /// only when a repository is made or moved. Whether the board exists, and
     /// how much is on it, is asked every time: that is what changes.
-    fn board_for(&mut self, group: &[usize]) -> Option<BoardRow> {
+    fn board_for(&mut self, group: &[usize], shells: &[usize]) -> Option<BoardRow> {
         let cwd = group
             .iter()
             .map(|&i| &self.snapshot.jobs[i])
-            .find(|job| job.machine.is_none())?
-            .cwd
-            .clone();
+            .find(|job| job.machine.is_none())
+            .map(|job| job.cwd.clone())
+            .or_else(|| shells.iter().find_map(|&i| self.shells[i].cwd.clone()))?;
         let repo = self
             .topics
             .entry(cwd)
@@ -798,17 +819,36 @@ impl App {
         })
     }
 
+    /// The repository the nth pane of your own is standing in, if it has said
+    /// where it is standing.
+    ///
+    /// Worked out on every rebuild rather than kept: it is a walk up a local
+    /// path for `.git`, which costs microseconds, and rows are rebuilt on a
+    /// refresh or when a pane moves — never once per frame.
+    fn shell_repo(&self, i: usize) -> Option<String> {
+        self.shells.get(i)?.cwd.as_deref().map(job::repo_of)
+    }
+
     /// The repositories in play, most-waiting first and then by name.
+    ///
+    /// A repository holding nothing but panes of your own sorts with the
+    /// finished ones: nothing in it is asking for you.
     fn repos_in_order(&self) -> Vec<String> {
         let mut repos: Vec<(Status, String)> = Vec::new();
-        for job in &self.snapshot.jobs {
-            let repo = job.repo();
+        let sessions = self
+            .snapshot
+            .jobs
+            .iter()
+            .map(|job| (job.status, job.repo()));
+        let shells =
+            (0..self.shells.len()).filter_map(|i| Some((Status::Done, self.shell_repo(i)?)));
+        for (status, repo) in sessions.chain(shells) {
             match repos.iter_mut().find(|(_, name)| name == &repo) {
                 // The most demanding status in the repository is what it sorts
                 // by: one session asking is enough to bring its repository up.
-                Some((best, _)) if job.status < *best => *best = job.status,
+                Some((best, _)) if status < *best => *best = status,
                 Some(_) => {}
-                None => repos.push((job.status, repo)),
+                None => repos.push((status, repo)),
             }
         }
         repos.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -1010,7 +1050,7 @@ mod tests {
                 } else {
                     format!("shell {}", i + 1)
                 },
-                detail: String::new(),
+                ..Default::default()
             })
             .collect()
     }
@@ -1243,6 +1283,51 @@ mod tests {
             ["ASK", "RUN", "FIN", "OLD"],
             "sessions are ordered within their repository, not shuffled"
         );
+    }
+
+    #[test]
+    fn a_pane_of_your_own_sits_under_the_repository_it_is_standing_in() {
+        // Three panes: one in `beta`, where sessions already are; one in
+        // `delta`, where none are; and one that has not said where it stands.
+        let f = across_repos();
+        let mut app = App::new(f.0.clone());
+        let at = |dir: &str| Some(PathBuf::from(format!("/tmp/savras-test-repos/{dir}")));
+        let mut panes = shells(3);
+        panes[0].cwd = at("beta");
+        panes[1].cwd = at("delta");
+        app.set_tabs(Front::Shell(0), Vec::new(), panes.clone());
+        app.set_group_by(GroupBy::Repo);
+
+        // Only the one that said nothing is left at the top, unheaded.
+        assert!(matches!(app.rows[0], Row::Shell(2)));
+        // `delta` has a heading for a pane alone, and sinks with the finished:
+        // nothing there is asking for you.
+        assert_eq!(app.groups, ["gamma", "beta", "alpha", "delta"]);
+        fn under(app: &App, shell: usize) -> Option<String> {
+            let at = app
+                .rows
+                .iter()
+                .position(|r| matches!(r, Row::Shell(i) if *i == shell));
+            app.rows[..at?].iter().rev().find_map(|r| match r {
+                Row::Repo(g) => Some(app.groups[*g].clone()),
+                _ => None,
+            })
+        }
+        assert_eq!(under(&app, 0).as_deref(), Some("beta"));
+        assert_eq!(under(&app, 1).as_deref(), Some("delta"));
+
+        // A pane that walks into another repository follows on the next draw.
+        panes[1].cwd = at("gamma");
+        app.set_tabs(Front::Shell(0), Vec::new(), panes);
+        assert_eq!(under(&app, 1).as_deref(), Some("gamma"));
+        assert_eq!(app.groups, ["gamma", "beta", "alpha"]);
+
+        // Grouped by status there are no repositories to be under.
+        app.set_group_by(GroupBy::Status);
+        assert!(matches!(
+            app.rows[..3],
+            [Row::Shell(0), Row::Shell(1), Row::Shell(2)]
+        ));
     }
 
     #[test]

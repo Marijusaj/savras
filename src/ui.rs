@@ -1138,7 +1138,7 @@ mod tests {
             vec!["aaa".into(), "bbb".into()],
             vec![Shell {
                 name: "shell".to_string(),
-                detail: String::new(),
+                ..Default::default()
             }],
         );
         let mut terminal = Terminal::new(TestBackend::new(44, 24)).unwrap();
@@ -1169,7 +1169,7 @@ mod tests {
             vec!["aaa".into(), "bbb".into()],
             vec![Shell {
                 name: "shell".to_string(),
-                detail: String::new(),
+                ..Default::default()
             }],
         );
         let mut terminal = Terminal::new(TestBackend::new(60, 24)).unwrap();
