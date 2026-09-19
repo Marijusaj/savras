@@ -463,15 +463,6 @@ impl Pane {
         self.wait_for(needle)
     }
 
-    /// Send keys and let the screen settle, for a key whose effect has nothing
-    /// new to say. The panel reads one key per read, so two keys written back
-    /// to back can arrive as one read and be taken for neither.
-    fn press(&mut self, keys: &[u8]) {
-        self.writer.write_all(keys).unwrap();
-        self.writer.flush().unwrap();
-        self.read_for(1);
-    }
-
     /// `svr board …`, as the owner would run it in a terminal of their own —
     /// no agent's marks in the environment — against this pane's boards.
     fn board(&self, args: &[&str]) -> String {
