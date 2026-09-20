@@ -1,3 +1,5 @@
+<img src="assets/logo.png" alt="" align="right" width="112" height="112">
+
 # Savras
 
 A side panel that sees every Claude Code session you have running.
