@@ -6,7 +6,7 @@ A side panel that sees every Claude Code session you have running.
 
 Named for the god of divination, who sees all things as they are.
 
-![The panel down the right of the terminal, a shell beside it, and the list regrouping from repository to status](assets/savras.gif)
+![Typing svr: the panel opens down the right with a shell beside it, sessions appear as they start, and the list regroups from repository to status](assets/savras.gif)
 
 ## At a glance
 
