@@ -6,7 +6,7 @@ A side panel that sees every Claude Code session you have running.
 
 Named for the god of divination, who sees all things as they are.
 
-![The savras panel: sessions grouped by status, then by repository](assets/savras.gif)
+![The panel down the right of the terminal, a shell beside it, and the list regrouping from repository to status](assets/savras.gif)
 
 ## At a glance
 
