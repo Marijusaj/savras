@@ -2996,9 +2996,10 @@ mod tests {
         assert!(posted.re.is_none(), "nothing was picked: a new message");
         assert_eq!(app.error.as_deref(), Some("posted to savras"));
 
-        // ↑ picks a message, and what is written then answers it.
-        board_tab_key(b"\x1b[A", &mut tabs, &mut app);
-        board_tab_key(b"\x1b[A", &mut tabs, &mut app);
+        // ↓ picks a message — the newest, then on down to the oldest — and
+        // what is written then answers it.
+        board_tab_key(b"\x1b[B", &mut tabs, &mut app);
+        board_tab_key(b"\x1b[B", &mut tabs, &mut app);
         board_tab_key(b"on it", &mut tabs, &mut app);
         board_tab_key(b"\r", &mut tabs, &mut app);
         let first = boards.read(&here, 10)[0].id.clone();
@@ -3006,7 +3007,7 @@ mod tests {
         assert_eq!(answer.re.as_deref(), Some(first.as_str()));
 
         // Esc lets go of the words first, then of the message.
-        board_tab_key(b"\x1b[A", &mut tabs, &mut app);
+        board_tab_key(b"\x1b[B", &mut tabs, &mut app);
         board_tab_key(b"never mind", &mut tabs, &mut app);
         board_tab_key(b"\x1b", &mut tabs, &mut app);
         assert!(tabs.front().unwrap().compose.is_none());

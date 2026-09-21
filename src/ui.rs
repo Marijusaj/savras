@@ -552,45 +552,46 @@ fn age_color(job: &Job) -> Color {
 /// The board, in place of the rows: what the agents said to each other, and
 /// what you are saying back.
 ///
-/// Oldest at the top and newest at the bottom, the way a conversation reads,
-/// with the view held at the bottom unless the cursor has gone above it.
+/// Newest at the top, under the line a message is written in, so what
+/// arrives is the first thing read and the oldest is what falls off the end.
 fn draw_board(frame: &mut Frame, area: Rect, app: &App) {
     let Some(view) = app.board.as_ref() else {
         return;
     };
     let chunks = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Min(1),
         Constraint::Length(if view.compose.is_some() { 2 } else { 0 }),
+        Constraint::Min(1),
     ])
     .split(area);
 
     draw_board_title(frame, chunks[0], view);
-    draw_messages(frame, chunks[1], view, "Press c to create one");
     if let Some(compose) = &view.compose {
-        draw_compose(frame, chunks[2], view, compose);
+        draw_compose(frame, chunks[1], view, compose);
     }
+    draw_messages(frame, chunks[2], view, "Press c to create one");
 }
 
 /// A repository's board as a tab in the working pane.
 ///
-/// The conversation fills the pane, the line being written sits under it with
-/// the terminal's own cursor in it, and the last line says what the keys do —
-/// because this is the one tab where typing is not typing into a program.
+/// The line being written sits at the top with the terminal's own cursor in
+/// it, the conversation fills the pane under it newest first, and the last
+/// line says what the keys do — because this is the one tab where typing is
+/// not typing into a program.
 pub fn draw_board_tab(frame: &mut Frame, area: Rect, view: &BoardView, focused: bool) {
     let chunks = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Min(1),
         Constraint::Length(if view.exists { 2 } else { 0 }),
+        Constraint::Min(1),
         Constraint::Length(1),
     ])
     .split(area);
 
     draw_board_title(frame, chunks[0], view);
-    draw_messages(frame, chunks[1], view, "Press enter to create one");
     if view.exists {
-        draw_tab_compose(frame, chunks[2], view, focused);
+        draw_tab_compose(frame, chunks[1], view, focused);
     }
+    draw_messages(frame, chunks[2], view, "Press enter to create one");
     let hint = match (&view.repo, view.exists) {
         (Some(_), true) => {
             "type to post · ↑↓ pick a message to answer · enter send · esc clear · ctrl-g panel"
@@ -635,8 +636,8 @@ fn draw_board_title(frame: &mut Frame, area: Rect, view: &BoardView) {
     );
 }
 
-/// The conversation, oldest at the top and newest at the bottom, held at the
-/// bottom unless the cursor has gone above it — or, where there is nothing to
+/// The conversation, newest at the top and held there unless the cursor has
+/// gone below what fits — or, where there is nothing to
 /// show, a sentence saying why. `create` is how this screen makes a board.
 fn draw_messages(frame: &mut Frame, area: Rect, view: &BoardView, create: &str) {
     if !view.exists || view.messages.is_empty() {
@@ -662,10 +663,11 @@ fn draw_messages(frame: &mut Frame, area: Rect, view: &BoardView, create: &str) 
         return;
     }
     let (lines, selected) = board_lines(view, area.width as usize);
-    let mut top = lines.len().saturating_sub(area.height as usize);
-    if let Some(start) = selected {
-        top = top.min(start);
-    }
+    // Scrolled only as far as it takes to show all of the picked message —
+    // or its start, when it is longer than the screen.
+    let top = selected.map_or(0, |(start, end)| {
+        end.saturating_sub(area.height as usize).min(start)
+    });
     frame.render_widget(
         Paragraph::new(lines).scroll((top.min(u16::MAX as usize) as u16, 0)),
         area,
@@ -708,22 +710,21 @@ fn draw_tab_compose(frame: &mut Frame, area: Rect, view: &BoardView, focused: bo
     }
 }
 
-/// Every message as the lines it takes at this width, and the line the
-/// selected one starts on.
+/// Every message as the lines it takes at this width, and the lines the
+/// selected one spans, end exclusive.
 ///
 /// An answer is marked with who it answers rather than moved under its
 /// question: the list keeps the order things were said in, and a thread
 /// rebuilt out of order hides that the answer came an hour later.
-fn board_lines(view: &BoardView, width: usize) -> (Vec<Line<'static>>, Option<usize>) {
+fn board_lines(view: &BoardView, width: usize) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+    let today = chrono::Local::now().date_naive();
     let mut lines = Vec::new();
     let mut selected = None;
     for (i, m) in view.messages.iter().enumerate() {
         let start = lines.len();
         let mut head = vec![
             Span::styled(
-                m.at.with_timezone(&chrono::Local)
-                    .format("%H:%M ")
-                    .to_string(),
+                format!("{} ", when(m.at, today)),
                 Style::default().fg(Color::DarkGray),
             ),
             // The owner in the colour Savras wears, so what you said stands
@@ -761,10 +762,26 @@ fn board_lines(view: &BoardView, width: usize) -> (Vec<Line<'static>>, Option<us
             for line in &mut lines[start..] {
                 *line = std::mem::take(line).style(Style::default().bg(Color::Indexed(236)));
             }
-            selected = Some(start);
+            selected = Some((start, lines.len()));
         }
     }
     (lines, selected)
+}
+
+/// When a message was said, in this machine's time: the time alone for
+/// today, the day as well for anything older, and the year once it is not
+/// this one. A bare time on a board that runs for days reads as today.
+fn when(at: chrono::DateTime<chrono::Utc>, today: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    let local = at.with_timezone(&chrono::Local);
+    let format = if local.date_naive() == today {
+        "%H:%M"
+    } else if local.year() == today.year() {
+        "%b %-d %H:%M"
+    } else {
+        "%Y-%m-%d %H:%M"
+    };
+    local.format(format).to_string()
 }
 
 /// The message being written: where it is going, then the end of the words,
@@ -1862,7 +1879,7 @@ mod tests {
         assert!(text.contains("type to post"), "the keys are said: {text}");
 
         // Picked, the line says who it answers, and the words are under it.
-        view.step(-1);
+        view.step(1);
         view.type_text("on it");
         let text = render_tab(&view, 70, 16).join("\n");
         assert!(text.contains("answering ROADMAP"), "{text}");
@@ -1872,6 +1889,23 @@ mod tests {
         let text = render_tab(&none, 70, 16).join("\n");
         assert!(text.contains("books has no board"), "{text}");
         assert!(text.contains("enter creates a board for books"), "{text}");
+    }
+
+    #[test]
+    fn a_message_from_another_day_says_which() {
+        let at: chrono::DateTime<chrono::Utc> = "2026-03-04T12:00:00Z".parse().unwrap();
+        let day = at.with_timezone(&chrono::Local).date_naive();
+        let time = at.with_timezone(&chrono::Local).format("%H:%M").to_string();
+        assert_eq!(when(at, day), time, "today is the time alone");
+        let later = day + chrono::Days::new(3);
+        assert!(when(at, later).starts_with("Mar "), "{}", when(at, later));
+        assert!(when(at, later).ends_with(&time));
+        let next_year = day + chrono::Days::new(400);
+        assert!(
+            when(at, next_year).starts_with("2026-03-0"),
+            "{}",
+            when(at, next_year)
+        );
     }
 
     #[test]

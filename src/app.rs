@@ -163,7 +163,8 @@ pub struct BoardView {
     /// Whether that repository has a board. Making one is the owner's call, so
     /// the screen for a repository without one says so and offers to.
     pub exists: bool,
-    /// Oldest first, in the order they were said.
+    /// Newest first, the way the screen shows them: what arrives lands at the
+    /// top, next to the line you write in.
     pub messages: Vec<Message>,
     /// The message the cursor is on, by index into `messages`.
     pub selected: Option<usize>,
@@ -197,16 +198,17 @@ impl BoardView {
     }
 
     /// Read the board again. A message you picked stays picked wherever the
-    /// list moved; nothing picked stays nothing — the bottom, where what
+    /// list moved; nothing picked stays nothing — the top, where what
     /// arrives is seen and where a new message is written.
     pub fn reload(&mut self) {
-        let (exists, messages) = match &self.repo {
+        let (exists, mut messages) = match &self.repo {
             Some(repo) => {
                 let boards = self.boards();
                 (boards.exists(repo), boards.read(repo, BOARD_WINDOW))
             }
             None => (false, Vec::new()),
         };
+        messages.reverse();
         self.selected = self
             .selected
             .and_then(|i| self.messages.get(i))
@@ -222,26 +224,26 @@ impl BoardView {
             .map_or_else(|| "no repository".to_string(), board::topic_name)
     }
 
-    /// Move the cursor one message up (`delta < 0`) or down. Up from nothing
-    /// picks the newest; down past the newest lets go again, which is back to
-    /// writing a new message rather than an answer. It stops at the top.
+    /// Move the cursor one message up (`delta < 0`) or down. Down from nothing
+    /// picks the newest; up past the newest lets go again, which is back to
+    /// writing a new message rather than an answer. It stops at the oldest.
     pub fn step(&mut self, delta: isize) {
         let last = self.messages.len().checked_sub(1);
         self.selected = match (self.selected, delta < 0) {
-            (None, true) => last,
-            (None, false) => None,
-            (Some(at), true) => Some(at.saturating_sub(1)),
-            (Some(at), false) if Some(at) == last => None,
-            (Some(at), false) => Some(at + 1),
+            (None, true) => None,
+            (None, false) => last.map(|_| 0),
+            (Some(0), true) => None,
+            (Some(at), true) => Some(at - 1),
+            (Some(at), false) => Some(at.saturating_add(1).min(last.unwrap_or(0))),
         };
     }
 
-    /// The oldest message, or back to the bottom with nothing picked.
+    /// Back to the top with nothing picked, or the oldest message.
     pub fn jump(&mut self, to_end: bool) {
         self.selected = if to_end {
-            None
+            self.messages.len().checked_sub(1)
         } else {
-            (!self.messages.is_empty()).then_some(0)
+            None
         };
     }
 
@@ -255,7 +257,7 @@ impl BoardView {
         let picked = self
             .selected
             .and_then(|i| self.messages.get(i))
-            .or(self.messages.last());
+            .or(self.messages.first());
         let re = match (reply, picked) {
             (false, _) => None,
             (true, Some(m)) => Some(m.clone()),
@@ -1576,16 +1578,16 @@ mod tests {
         assert_eq!(app.error.as_deref(), Some("posted to savras"));
         let view = app.board.as_ref().unwrap();
         assert_eq!(
-            view.messages.last().unwrap().id,
+            view.messages.first().unwrap().id,
             posted.id,
-            "and it is on screen"
+            "and it is on screen, at the top"
         );
-        assert_eq!(view.selected, None, "back at the bottom");
+        assert_eq!(view.selected, None, "back at the top");
 
         // An answer carries what it answers, on the same board.
         let first = boards.read(&here, 10)[0].id.clone();
         let view = app.board.as_mut().unwrap();
-        view.jump(false);
+        view.jump(true);
         view.compose(true);
         view.type_text("on it");
         app.send_board();
@@ -1630,7 +1632,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_arriving_while_you_read_is_shown_and_followed_from_the_bottom() {
+    fn a_message_arriving_while_you_read_is_shown_at_the_top() {
         let (f, dir, here) = with_a_board("board-arrive", true);
         let boards = Boards::at(dir.clone());
         let mut app = App::new(f.0.clone());
@@ -1640,14 +1642,18 @@ mod tests {
         boards.post("ROADMAP", &here, None, "green now").unwrap();
         app.refresh();
         let view = app.board.as_ref().unwrap();
-        assert_eq!(view.messages.last().unwrap().text, "green now");
-        assert_eq!(view.selected, None, "still at the bottom, where it arrived");
+        assert_eq!(view.messages.first().unwrap().text, "green now");
+        assert_eq!(view.selected, None, "still at the top, where it arrived");
 
-        // Scrolled back to read something, the cursor stays where you put it.
-        app.board.as_mut().unwrap().jump(false);
+        // Scrolled down to read something, the cursor stays on that message
+        // while a new one pushes it along.
+        let view = app.board.as_mut().unwrap();
+        view.jump(true);
+        let picked = view.messages.last().unwrap().id.clone();
         boards.post("ROADMAP", &here, None, "and again").unwrap();
         app.refresh();
-        assert_eq!(app.board.as_ref().unwrap().selected, Some(0));
+        let view = app.board.as_ref().unwrap();
+        assert_eq!(view.messages[view.selected.unwrap()].id, picked);
     }
 
     #[test]
@@ -1780,21 +1786,22 @@ mod tests {
         let mut view = BoardView::new(dir, Some(here));
 
         assert_eq!(view.selected, None);
+        view.step(-1);
+        assert_eq!(view.selected, None, "nothing above the top");
         view.step(1);
-        assert_eq!(view.selected, None, "nothing below the bottom");
-        view.step(-1);
-        assert_eq!(view.selected, Some(1), "up from the bottom is the newest");
-        view.step(-1);
-        view.step(-1);
-        assert_eq!(view.selected, Some(0), "and it stops at the top");
+        assert_eq!(view.selected, Some(0), "down from the top is the newest");
+        assert_eq!(view.messages[0].text, "second");
         view.step(1);
         view.step(1);
-        assert_eq!(view.selected, None, "down past the newest lets go");
+        assert_eq!(view.selected, Some(1), "and it stops at the oldest");
+        view.step(-1);
+        view.step(-1);
+        assert_eq!(view.selected, None, "up past the newest lets go");
 
         view.type_text("new");
         assert!(view.compose.as_ref().unwrap().re.is_none());
         view.cancel();
-        view.step(-1);
+        view.step(1);
         view.type_text("on it");
         let answering = view.compose.as_ref().unwrap().re.as_ref().unwrap();
         assert_eq!(answering.text, "second");
