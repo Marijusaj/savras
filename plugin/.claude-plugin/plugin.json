@@ -1,6 +1,6 @@
 {
   "name": "savras",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Lets agents use savras (svr): read and post to the repository's board, and see every other Claude Code session running on the machine.",
   "author": {
     "name": "Marijus Jankauskas",

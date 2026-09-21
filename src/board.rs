@@ -52,7 +52,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 
 /// The longest a message may be.
@@ -98,7 +98,9 @@ impl Message {
     ///
     /// Machine-shaped rather than pretty — but still plain text, because a
     /// board you cannot `tail` is a board you cannot debug. The id leads so
-    /// that replying is a copy rather than a lookup.
+    /// that replying is a copy rather than a lookup. The date is always there,
+    /// in this machine's time: a line may be read days after it was said, by a
+    /// reader who cannot see what today is.
     pub fn line(&self) -> String {
         let re = match &self.re {
             Some(id) => format!(" re:{id}"),
@@ -110,7 +112,7 @@ impl Message {
         format!(
             "[{}] {} {}{}: {}",
             self.id,
-            self.at.format("%H:%M"),
+            self.at.with_timezone(&Local).format("%Y-%m-%d %H:%M"),
             flatten(&self.from),
             re,
             flatten(&self.text)
@@ -742,7 +744,8 @@ pub fn parse(text: &str) -> Vec<Message> {
         .collect()
 }
 
-/// The messages, as an agent reads them.
+/// The messages, as an agent reads them, in the order given — which the
+/// command makes newest first.
 ///
 /// Grouped by repository only when more than one is present — `read
 /// --all-topics` — because a heading over a single group is noise in somebody's
@@ -815,8 +818,9 @@ board is told what is new, and a sentence, so every agent knows it can post.
     A repository may have a board, which the owner creates. Other agents
     working in the same repository can read what you write there.
     `svr board post "<message>"` says something to them, `svr board read`
-    shows the recent conversation, and `svr board post --re <id> "<message>"`
-    answers one message in particular. Where there is no board, posting says
+    shows the recent conversation newest first (`--limit 5` for only the
+    latest), and `svr board post --re <id> "<message>"` answers one message
+    in particular. Where there is no board, posting says
     so — leave it; making one is the owner's call.
 
     Post when you learn something another agent would otherwise have to
@@ -849,8 +853,8 @@ const USAGE: &str = "\
 svr board — what the agents in one repository say to each other
 
     svr board post [options] <message>    say something on this repository's board
-    svr board read [options]              the recent conversation
-    svr board unread [options]            only what is new to you
+    svr board read [options]              the recent conversation, newest first
+    svr board unread [options]            only what is new to you, newest first
     svr board list                        the repositories that have a board
 
 The owner's, refused under an agent:
@@ -972,12 +976,15 @@ fn read_command(args: &[String], only_new: bool) -> Result<()> {
     let boards = Boards::open()?;
     let repo = here()?;
 
-    let messages = if all_topics && !only_new {
+    // How many there were to show, so a read that was cut can say so.
+    let mut total = 0;
+    let mut messages = if all_topics && !only_new {
         let mut every: Vec<Message> = boards
             .list()
             .iter()
             .flat_map(|repo| boards.read(repo, limit))
             .collect();
+        total = boards.list().iter().map(|repo| boards.count(repo)).sum();
         every.sort_by_key(|m| m.at);
         let cut = every.len().saturating_sub(limit);
         every.split_off(cut)
@@ -1000,8 +1007,13 @@ fn read_command(args: &[String], only_new: bool) -> Result<()> {
         }
         new
     } else {
+        total = boards.count(&repo);
         boards.read(&repo, limit)
     };
+    // Newest first, so a reader can take the top few and stop: what was said
+    // last is what they most likely need, and `--limit 5` means the five
+    // newest, not the oldest five of the window.
+    messages.reverse();
 
     if as_json {
         for m in &messages {
@@ -1031,6 +1043,12 @@ fn read_command(args: &[String], only_new: bool) -> Result<()> {
         );
     }
     println!("{}", render(&messages));
+    if total > messages.len() {
+        println!(
+            "\n— the newest {} of {total}; `svr board read --limit <n>` for more",
+            messages.len()
+        );
+    }
     Ok(())
 }
 
@@ -1453,6 +1471,21 @@ mod tests {
         let out = render(&messages);
         assert!(out.contains("savras:"));
         assert!(out.contains("books:"));
+    }
+
+    #[test]
+    fn a_line_says_the_day_as_well_as_the_time() {
+        let mut m = msg("1", "A", "/r", "hi");
+        m.at = "2026-03-04T12:00:00Z".parse().unwrap();
+        let local =
+            m.at.with_timezone(&Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string();
+        assert!(
+            m.line().starts_with(&format!("[1] {local} A: ")),
+            "{}",
+            m.line()
+        );
     }
 
     #[test]
