@@ -768,15 +768,14 @@ fn board_lines(view: &BoardView, width: usize) -> (Vec<Line<'static>>, Option<(u
     (lines, selected)
 }
 
-/// When a message was said, in this machine's time: the time alone for
-/// today, the day as well for anything older, and the year once it is not
-/// this one. A bare time on a board that runs for days reads as today.
+/// When a message was said, in this machine's time: always the day and the
+/// time, and the year once it is not this one. Today's messages carry their
+/// date too — a bare time at the top of the list reads as a date that is
+/// missing, not as today.
 fn when(at: chrono::DateTime<chrono::Utc>, today: chrono::NaiveDate) -> String {
     use chrono::Datelike;
     let local = at.with_timezone(&chrono::Local);
-    let format = if local.date_naive() == today {
-        "%H:%M"
-    } else if local.year() == today.year() {
+    let format = if local.year() == today.year() {
         "%b %-d %H:%M"
     } else {
         "%Y-%m-%d %H:%M"
@@ -1892,11 +1891,16 @@ mod tests {
     }
 
     #[test]
-    fn a_message_from_another_day_says_which() {
+    fn every_message_says_its_day() {
         let at: chrono::DateTime<chrono::Utc> = "2026-03-04T12:00:00Z".parse().unwrap();
         let day = at.with_timezone(&chrono::Local).date_naive();
         let time = at.with_timezone(&chrono::Local).format("%H:%M").to_string();
-        assert_eq!(when(at, day), time, "today is the time alone");
+        assert!(
+            when(at, day).starts_with("Mar "),
+            "today too: {}",
+            when(at, day)
+        );
+        assert!(when(at, day).ends_with(&time));
         let later = day + chrono::Days::new(3);
         assert!(when(at, later).starts_with("Mar "), "{}", when(at, later));
         assert!(when(at, later).ends_with(&time));
