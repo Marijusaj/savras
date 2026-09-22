@@ -410,7 +410,13 @@ so everything to the right of it still reads as a column down the list.
 
 A *family* is placed by the oldest session in it — its lead, usually, since its
 agents were started from it — and then by its lead's name, so an agent asking a
-question or finishing one never reshuffles the group under your cursor. A session with
+question or finishing one never reshuffles the group under your cursor.
+
+**Delete the lead and nobody is promoted.** `STAGING-2` was never `STAGING-3`'s
+parent: the indent is read out of the names, and nothing on disk says a session
+has one. So with `STAGING` gone its agents stay on the panel as ordinary rows,
+side by side and unindented, and the detail line says they were started
+alongside each other. Deleting a session deletes that session only. A session with
 no siblings is an ordinary row: the tail has to parse as a number, so `PR-357`
 leads nothing and `BOOKS-LEG3` is not an agent of `BOOKS`. Grouped by status
 there is no indent at all, since a lead and its agent can be under different
