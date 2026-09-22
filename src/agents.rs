@@ -23,7 +23,7 @@ use std::sync::mpsc;
 use anyhow::{Context, Result};
 
 use crate::app::App;
-use crate::job::{Job, Snapshot, Status};
+use crate::job::{Job, Snapshot};
 
 /// The lead a session name belongs to, and its number within that lead.
 ///
@@ -44,14 +44,39 @@ pub fn split(name: &str) -> (&str, Option<u32>) {
 pub struct Group<'a> {
     pub lead: &'a Job,
     pub agents: Vec<&'a Job>,
+    /// Whether `lead` really is the session the others were named after — the
+    /// bare name. When it is not, the group has lost its lead and what is
+    /// left are siblings.
+    pub led: bool,
 }
 
 impl Group<'_> {
     /// What the panel says about a session: its place in its own group.
+    ///
+    /// With the lead gone, nobody is promoted into its place: `STAGING-2` was
+    /// never `STAGING-3`'s parent, and saying so would invent a chain of
+    /// command out of a deleted row.
     pub fn describe(&self, job: &Job) -> String {
-        let names: Vec<&str> = self.agents.iter().map(|j| j.name.as_str()).collect();
+        let named = |others: Vec<&Job>| -> String {
+            others
+                .iter()
+                .map(|j| j.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if !self.led {
+            let (base, _) = split(&job.name);
+            let others = std::iter::once(self.lead)
+                .chain(self.agents.iter().copied())
+                .filter(|j| j.name != job.name)
+                .collect();
+            return format!(
+                "started alongside {} · no {base} to lead them",
+                named(others)
+            );
+        }
         if job.name == self.lead.name {
-            format!("leads {}", names.join(", "))
+            format!("leads {}", named(self.agents.clone()))
         } else {
             format!("parallel agent under {}", self.lead.name)
         }
@@ -95,10 +120,11 @@ pub fn lead_of<'a>(snapshot: &'a Snapshot, job: &'a Job) -> &'a Job {
 /// threshold is also what stops the panel inventing a hierarchy out of a
 /// hyphen — a lone `PR-357` is nobody's parallel agent.
 ///
-/// The lead does not have to be the bare name, and does not have to still be
-/// running: `SAVRAS-2` and `SAVRAS-3` with no `SAVRAS` anywhere are a group
-/// led by `SAVRAS-2`. A group that dissolved because one session exited would
-/// be worse than one whose lead is numbered.
+/// The group survives its lead, but nothing takes the lead's place:
+/// `SAVRAS-2` and `SAVRAS-3` with no `SAVRAS` anywhere are still one group —
+/// they were started together and share a name — and `led` is false, so the
+/// panel says they stand alongside each other rather than promoting the
+/// lowest number to parent.
 pub fn group_of<'a>(snapshot: &'a Snapshot, job: &Job) -> Option<Group<'a>> {
     let (base, _) = split(&job.name);
     let mut family = family(snapshot, base);
@@ -107,6 +133,7 @@ pub fn group_of<'a>(snapshot: &'a Snapshot, job: &Job) -> Option<Group<'a>> {
     }
     let lead = family.remove(0);
     Some(Group {
+        led: lead.name == base,
         lead,
         agents: family,
     })
@@ -145,11 +172,10 @@ pub fn next_name(snapshot: &Snapshot, lead: &str) -> String {
 ///
 /// The list has to **hold still** — the flip keys walk it, and a row that
 /// moves while you are looking at it makes them a lottery (M2.2). So a family
-/// is placed by two things that do not change while it runs: the most
-/// demanding status anyone in it has, and its lead's name. A family with a
-/// question in it rises, which is the rule the repository headings already
-/// follow — a question does not stop being a question because of who asked it
-/// — and an agent finishing a task does not reshuffle the group.
+/// is placed by two things that do not change while it runs: when its oldest
+/// session was started, and its lead's name. An agent asking a question or
+/// finishing one does not reshuffle the group; what it is doing is said in
+/// its own row.
 ///
 /// Inside a family the order is the lead, then its agents by number. A session
 /// with no siblings *here* is a family of one and comes out exactly as it went
@@ -157,6 +183,12 @@ pub fn next_name(snapshot: &Snapshot, lead: &str) -> String {
 /// not an orphan indented under nothing. "Here" matters — the lead has to be
 /// in this same heading, or the indent would point at a row that is not on
 /// screen.
+///
+/// **No agent is promoted to lead.** The lead is the session with the bare
+/// name and nothing else is: delete `STAGING` and `STAGING-2` does not become
+/// the parent of `STAGING-3` — it never was one, and nothing on disk changed.
+/// Its agents outlive it as ordinary rows, side by side, because an indent
+/// under a session that is gone claims a relationship that no longer exists.
 pub fn under_leads(snapshot: &Snapshot, group: &[usize]) -> Vec<(usize, bool)> {
     // Families, keyed by the base name they share, in this heading only.
     let mut families: Vec<(String, Vec<usize>)> = Vec::new();
@@ -177,27 +209,34 @@ pub fn under_leads(snapshot: &Snapshot, group: &[usize]) -> Vec<(usize, bool)> {
         });
     }
 
+    // A family is as old as its oldest member — the lead, usually, since its
+    // agents were started from it. Ordering by that and not by status is what
+    // keeps a row still while you are reaching for it.
     families.sort_by(|a, b| {
-        let rank = |members: &Vec<usize>| {
+        let age = |members: &Vec<usize>| {
             members
                 .iter()
-                .map(|&at| snapshot.jobs[at].status)
+                .map(|&at| crate::job::started(&snapshot.jobs[at]))
                 .min()
-                .unwrap_or(Status::Done)
+                .unwrap_or((true, None))
         };
-        rank(&a.1)
-            .cmp(&rank(&b.1))
+        age(&a.1)
+            .cmp(&age(&b.1))
             .then_with(|| snapshot.jobs[a.1[0]].name.cmp(&snapshot.jobs[b.1[0]].name))
     });
 
     families
         .into_iter()
-        .flat_map(|(_, members)| {
+        .flat_map(|(base, members)| {
+            // Only the bare name leads. Without it — it was deleted, or it is
+            // under another heading — these are siblings, not a family, and
+            // none of them is indented under any of the others.
+            let led = snapshot.jobs[members[0]].name == base;
             let alone = members.len() < 2;
             members
                 .into_iter()
                 .enumerate()
-                .map(move |(n, at)| (at, !alone && n > 0))
+                .map(move |(n, at)| (at, led && !alone && n > 0))
         })
         .collect()
 }
@@ -494,9 +533,38 @@ mod tests {
         let s = snap(&f);
 
         let group = group_of(&s, job(&s, "SAVRAS-3")).unwrap();
-        assert_eq!(group.lead.name, "SAVRAS-2", "the lowest number leads");
         assert_eq!(group.agents.len(), 1);
-        assert_eq!(group.agents[0].name, "SAVRAS-3");
+        assert!(!group.led, "with no bare SAVRAS, nobody leads");
+        assert_eq!(
+            group.describe(job(&s, "SAVRAS-3")),
+            "started alongside SAVRAS-2 · no SAVRAS to lead them",
+            "and the panel says so rather than naming a parent"
+        );
+    }
+
+    #[test]
+    fn deleting_the_lead_does_not_promote_one_of_its_agents() {
+        // The bug the owner saw: delete `STAGING` and the panel drew
+        // `STAGING-2` as the parent of the others. Nothing on disk says a
+        // session has a parent — the indent is read out of the names — so the
+        // agents outlive their lead as ordinary rows, side by side.
+        let led = Fixture::new("agents-lead-there")
+            .job("a", &named("STAGING"))
+            .job("b", &named("STAGING-2"))
+            .job("c", &named("STAGING-3"));
+        assert_eq!(
+            laid_out(&snap(&led)),
+            ["STAGING", "└ STAGING-2", "└ STAGING-3"]
+        );
+
+        let orphaned = Fixture::new("agents-lead-gone")
+            .job("b", &named("STAGING-2"))
+            .job("c", &named("STAGING-3"));
+        assert_eq!(
+            laid_out(&snap(&orphaned)),
+            ["STAGING-2", "STAGING-3"],
+            "no indent, and no session promoted into the empty place"
+        );
     }
 
     #[test]
@@ -623,22 +691,30 @@ mod tests {
     }
 
     #[test]
-    fn a_family_is_placed_by_the_most_demanding_status_in_it() {
-        // A question does not stop being a question because an agent asked it,
-        // so the family rises — and the agent is still visible, directly under
-        // the lead it belongs to.
+    fn a_family_is_placed_by_the_oldest_session_in_it() {
+        // An agent asking a question does not move its family: where a family
+        // sits is settled by when its work started, and the question is said
+        // in the row itself. The agent stays under the lead it belongs to.
         let f = Fixture::new("agents-waiting")
-            .job("a", &named("ALPHA"))
-            .job("b", r#"{"state":"done","name":"BOOKS","cwd":"/tmp/repo"}"#)
+            .job(
+                "a",
+                r#"{"state":"working","name":"ALPHA","cwd":"/tmp/repo",
+                    "createdAt":"2026-09-22T08:00:00Z"}"#,
+            )
+            .job(
+                "b",
+                r#"{"state":"done","name":"BOOKS","cwd":"/tmp/repo",
+                    "createdAt":"2026-09-22T09:00:00Z"}"#,
+            )
             .job(
                 "c",
                 r#"{"state":"working","name":"BOOKS-2","cwd":"/tmp/repo",
-                    "needs":"answer: which one?"}"#,
+                    "needs":"answer: which one?","createdAt":"2026-09-22T10:00:00Z"}"#,
             );
         assert_eq!(
             laid_out(&snap(&f)),
-            ["BOOKS", "└ BOOKS-2", "ALPHA"],
-            "the family with the question comes first, lead included"
+            ["ALPHA", "BOOKS", "└ BOOKS-2"],
+            "the older session first, and the family stays together"
         );
     }
 
