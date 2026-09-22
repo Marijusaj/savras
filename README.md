@@ -279,13 +279,15 @@ the panel closes the one under the cursor without waiting for that. A
 screen is usually the reason it stopped. And the shell you *arrived* in is
 neither: leaving that one is leaving Savras, which asks first.
 
-**The order holds still.** Rows are grouped by status and then sorted by name,
-never by how recently a session did something. Freshest-first was the first cut
-and it made the panel unnavigable: a working session rewrites its timestamp
-every few seconds, so rows swapped places under your fingers and pressing the
-key twice landed somewhere different each time. A name is the one thing about a
-session that stands still, so the list now only moves when a session changes
-*status* — which is a change you want to see.
+**The order holds still.** Rows are sorted by when each session was *started*,
+oldest at the top, never by how recently one did something. Freshest-first was
+the first cut and it made the panel unnavigable: a working session rewrites its
+timestamp every few seconds, so rows swapped places under your fingers and
+pressing the key twice landed somewhere different each time. Status was the
+second, and it moved a row at the worst moment — the instant a session asked or
+stopped asking, while you were reaching for it. When a session started is the
+one thing about it that never changes, so a row keeps its place for as long as
+it lives and the list only grows at the end.
 
 **The header says which session you are in**, by name, next to the title. The
 pane itself does not reliably say — Claude Code draws its own name only
@@ -394,10 +396,11 @@ docs-site
 ✳ PLAN        DONE        READY #28          25%  1d
 ```
 
-**A repository with a session waiting on you sorts to the top**, and inside a
-repository the old order holds: waiting, then working, then done, and by name
-within each. A question does not stop being a question because of where it was
-asked, and grouping must not bury it.
+**The repository you started in first sorts to the top**, a repository being as
+old as its oldest session, and inside one the same order holds: oldest session
+first, newest last. A repository holding nothing but panes of your own has no
+session to date it by and sits after the rest. What is waiting for you is said
+in the row, so nothing has to move to tell you.
 
 **Parallel agents sit under their lead.** `SAVRAS-4` is indented beneath
 `SAVRAS`, in number order, because the names already say they belong together —
@@ -405,9 +408,9 @@ Claude Code numbers repeats, so the bare name leads and the numbered ones
 follow. The indent comes out of the name column rather than shifting the row,
 so everything to the right of it still reads as a column down the list.
 
-A *family* is placed by the most demanding status anyone in it has, then by its
-lead's name — so a group with a question in it rises to the top, and an agent
-finishing a task never reshuffles the group under your cursor. A session with
+A *family* is placed by the oldest session in it — its lead, usually, since its
+agents were started from it — and then by its lead's name, so an agent asking a
+question or finishing one never reshuffles the group under your cursor. A session with
 no siblings is an ordinary row: the tail has to parse as a number, so `PR-357`
 leads nothing and `BOOKS-LEG3` is not an agent of `BOOKS`. Grouped by status
 there is no indent at all, since a lead and its agent can be under different

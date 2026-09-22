@@ -738,16 +738,16 @@ impl App {
         }
     }
 
-    /// One group per repository, the sessions inside it ordered exactly as the
-    /// status grouping orders them: waiting first, then working, then done,
-    /// and by name within each.
+    /// One group per repository, the sessions inside it ordered exactly as
+    /// the status grouping orders them: oldest first, by when each was
+    /// started.
     ///
-    /// **A repository with a session waiting on you sorts to the top.** The
-    /// panel's job is to surface what is waiting, and grouping must not bury
-    /// it — a repository is a place, and a question does not stop being a
-    /// question because of where it was asked. Repositories with nothing but
-    /// finished sessions sink, and ties are broken by name, so the list only
-    /// moves when a session changes status.
+    /// **The repository you started in first is at the top.** A repository is
+    /// as old as its oldest session, and nothing that happens afterwards
+    /// moves it — what is asking for you is said in the row itself, in the
+    /// column that is there to say it. Ordering by status meant a repository
+    /// jumped the moment a session asked or stopped asking, which is exactly
+    /// while you are reaching for one of its rows.
     fn rows_by_repo(&mut self) {
         self.groups = self.repos_in_order();
         // Indices are into the snapshot, which is already sorted by status and
@@ -831,26 +831,30 @@ impl App {
         self.shells.get(i)?.cwd.as_deref().map(job::repo_of)
     }
 
-    /// The repositories in play, most-waiting first and then by name.
+    /// The repositories in play, the one whose work started first at the top.
     ///
-    /// A repository holding nothing but panes of your own sorts with the
-    /// finished ones: nothing in it is asking for you.
+    /// A repository is as old as its oldest session, so a repository you have
+    /// been in all morning stays where you last saw it however its sessions
+    /// come and go. A session whose start time could not be read dates its
+    /// repository no better than not at all, and a repository holding nothing
+    /// but panes of your own has no session to date it by: both sort after
+    /// the dated ones, by name.
     fn repos_in_order(&self) -> Vec<String> {
-        let mut repos: Vec<(Status, String)> = Vec::new();
-        let sessions = self
-            .snapshot
-            .jobs
-            .iter()
-            .map(|job| (job.status, job.repo()));
-        let shells =
-            (0..self.shells.len()).filter_map(|i| Some((Status::Done, self.shell_repo(i)?)));
-        for (status, repo) in sessions.chain(shells) {
+        /// Dated sessions first, then undated ones, then panes alone.
+        type Age = (u8, Option<chrono::DateTime<chrono::Utc>>);
+        let mut repos: Vec<(Age, String)> = Vec::new();
+        let sessions = self.snapshot.jobs.iter().map(|job| {
+            let (undated, at) = job::started(job);
+            ((u8::from(undated), at), job.repo())
+        });
+        let shells = (0..self.shells.len()).filter_map(|i| Some(((2, None), self.shell_repo(i)?)));
+        for (age, repo) in sessions.chain(shells) {
             match repos.iter_mut().find(|(_, name)| name == &repo) {
-                // The most demanding status in the repository is what it sorts
-                // by: one session asking is enough to bring its repository up.
-                Some((best, _)) if status < *best => *best = status,
+                // The oldest session in the repository is what it sorts by:
+                // the repository has been in play since that one started.
+                Some((oldest, _)) if age < *oldest => *oldest = age,
                 Some(_) => {}
-                None => repos.push((status, repo)),
+                None => repos.push((age, repo)),
             }
         }
         repos.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
@@ -1291,41 +1295,44 @@ mod tests {
 
     /// Sessions in three directories, so grouping has something to group.
     /// The `cwd`s are outside any repository, so each is its own name.
+    /// Four sessions across three repositories, started an hour apart: beta's
+    /// RUN first, then gamma's ASK, then beta's FIN, then alpha's OLD. The
+    /// statuses are deliberately at odds with that order — what is asking is
+    /// neither the oldest nor in the oldest repository.
     fn across_repos() -> Fixture {
         Fixture::new("app-repos")
             .job(
                 "aaa",
-                r#"{"state":"working","name":"RUN","cwd":"/tmp/savras-test-repos/beta"}"#,
+                r#"{"state":"working","name":"RUN","cwd":"/tmp/savras-test-repos/beta","createdAt":"2026-09-22T08:00:00Z"}"#,
             )
             .job(
                 "bbb",
-                r#"{"state":"working","name":"ASK","needs":"answer: ?","cwd":"/tmp/savras-test-repos/gamma"}"#,
+                r#"{"state":"working","name":"ASK","needs":"answer: ?","cwd":"/tmp/savras-test-repos/gamma","createdAt":"2026-09-22T09:00:00Z"}"#,
             )
             .job(
                 "ccc",
-                r#"{"state":"done","name":"FIN","output":{"result":"ok"},"cwd":"/tmp/savras-test-repos/beta"}"#,
+                r#"{"state":"done","name":"FIN","output":{"result":"ok"},"cwd":"/tmp/savras-test-repos/beta","createdAt":"2026-09-22T10:00:00Z"}"#,
             )
             .job(
                 "ddd",
-                r#"{"state":"done","name":"OLD","output":{"result":"ok"},"cwd":"/tmp/savras-test-repos/alpha"}"#,
+                r#"{"state":"done","name":"OLD","output":{"result":"ok"},"cwd":"/tmp/savras-test-repos/alpha","createdAt":"2026-09-22T11:00:00Z"}"#,
             )
     }
 
     #[test]
-    fn grouping_by_repository_puts_the_one_that_needs_you_first() {
-        // A repository is a place, and a question does not stop being a
-        // question because of where it was asked — so grouping must not bury
-        // it. `alpha` sorts last despite its name: nothing there is waiting.
+    fn grouping_by_repository_puts_the_one_you_started_in_first() {
+        // A repository is as old as its oldest session, and nothing a session
+        // does afterwards moves it: `gamma` holds the question and still sits
+        // under `beta`, which was open an hour earlier.
         let f = across_repos();
         let mut app = App::new(f.0.clone());
         app.set_group_by(GroupBy::Repo);
 
-        assert_eq!(app.groups, ["gamma", "beta", "alpha"]);
-        // Inside a repository, the panel's own order holds: waiting, then
-        // working, then done, and by name within each.
+        assert_eq!(app.groups, ["beta", "gamma", "alpha"]);
+        // Inside a repository, the panel's own order holds: oldest first.
         assert_eq!(
             names_in_order(&app),
-            ["ASK", "RUN", "FIN", "OLD"],
+            ["RUN", "FIN", "ASK", "OLD"],
             "sessions are ordered within their repository, not shuffled"
         );
     }
@@ -1345,9 +1352,9 @@ mod tests {
 
         // Only the one that said nothing is left at the top, unheaded.
         assert!(matches!(app.rows[0], Row::Shell(2)));
-        // `delta` has a heading for a pane alone, and sinks with the finished:
-        // nothing there is asking for you.
-        assert_eq!(app.groups, ["gamma", "beta", "alpha", "delta"]);
+        // `delta` has a heading for a pane alone, and sits after the others:
+        // with no session in it there is nothing to date it by.
+        assert_eq!(app.groups, ["beta", "gamma", "alpha", "delta"]);
         fn under(app: &App, shell: usize) -> Option<String> {
             let at = app
                 .rows
@@ -1365,7 +1372,7 @@ mod tests {
         panes[1].cwd = at("gamma");
         app.set_tabs(Front::Shell(0), Vec::new(), panes);
         assert_eq!(under(&app, 1).as_deref(), Some("gamma"));
-        assert_eq!(app.groups, ["gamma", "beta", "alpha"]);
+        assert_eq!(app.groups, ["beta", "gamma", "alpha"]);
 
         // Grouped by status there are no repositories to be under.
         app.set_group_by(GroupBy::Status);
@@ -1377,7 +1384,7 @@ mod tests {
 
     #[test]
     fn a_deleted_session_is_replaced_by_its_neighbour_in_the_repository() {
-        // gamma: ASK · beta: RUN, FIN · alpha: OLD
+        // beta: RUN, FIN · gamma: ASK · alpha: OLD
         let f = across_repos();
         let mut app = App::new(f.0.clone());
         app.set_group_by(GroupBy::Repo);
@@ -1387,8 +1394,8 @@ mod tests {
         assert_eq!(app.successor("ccc").as_deref(), Some("aaa"));
         // Alone in its repository: the nearest session on the panel, below
         // before above when both are as near.
-        assert_eq!(app.successor("bbb").as_deref(), Some("aaa"));
-        assert_eq!(app.successor("ddd").as_deref(), Some("ccc"));
+        assert_eq!(app.successor("bbb").as_deref(), Some("ddd"));
+        assert_eq!(app.successor("ddd").as_deref(), Some("bbb"));
         assert_eq!(app.successor("zzz"), None);
 
         // Grouped by status the repository still decides first: RUN's

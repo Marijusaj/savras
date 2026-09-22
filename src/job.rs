@@ -778,16 +778,30 @@ struct RawSessionFile {
 
 /// The panel's order, applied wherever jobs are put together: local ones as
 /// they are read, and again once the machines' rows are mixed in.
+///
+/// **Oldest first, by when the session was started.** Status was the first
+/// cut, and a status changes while you are looking at it: a session answering
+/// a question moved from the top of the list to the bottom of it, taking its
+/// repository with it, and the row you were about to press enter on was
+/// somewhere else. Start time never changes, so a session keeps its place for
+/// as long as it lives and the list only grows at the end.
 pub fn sort(jobs: &mut [Job]) {
-    // The id breaks ties last: two machines can hold sessions with the same
-    // derived name, and a list that reordered itself between batches would be
+    // A session whose start time we could not read sorts after the dated ones
+    // rather than jumping to the top: `None` is missing, not old. The id
+    // breaks ties last, because two machines can hold sessions with the same
+    // derived name and a list that reordered itself between batches would be
     // the "slot machine" all over again.
     jobs.sort_by(|a, b| {
-        a.status
-            .cmp(&b.status)
+        started(a)
+            .cmp(&started(b))
             .then(a.name.cmp(&b.name))
             .then(a.short.cmp(&b.short))
     });
+}
+
+/// When a session started, for ordering: undated ones sort last.
+pub fn started(job: &Job) -> (bool, Option<DateTime<Utc>>) {
+    (job.created_at.is_none(), job.created_at)
 }
 
 /// The file, parsed — with one retry.
@@ -991,47 +1005,59 @@ mod tests {
     }
 
     #[test]
-    fn a_change_of_status_is_the_one_thing_that_moves_a_row() {
+    fn a_change_of_status_does_not_move_a_row() {
         let f = Fixture::new("job-status-moves")
-            .job("a", r#"{"state":"working","name":"ALPHA"}"#)
-            .job("b", r#"{"state":"working","name":"BETA"}"#);
+            .job(
+                "a",
+                r#"{"state":"working","name":"ALPHA","createdAt":"2026-09-22T08:00:00Z"}"#,
+            )
+            .job(
+                "b",
+                r#"{"state":"working","name":"BETA","createdAt":"2026-09-22T09:00:00Z"}"#,
+            );
         let names =
             |s: &Snapshot| -> Vec<String> { s.jobs.iter().map(|j| j.name.clone()).collect() };
         assert_eq!(names(&load(&f.0).unwrap()), ["ALPHA", "BETA"]);
 
-        // BETA starts asking, and asking sorts above working — a move you
-        // want to see, unlike a timestamp ticking.
+        // BETA starts asking. It is still the younger session, so it stays
+        // where it was: the panel says what is asking in the row itself, and
+        // a row that moves as you reach for it is worse than one that waits.
         std::fs::write(
             f.0.join("b").join("state.json"),
-            r#"{"state":"working","name":"BETA","needs":"answer: which?"}"#,
+            r#"{"state":"working","name":"BETA","needs":"answer: which?","createdAt":"2026-09-22T09:00:00Z"}"#,
         )
         .unwrap();
-        assert_eq!(names(&load(&f.0).unwrap()), ["BETA", "ALPHA"]);
+        assert_eq!(names(&load(&f.0).unwrap()), ["ALPHA", "BETA"]);
     }
 
     #[test]
-    fn groups_by_needs_then_state() {
+    fn the_oldest_session_is_first_and_an_undated_one_is_last() {
         let f = Fixture::new("groups")
             .job(
                 "aaa",
-                r#"{"state":"working","name":"WORK","detail":"building"}"#,
+                r#"{"state":"working","name":"WORK","detail":"building","createdAt":"2026-09-22T09:00:00Z"}"#,
             )
             .job(
                 "bbb",
-                r#"{"state":"working","name":"ASK","detail":"d","needs":"answer: which one?"}"#,
+                r#"{"state":"working","name":"ASK","detail":"d","needs":"answer: which one?","createdAt":"2026-09-22T10:00:00Z"}"#,
             )
             .job(
                 "ccc",
-                r#"{"state":"done","name":"FIN","output":{"result":"shipped"}}"#,
-            );
+                r#"{"state":"done","name":"FIN","output":{"result":"shipped"},"createdAt":"2026-09-22T08:00:00Z"}"#,
+            )
+            // No start time to be had: it sorts after the dated ones rather
+            // than passing for the oldest session on the machine.
+            .job("ddd", r#"{"state":"working","name":"NODATE"}"#);
         let snap = load(&f.0).unwrap();
 
-        assert_eq!(snap.jobs.len(), 3);
-        // Needs-input first, then working, then done.
-        assert_eq!(snap.jobs[0].name, "ASK");
-        assert_eq!(snap.jobs[0].status, Status::NeedsInput);
-        assert_eq!(snap.jobs[1].status, Status::Working);
-        assert_eq!(snap.jobs[2].status, Status::Done);
+        assert_eq!(
+            snap.jobs
+                .iter()
+                .map(|j| j.name.as_str())
+                .collect::<Vec<_>>(),
+            ["FIN", "WORK", "ASK", "NODATE"]
+        );
+        assert_eq!(snap.jobs[2].status, Status::NeedsInput, "asking, and third");
     }
 
     #[test]

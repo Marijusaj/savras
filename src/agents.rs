@@ -23,7 +23,7 @@ use std::sync::mpsc;
 use anyhow::{Context, Result};
 
 use crate::app::App;
-use crate::job::{Job, Snapshot, Status};
+use crate::job::{Job, Snapshot};
 
 /// The lead a session name belongs to, and its number within that lead.
 ///
@@ -177,16 +177,19 @@ pub fn under_leads(snapshot: &Snapshot, group: &[usize]) -> Vec<(usize, bool)> {
         });
     }
 
+    // A family is as old as its oldest member — the lead, usually, since its
+    // agents were started from it. Ordering by that and not by status is what
+    // keeps a row still while you are reaching for it.
     families.sort_by(|a, b| {
-        let rank = |members: &Vec<usize>| {
+        let age = |members: &Vec<usize>| {
             members
                 .iter()
-                .map(|&at| snapshot.jobs[at].status)
+                .map(|&at| crate::job::started(&snapshot.jobs[at]))
                 .min()
-                .unwrap_or(Status::Done)
+                .unwrap_or((true, None))
         };
-        rank(&a.1)
-            .cmp(&rank(&b.1))
+        age(&a.1)
+            .cmp(&age(&b.1))
             .then_with(|| snapshot.jobs[a.1[0]].name.cmp(&snapshot.jobs[b.1[0]].name))
     });
 
@@ -623,22 +626,30 @@ mod tests {
     }
 
     #[test]
-    fn a_family_is_placed_by_the_most_demanding_status_in_it() {
-        // A question does not stop being a question because an agent asked it,
-        // so the family rises — and the agent is still visible, directly under
-        // the lead it belongs to.
+    fn a_family_is_placed_by_the_oldest_session_in_it() {
+        // An agent asking a question does not move its family: where a family
+        // sits is settled by when its work started, and the question is said
+        // in the row itself. The agent stays under the lead it belongs to.
         let f = Fixture::new("agents-waiting")
-            .job("a", &named("ALPHA"))
-            .job("b", r#"{"state":"done","name":"BOOKS","cwd":"/tmp/repo"}"#)
+            .job(
+                "a",
+                r#"{"state":"working","name":"ALPHA","cwd":"/tmp/repo",
+                    "createdAt":"2026-09-22T08:00:00Z"}"#,
+            )
+            .job(
+                "b",
+                r#"{"state":"done","name":"BOOKS","cwd":"/tmp/repo",
+                    "createdAt":"2026-09-22T09:00:00Z"}"#,
+            )
             .job(
                 "c",
                 r#"{"state":"working","name":"BOOKS-2","cwd":"/tmp/repo",
-                    "needs":"answer: which one?"}"#,
+                    "needs":"answer: which one?","createdAt":"2026-09-22T10:00:00Z"}"#,
             );
         assert_eq!(
             laid_out(&snap(&f)),
-            ["BOOKS", "└ BOOKS-2", "ALPHA"],
-            "the family with the question comes first, lead included"
+            ["ALPHA", "BOOKS", "└ BOOKS-2"],
+            "the older session first, and the family stays together"
         );
     }
 
