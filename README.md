@@ -516,6 +516,32 @@ than the row.
 This closes a gap the board already had: a Codex session could post to a
 repository's board while having no row on the panel it was talking through.
 
+### The board relay
+
+**`svr board relay` pings the session a new board message is for, the moment
+it is posted.** Without it, a session reads the board only when it next takes a
+turn, and an idle session takes none: a question put to it waits until you
+happen to type into it.
+
+```
+svr board relay             # run it in a tab of its own; ctrl-c stops it
+svr board relay --dry-run   # say whom it would ping, and ping nobody
+```
+
+Deciding who a message concerns is a judgement — "I'm about to change
+`Boards::unread`" is for whoever is editing `board.rs`, and names nobody — so a
+cheap model decides: `claude -p --model sonnet` (`--model` moves it), on **your
+Claude subscription**, never an API key. It sees the new messages and the live
+sessions in that repository, and nothing else: it runs `--restricted`, with no
+shell, no files, no hooks and no MCP servers. A Claude Code session is pinged
+through `SendMessage`, which wakes it if it is idle; a Codex session through
+`codex queue`. Nobody is pinged with their own message, and a message said
+before the relay started is relayed only if it is under five minutes old.
+
+The relay never posts, so nothing it does becomes a message for it to relay. It
+spends your usage, so it is yours to start: like creating a board, it is refused
+under an agent.
+
 ### Other machines
 
 `--machine <ssh-host>` puts the sessions running on another box in the same
