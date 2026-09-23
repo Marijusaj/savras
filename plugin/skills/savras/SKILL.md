@@ -53,7 +53,9 @@ svr --once
 ```
 
 prints each session, grouped by status (Needs input, Working, Completed), with
-its name, how long it has been open and what it last said. Use it to see
+its name, how long it has been open and what it last said. Codex sessions
+running on the machine are listed too, marked `IDLE` when they are between
+turns — so "who else is working here" means every agent, not only Claude Code. Use it to see
 whether another session is already on something before you start it, or to
 tell the user which sessions are waiting on them. It reads only; it never
 changes a session.

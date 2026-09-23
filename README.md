@@ -65,7 +65,7 @@ concluded.
 - **The name** — in white, with no colour badge, for the session in the pane
   beside the panel. That is the one your keystrokes are going to.
 - **One word.** `WAITING` wants you, `WORKING` does not, `DONE` is finished,
-  `FAILED` broke. It sits where the summary used to and answers the question you
+  `FAILED` broke, and `IDLE` is a Codex session between turns. It sits where the summary used to and answers the question you
   actually scan ten rows for.
 - **The pull request**, if the session produced one: `READY` when its checks are
   green, `CHECKS` while they run, `FAILED` when one has not, then `MERGED` or
@@ -485,6 +485,36 @@ member.
 This is the one thing Savras does that is not looking. It still never writes to
 `~/.claude/`, and it still cannot disturb a session that is running — but it
 can now *start* one, with `claude --bg`, in that group's own repository.
+
+### Codex sessions
+
+**A Codex session running on this machine is a row like any other**, under the
+repository it is working in, ordered by when it started, with the model it is
+on and how much of its context window it has spent. It wears `◈` where a Claude
+Code session wears `✳`, and `enter` opens it with `codex resume`.
+
+```
+◈ CODEX SETUP  IDLE                  50%  25m
+  └ codex      └ between turns       └ its own window, as Codex reports it
+```
+
+Only *running* Codex sessions are listed. Codex keeps every session it has ever
+written, months back, and the lock file it holds open while a session lives is
+what tells the two apart. Nothing is written: the panel reads
+`~/.codex/sessions/…jsonl`, `session_index.jsonl` and `thread-writer-locks/`,
+and the long rollout files are read from the end, since everything a row needs
+was said in the last few events.
+
+**The one word a Codex row cannot say is `WAITING`.** Codex records no approval
+event, so "waiting for you to approve a command" and "waiting for your next
+prompt" look the same on disk — both are simply a turn that has ended. Savras's
+`WAITING` is a claim that a session asked *you* something, and the ping is built
+on it, so a Codex session between turns says `IDLE` instead. None of these files
+are documented by Codex, so a field that changes shape costs a column rather
+than the row.
+
+This closes a gap the board already had: a Codex session could post to a
+repository's board while having no row on the panel it was talking through.
 
 ### Other machines
 

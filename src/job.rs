@@ -43,6 +43,20 @@ pub struct Link {
     pub href: String,
 }
 
+/// Which agent this session is.
+///
+/// Savras reads two programs' files now, and the difference reaches exactly
+/// two places: how a session is opened, and the word for a turn that has
+/// finished while the session is still there. Everything else — the row, the
+/// grouping, the board, the age — is the same question asked of the same
+/// fields, which is the point of having one `Job`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Client {
+    #[default]
+    Claude,
+    Codex,
+}
+
 #[derive(Debug, Clone)]
 pub struct Job {
     /// Short id, and the directory name under `jobs/`.
@@ -84,12 +98,21 @@ pub struct Job {
     /// `tokens` from the state file is all there is — see [`context_used`] for
     /// why that is a poor second.
     pub context: Option<u64>,
+    /// The context window this session was given, when it says so itself.
+    ///
+    /// Claude Code does not, so the window is read out of the model name
+    /// there. Codex writes it on every turn, and a number the session
+    /// reported beats a number we inferred — it is also the only way to be
+    /// right about a model this panel has never heard of.
+    pub context_window: Option<u64>,
     /// Finished badly. Claude Code has no such state today; this is here so
     /// that one it grows is shown rather than read as `done`.
     pub failed: bool,
     /// What the pull request this session produced is doing, when it has one
     /// and the cache knows about it.
     pub deploy: Option<Deploy>,
+    /// Which agent this is: Claude Code, or Codex.
+    pub client: Client,
 }
 
 /// What a session's pull request is doing.
@@ -213,6 +236,14 @@ impl Job {
         if let Some(remote) = &self.machine {
             return remote.open_command();
         }
+        // Codex has one way in, and it takes the session's own id.
+        if self.client == Client::Codex {
+            return vec![
+                "codex".to_string(),
+                "resume".to_string(),
+                self.session_id.clone(),
+            ];
+        }
         match (&self.backend, &self.daemon_short) {
             (Some(backend), Some(short)) if backend == "daemon" => {
                 vec!["claude".into(), "attach".into(), short.clone()]
@@ -244,11 +275,15 @@ impl Job {
     /// sessions for — which of these wants me, which are still going, which
     /// are finished — and answers it in seven columns.
     pub fn word(&self) -> &'static str {
-        match (self.failed, self.status) {
-            (true, _) => "FAILED",
-            (_, Status::NeedsInput) => "WAITING",
-            (_, Status::Working) => "WORKING",
-            (_, Status::Done) => "DONE",
+        match (self.failed, self.status, self.client) {
+            (true, ..) => "FAILED",
+            (_, Status::NeedsInput, _) => "WAITING",
+            (_, Status::Working, _) => "WORKING",
+            // A Codex session is only on the panel while it is running, so a
+            // turn that ended is a session between turns — `DONE` would be a
+            // lie about a session you can type into.
+            (_, Status::Done, Client::Codex) => "IDLE",
+            (_, Status::Done, Client::Claude) => "DONE",
         }
     }
 
@@ -263,7 +298,9 @@ impl Job {
         if self.machine.is_some() {
             return None;
         }
-        let window = context_window(self.model.as_deref());
+        let window = self
+            .context_window
+            .unwrap_or_else(|| context_window(self.model.as_deref()));
         // Rounded, not truncated, so the row agrees with the status line the
         // session draws for itself: 386,839 of a million is 39% in both
         // places, and two numbers for one thing is worse than either.
@@ -528,6 +565,15 @@ fn named(cwd: &Path) -> String {
 /// [`Job::repo`] calls a local session's repository, so a pane of your own
 /// standing in the same place lands under the same heading.
 pub fn repo_of(cwd: &Path) -> String {
+    // Nowhere at all: a session whose file names no directory, or a Codex
+    // session that has not had its first turn and has not said where it is
+    // yet. Asked first, because an empty path is not a path that fails to be
+    // a repository — it is the *current* directory, which is wherever the
+    // panel happens to have been started, and answering with that would put a
+    // session in a repository it has never been near.
+    if cwd.as_os_str().is_empty() {
+        return "no directory".to_string();
+    }
     let root = match git_dir(cwd).as_deref().and_then(repo_root) {
         Some(root) => PathBuf::from(root),
         // Not in a repository at all: the directory is all there is to go on,
@@ -913,7 +959,9 @@ fn read_one(dir: &Path, short: &str, fallback_model: Option<&str>) -> Option<Job
             .and_then(context_used),
         failed: matches!(raw.state.as_deref(), Some("failed") | Some("error")),
         // Filled in by `load`, which holds the cache the answer comes from.
+        context_window: None,
         deploy: None,
+        client: Client::Claude,
     })
 }
 

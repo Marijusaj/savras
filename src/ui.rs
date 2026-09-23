@@ -10,7 +10,7 @@ use ratatui::{
 use crate::agents;
 use crate::app::{App, BoardRow, BoardView, Compose, Row, Tab};
 use crate::board;
-use crate::job::{age, Deploy, Job, Status};
+use crate::job::{age, Client, Deploy, Job, Status};
 
 /// Keep the summary as long as this many columns are left for it. Claude
 /// Code's own panel keeps a truncated summary in a narrow pane, and a sidebar
@@ -365,8 +365,14 @@ fn job_line(
         // Open, running, and not on your screen — the state worth seeing.
         Span::styled("▷ ", Style::default().fg(Color::Indexed(245)))
     } else {
+        // A Codex session wears a different star in the same column: which
+        // agent a row is changes what `enter` runs and what the words on it
+        // mean, and it costs no width to say so.
         Span::styled(
-            "✳ ",
+            match job.client {
+                Client::Claude => "✳ ",
+                Client::Codex => "◈ ",
+            },
             Style::default().fg(match job.status {
                 Status::NeedsInput => Color::Indexed(179),
                 Status::Working => Color::Indexed(117),
@@ -858,6 +864,17 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(Color::Indexed(140)),
         ),
     ])];
+    // Which agent, and on what — said once, here, where there is room for the
+    // model's name. The row has the star and that is all it can afford.
+    if job.client == Client::Codex {
+        lines[0].spans.push(Span::styled(
+            match &job.model {
+                Some(model) => format!("  codex · {model}"),
+                None => "  codex".to_string(),
+            },
+            Style::default().fg(Color::Indexed(140)),
+        ));
+    }
     // A session on another machine reports no token count — the file it comes
     // from has none. "0 tokens" would read as a session that has spent
     // nothing, which is a different and untrue thing.
