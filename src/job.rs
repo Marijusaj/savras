@@ -565,6 +565,15 @@ fn named(cwd: &Path) -> String {
 /// [`Job::repo`] calls a local session's repository, so a pane of your own
 /// standing in the same place lands under the same heading.
 pub fn repo_of(cwd: &Path) -> String {
+    // Nowhere at all: a session whose file names no directory, or a Codex
+    // session that has not had its first turn and has not said where it is
+    // yet. Asked first, because an empty path is not a path that fails to be
+    // a repository — it is the *current* directory, which is wherever the
+    // panel happens to have been started, and answering with that would put a
+    // session in a repository it has never been near.
+    if cwd.as_os_str().is_empty() {
+        return "no directory".to_string();
+    }
     let root = match git_dir(cwd).as_deref().and_then(repo_root) {
         Some(root) => PathBuf::from(root),
         // Not in a repository at all: the directory is all there is to go on,

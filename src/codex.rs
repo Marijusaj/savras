@@ -77,9 +77,17 @@ pub fn load(dir: &Path) -> Vec<Job> {
     let names = names(dir);
     let rollouts = rollouts(&dir.join("sessions"), &live);
     live.iter()
-        .filter_map(|id| {
-            let path = rollouts.get(id)?;
-            read_one(id, path, names.get(id).cloned())
+        .map(|id| {
+            let named = names.get(id).cloned();
+            match rollouts.get(id) {
+                Some(path) => read_one(id, path, named.clone()),
+                None => None,
+            }
+            // A session that has not been asked anything yet has a lock and a
+            // name and no rollout — Codex writes that on the first turn. It is
+            // a session you can type into, so it is a row; it simply has
+            // nothing to say yet, and does not know where it is.
+            .unwrap_or_else(|| waiting_to_start(dir, id, named))
         })
         .collect()
 }
@@ -97,11 +105,24 @@ fn live_ids(dir: &Path) -> Vec<String> {
         .flatten()
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().to_string();
-            name.strip_suffix(".lock").map(str::to_string)
+            let id = name.strip_suffix(".lock")?;
+            // Codex keeps a `.coordination.lock` of its own in here, and
+            // whatever else it grows is not ours to draw either. A session id
+            // is a uuid, and nothing else in this directory is one.
+            is_uuid(id).then(|| id.to_string())
         })
         .collect();
     ids.sort();
     ids
+}
+
+/// `01a0ccda-8ca8-7902-94df-5786dc86d974`, and nothing else.
+fn is_uuid(name: &str) -> bool {
+    name.len() == 36
+        && name.chars().enumerate().all(|(at, c)| match at {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
 }
 
 /// The name the owner gave each thread, latest line winning.
@@ -149,6 +170,39 @@ fn rollouts(sessions: &Path, live: &[String]) -> HashMap<String, PathBuf> {
         }
     }
     found
+}
+
+/// A session that is open but has not had its first turn.
+///
+/// Its lock is the only file it has, so the lock is where its age comes from,
+/// and where it is working is not written down anywhere until it answers
+/// something. It is drawn with no repository rather than a guessed one: the
+/// panel says what it knows, and this one moves under its heading the moment
+/// it is used.
+fn waiting_to_start(dir: &Path, id: &str, name: Option<String>) -> Job {
+    let lock = dir.join("thread-writer-locks").join(format!("{id}.lock"));
+    Job {
+        short: short(id).to_string(),
+        name: flatten(&name.unwrap_or_else(|| format!("codex {}", short(id))), 32),
+        color: None,
+        status: Status::Done,
+        summary: "nothing asked yet".to_string(),
+        cwd: PathBuf::new(),
+        session_id: id.to_string(),
+        tokens: 0,
+        updated_at: modified(&lock),
+        links: Vec::new(),
+        backend: None,
+        daemon_short: None,
+        machine: None,
+        created_at: modified(&lock),
+        model: None,
+        context: None,
+        context_window: None,
+        failed: false,
+        deploy: None,
+        client: Client::Codex,
+    }
 }
 
 /// One session, from the two ends of its rollout.
@@ -463,6 +517,47 @@ mod tests {
             jobs[0].summary, "Copied all three into ~/.codex/skills",
             "one line, whatever the message did"
         );
+    }
+
+    #[test]
+    fn a_session_opened_but_not_yet_asked_anything_is_still_a_row() {
+        // What the owner saw: a Codex session started in the pane beside the
+        // panel, named, waiting at its prompt — and no row, because Codex
+        // writes the rollout on the first turn and there was nothing to read.
+        let s = Scratch::new("fresh");
+        std::fs::write(
+            s.0.join("thread-writer-locks").join(format!("{ID}.lock")),
+            "",
+        )
+        .unwrap();
+        let s = s.named(ID, "CODEX SETUP 2");
+
+        let jobs = load(&s.0);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "CODEX SETUP 2");
+        assert_eq!(jobs[0].word(), "IDLE");
+        assert_eq!(jobs[0].summary, "nothing asked yet");
+        assert!(jobs[0].created_at.is_some(), "aged from its lock");
+        // It has not said where it is, so it is not put anywhere.
+        assert_eq!(jobs[0].repo(), "no directory");
+        assert_eq!(jobs[0].open_command(), ["codex", "resume", ID]);
+    }
+
+    #[test]
+    fn a_lock_that_is_not_a_session_is_not_a_row() {
+        // Codex keeps a `.coordination.lock` in the same directory. Taken for
+        // a session it would be a row named after a file.
+        let s = Scratch::new("coordination").session(ID, &[&meta("/tmp/repo"), STARTED]);
+        std::fs::write(
+            s.0.join("thread-writer-locks").join(".coordination.lock"),
+            "",
+        )
+        .unwrap();
+        std::fs::write(s.0.join("thread-writer-locks").join("notes.lock"), "").unwrap();
+
+        let jobs = load(&s.0);
+        assert_eq!(jobs.len(), 1, "only the uuid is a session");
+        assert_eq!(jobs[0].session_id, ID);
     }
 
     #[test]
