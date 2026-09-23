@@ -7,6 +7,7 @@ use anyhow::Result;
 use ratatui::widgets::ListState;
 
 use crate::board::{self, Boards, Message, Owner};
+use crate::codex;
 use crate::job::{self, Job, Snapshot, Status};
 
 /// How many messages the board screen holds. More than a hook injects, because
@@ -138,6 +139,10 @@ pub struct App {
     /// Where the boards are kept. A field of its own so a test can point it at
     /// boards of its own rather than the ones the machine's agents are reading.
     pub board_dir: PathBuf,
+    /// Codex's own directory, read for the sessions it has running. A field
+    /// for the same reason as the two above: a test must never read — or be
+    /// at the mercy of — the Codex sessions on the machine running it.
+    pub codex_dir: PathBuf,
     /// The boards drawn as rows, in the order they appear — rebuilt with the
     /// rows, since whether a repository has a board is asked of the disk then.
     pub board_rows: Vec<BoardRow>,
@@ -404,6 +409,14 @@ impl App {
             // The path only: opening the boards migrates the old log, and that
             // is for a panel starting up, not for every `App` a test builds.
             board_dir: board::default_dir().unwrap_or_default(),
+            // Under test this is nowhere on purpose: a suite that read the
+            // machine's real Codex sessions would pass or fail depending on
+            // what the developer happened to have open.
+            codex_dir: if cfg!(test) {
+                PathBuf::new()
+            } else {
+                codex::default_dir().unwrap_or_default()
+            },
             board_rows: Vec::new(),
             open_boards: Vec::new(),
             topics: HashMap::new(),
@@ -581,6 +594,10 @@ impl App {
             }
             Err(e) => self.error = Some(format!("{e}")),
         }
+        // Codex's running sessions, beside Claude Code's and read the same
+        // way. Not an error when there are none: most machines have no Codex
+        // on them, and a panel that said so every tick would be noise.
+        self.local.extend(codex::load(&self.codex_dir));
         self.merge();
         // The same tick as the rows: the board is a file too, and an answer
         // should not wait for a key to be seen.
@@ -1317,6 +1334,73 @@ mod tests {
                 "ddd",
                 r#"{"state":"done","name":"OLD","output":{"result":"ok"},"cwd":"/tmp/savras-test-repos/alpha","createdAt":"2026-09-22T11:00:00Z"}"#,
             )
+    }
+
+    /// A `~/.codex` holding one running session, started at `at`, in `cwd`.
+    fn with_a_codex_session(tag: &str, cwd: &str, at: &str) -> PathBuf {
+        const ID: &str = "01a0ccda-8ca8-7902-94df-5786dc86d974";
+        let dir =
+            std::env::temp_dir().join(format!("savras-app-codex-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("thread-writer-locks")).unwrap();
+        std::fs::write(
+            dir.join("thread-writer-locks").join(format!("{ID}.lock")),
+            "",
+        )
+        .unwrap();
+        let day = dir.join("sessions").join("2026").join("09").join("23");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(
+            day.join(format!("rollout-2026-09-23T09-01-10-{ID}.jsonl")),
+            format!(
+                "{}\n{}\n",
+                format_args!(
+                    r#"{{"type":"session_meta","payload":{{"session_id":"{ID}","timestamp":"{at}","cwd":"{cwd}"}}}}"#
+                ),
+                r#"{"type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("session_index.jsonl"),
+            format!(r#"{{"id":"{ID}","thread_name":"CODEX SETUP"}}"#),
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_codex_session_sits_with_the_claude_ones_in_its_own_repository() {
+        // The gap this closes: a Codex session could post to a repository's
+        // board while having no row on the panel it was talking through.
+        let f = across_repos();
+        let codex = with_a_codex_session(
+            "beside",
+            "/tmp/savras-test-repos/beta",
+            // Between beta's RUN (08:00) and its FIN (10:00), so the ordering
+            // has to interleave the two sources rather than append one.
+            "2026-09-22T09:30:00Z",
+        );
+        let mut app = App::new(f.0.clone());
+        app.codex_dir = codex.clone();
+        app.set_group_by(GroupBy::Repo);
+        app.refresh();
+
+        assert_eq!(
+            names_in_order(&app),
+            ["RUN", "CODEX SETUP", "FIN", "ASK", "OLD"],
+            "one list, ordered by when each session started"
+        );
+        let job = app
+            .snapshot
+            .jobs
+            .iter()
+            .find(|j| j.name == "CODEX SETUP")
+            .unwrap();
+        assert_eq!(job.client, job::Client::Codex);
+        assert_eq!(job.repo(), "beta", "grouped by the same rule as the rest");
+        assert_eq!(job.open_command()[0], "codex");
+        let _ = std::fs::remove_dir_all(codex);
     }
 
     #[test]

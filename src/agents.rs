@@ -781,8 +781,10 @@ mod tests {
             created_at: None,
             model: None,
             context: None,
+            context_window: None,
             failed: false,
             deploy: None,
+            client: crate::job::Client::Claude,
         };
         let short = job.short.clone();
         app.set_remote("claude-box".to_string(), vec![job]);

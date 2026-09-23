@@ -232,8 +232,12 @@ fn read_one(host: &str, line: &str) -> Option<Job> {
         // a session someone is driving by hand, not a job with children.
         model: None,
         context: None,
+        context_window: None,
         failed: false,
         deploy: None,
+        // The far side is asked for Claude Code sessions; a Codex session on
+        // another machine is not something this protocol carries yet.
+        client: crate::job::Client::Claude,
     })
 }
 

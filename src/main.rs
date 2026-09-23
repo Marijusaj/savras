@@ -7,6 +7,7 @@
 mod agents;
 mod app;
 mod board;
+mod codex;
 mod focus;
 mod host;
 mod job;
@@ -492,9 +493,15 @@ fn plain(s: &str) -> String {
 }
 
 fn print_once(jobs_dir: &std::path::Path) -> Result<()> {
-    let snapshot = job::load(jobs_dir)?;
+    let mut snapshot = job::load(jobs_dir)?;
+    // The same two sources the panel has. An agent reading this to see who
+    // else is working must not be told a Codex session is not there.
+    if let Some(dir) = codex::default_dir() {
+        snapshot.jobs.extend(codex::load(&dir));
+        job::sort(&mut snapshot.jobs);
+    }
     if snapshot.is_empty() {
-        println!("no Claude Code sessions");
+        println!("no sessions");
         return Ok(());
     }
     let now = Utc::now();
