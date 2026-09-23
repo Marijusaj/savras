@@ -591,7 +591,7 @@ fn claimed(name: &str) -> Result<String> {
 /// middle of the text therefore invents a whole message, attributed to whoever
 /// the forger likes. An escape sequence, on its way to the owner's own
 /// terminal, is the older problem: `\x1b]52` writes the clipboard.
-fn flatten(s: &str) -> String {
+pub fn flatten(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
@@ -862,6 +862,9 @@ The owner's, refused under an agent:
     svr board clean --yes [--repo <path>] remove every message, keep the board
     svr board delete --yes [--repo <path>] remove the board itself
 
+    svr board relay [--dry-run]           ping the session each new message is for
+                                          (a cheap model on your subscription)
+
     svr board install                     how to wire it into every session
     svr board path                        where the boards are kept
 
@@ -894,6 +897,7 @@ fn run(args: &[String]) -> Result<()> {
         "read" => read_command(rest, false),
         "unread" => read_command(rest, true),
         "list" => list_command(),
+        "relay" => crate::relay::run(rest),
         "create" | "clean" | "delete" => owner_command(command, rest),
         "install" => {
             print!("{}", install_text());

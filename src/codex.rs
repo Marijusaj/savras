@@ -42,6 +42,9 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -76,6 +79,12 @@ pub fn load(dir: &Path) -> Vec<Job> {
     }
     let names = names(dir);
     let rollouts = rollouts(&dir.join("sessions"), &live);
+    let unstarted: Vec<&str> = live
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !rollouts.contains_key(*id))
+        .collect();
+    let standing = standing(&dir.join("thread-writer-locks"), &unstarted);
     live.iter()
         .map(|id| {
             let named = names.get(id).cloned();
@@ -86,8 +95,8 @@ pub fn load(dir: &Path) -> Vec<Job> {
             // A session that has not been asked anything yet has a lock and a
             // name and no rollout — Codex writes that on the first turn. It is
             // a session you can type into, so it is a row; it simply has
-            // nothing to say yet, and does not know where it is.
-            .unwrap_or_else(|| waiting_to_start(dir, id, named))
+            // nothing to say yet.
+            .unwrap_or_else(|| waiting_to_start(dir, id, named, standing.get(id).cloned()))
         })
         .collect()
 }
@@ -176,10 +185,10 @@ fn rollouts(sessions: &Path, live: &[String]) -> HashMap<String, PathBuf> {
 ///
 /// Its lock is the only file it has, so the lock is where its age comes from,
 /// and where it is working is not written down anywhere until it answers
-/// something. It is drawn with no repository rather than a guessed one: the
-/// panel says what it knows, and this one moves under its heading the moment
-/// it is used.
-fn waiting_to_start(dir: &Path, id: &str, name: Option<String>) -> Job {
+/// something — so it is asked of the process holding that lock, see
+/// [`standing`]. When nothing can say, it is drawn with no repository rather
+/// than a guessed one, and moves under its heading the moment it is used.
+fn waiting_to_start(dir: &Path, id: &str, name: Option<String>, cwd: Option<PathBuf>) -> Job {
     let lock = dir.join("thread-writer-locks").join(format!("{id}.lock"));
     Job {
         short: short(id).to_string(),
@@ -187,7 +196,7 @@ fn waiting_to_start(dir: &Path, id: &str, name: Option<String>) -> Job {
         color: None,
         status: Status::Done,
         summary: "nothing asked yet".to_string(),
-        cwd: PathBuf::new(),
+        cwd: cwd.unwrap_or_default(),
         session_id: id.to_string(),
         tokens: 0,
         updated_at: modified(&lock),
@@ -203,6 +212,124 @@ fn waiting_to_start(dir: &Path, id: &str, name: Option<String>) -> Job {
         deploy: None,
         client: Client::Codex,
     }
+}
+
+/// Where each Codex process holding a session's lock is standing — the only
+/// thing that says where a session is before its first turn.
+///
+/// Codex writes the directory into the rollout, and the rollout on the first
+/// turn: until then a session started in a tab beside the panel sat under "no
+/// directory", away from the repository it was opened in. The lock is held
+/// open from the moment the session starts, so whoever holds it is the
+/// session, and its working directory is where it was started.
+///
+/// One pass for every session that needs it: `pgrep` for the Codex processes,
+/// then one `lsof` over just those, which lists each one's locks and its
+/// working directory together — tens of milliseconds, on the panel's own
+/// thread. Asking `lsof` by file instead walks every process on the machine,
+/// a quarter of a second per session. An answer is kept for good, since a
+/// process's start directory does not move; a miss is asked again, but not
+/// more than every [`RETRY`].
+fn standing(locks: &Path, unstarted: &[&str]) -> HashMap<String, PathBuf> {
+    struct Known {
+        cwds: HashMap<String, PathBuf>,
+        asked: Option<Instant>,
+    }
+    static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
+    let known = KNOWN.get_or_init(|| {
+        Mutex::new(Known {
+            cwds: HashMap::new(),
+            asked: None,
+        })
+    });
+    let Ok(mut known) = known.lock() else {
+        return HashMap::new();
+    };
+    let missing = unstarted.iter().any(|id| !known.cwds.contains_key(*id));
+    if missing && known.asked.is_none_or(|at| at.elapsed() >= RETRY) {
+        known.asked = Some(Instant::now());
+        let found = held_by(&codex_pids(), locks);
+        known.cwds.extend(found);
+    }
+    unstarted
+        .iter()
+        .filter_map(|id| Some((id.to_string(), known.cwds.get(*id)?.clone())))
+        .collect()
+}
+
+/// How long a session nobody could place waits before it is asked about again.
+const RETRY: Duration = Duration::from_secs(10);
+
+fn codex_pids() -> Vec<String> {
+    run("pgrep", &["-x", "codex"])
+        .split_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+/// For each session lock these processes hold, where the holder stands.
+fn held_by(pids: &[String], locks: &Path) -> HashMap<String, PathBuf> {
+    if pids.is_empty() {
+        return HashMap::new();
+    }
+    let pids = pids.join(",");
+    // `lsof` names files by their resolved path, and `/var` on macOS — or a
+    // symlinked home anywhere — is not one.
+    let locks = locks.canonicalize().unwrap_or_else(|_| locks.to_path_buf());
+    let locks = locks.as_path();
+    parse_held(&run("lsof", &["-w", "-a", "-p", &pids, "-F", "fn"]), locks)
+}
+
+/// `lsof -F fn` output — `p<pid>`, then `f<fd>` and `n<name>` per open file —
+/// as session id to the holder's working directory.
+fn parse_held(text: &str, lock_dir: &Path) -> HashMap<String, PathBuf> {
+    let mut held = HashMap::new();
+    let mut cwd: Option<PathBuf> = None;
+    let mut locks: Vec<String> = Vec::new();
+    let mut fd = "";
+    // One process's worth: its locks go to where it stands. A daemon holding
+    // a lock stands at `/`, which says nothing.
+    let mut flush = |cwd: &mut Option<PathBuf>, locks: &mut Vec<String>| {
+        if let Some(at) = cwd.take().filter(|at| at.parent().is_some()) {
+            for id in locks.drain(..) {
+                held.insert(id, at.clone());
+            }
+        }
+        locks.clear();
+    };
+    for line in text.lines() {
+        match line.split_at_checked(1) {
+            Some(("p", _)) => flush(&mut cwd, &mut locks),
+            Some(("f", f)) => fd = f,
+            Some(("n", name)) if fd == "cwd" => cwd = Some(PathBuf::from(name)),
+            Some(("n", name)) => {
+                if let Some(id) = session_lock(Path::new(name), lock_dir) {
+                    locks.push(id.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    flush(&mut cwd, &mut locks);
+    held
+}
+
+/// The session id a path names, when it is a session's writer lock in the
+/// Codex directory being read — not one of another `CODEX_HOME`'s.
+fn session_lock<'a>(path: &'a Path, locks: &Path) -> Option<&'a str> {
+    let id = path.file_name()?.to_str()?.strip_suffix(".lock")?;
+    (path.parent() == Some(locks) && is_uuid(id)).then_some(id)
+}
+
+/// A helper program's output, or nothing when it is not there.
+fn run(program: &str, args: &[&str]) -> String {
+    Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default()
 }
 
 /// One session, from the two ends of its rollout.
@@ -538,9 +665,49 @@ mod tests {
         assert_eq!(jobs[0].word(), "IDLE");
         assert_eq!(jobs[0].summary, "nothing asked yet");
         assert!(jobs[0].created_at.is_some(), "aged from its lock");
-        // It has not said where it is, so it is not put anywhere.
+        // Nothing holds this lock, so nothing says where it is, and it is not
+        // put anywhere.
         assert_eq!(jobs[0].repo(), "no directory");
         assert_eq!(jobs[0].open_command(), ["codex", "resume", ID]);
+    }
+
+    #[test]
+    fn a_session_not_yet_asked_anything_stands_where_its_process_does() {
+        // What the owner saw next: a Codex session opened in a tab under
+        // savras, drawn under "no directory". Its process holds the lock and
+        // stands in savras, and that is where it goes.
+        let lsof = "p8048\nfcwd\nn/code/savras\nf3\nn/dev/ttys004\n\
+                    f19\nn/h/.codex/thread-writer-locks/01a0cfa4-7b7e-7250-8008-6df63f7f61b0.lock\n\
+                    f20\nn/h/.codex/thread-writer-locks/.coordination.lock\n\
+                    p99\nfcwd\nn/\n\
+                    f7\nn/h/.codex/thread-writer-locks/01a0ccda-8ca8-7902-94df-5786dc86d974.lock\n";
+        let held = parse_held(lsof, Path::new("/h/.codex/thread-writer-locks"));
+        assert_eq!(
+            held.get("01a0cfa4-7b7e-7250-8008-6df63f7f61b0"),
+            Some(&PathBuf::from("/code/savras"))
+        );
+        assert_eq!(
+            held.len(),
+            1,
+            "a holder at / says nothing, and a lock that is not a session is no session"
+        );
+    }
+
+    #[test]
+    fn a_process_holding_a_lock_is_found_by_lsof() {
+        // The real `lsof`, with this test as the holder.
+        if Command::new("lsof").arg("-v").output().is_err() {
+            return;
+        }
+        let s = Scratch::new("held");
+        let lock = s.0.join("thread-writer-locks").join(format!("{ID}.lock"));
+        std::fs::write(&lock, "").unwrap();
+        let _held = std::fs::File::open(&lock).unwrap();
+        let held = held_by(
+            &[std::process::id().to_string()],
+            &s.0.join("thread-writer-locks"),
+        );
+        assert_eq!(held.get(ID), Some(&std::env::current_dir().unwrap()));
     }
 
     #[test]

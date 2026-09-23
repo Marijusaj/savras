@@ -13,6 +13,7 @@ mod host;
 mod job;
 mod panel;
 mod ping;
+mod relay;
 mod remote;
 mod sh;
 #[cfg(test)]
