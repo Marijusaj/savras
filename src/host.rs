@@ -354,6 +354,9 @@ enum Action {
     ConfirmClean,
     /// The second `c`: empty it.
     Clean,
+    /// `R` in the panel: the relay of the board the cursor is in, as a tab —
+    /// started if it is not running.
+    Relay,
 }
 
 /// A question the panel is holding open, waiting for the same key again.
@@ -601,6 +604,10 @@ struct Pane {
     /// genuinely empty — so without this, opening a session shows a black
     /// rectangle and looks like something broke rather than like waiting.
     drew: bool,
+    /// For a board relay's tab, the repository it relays — see [`relay_tab`].
+    /// Kept rather than read back out of `reopen`, because an argument list
+    /// is not something to parse for what a pane is.
+    relay: Option<String>,
 }
 
 impl Pane {
@@ -617,7 +624,9 @@ impl Pane {
     /// shell that is usually the host and the directory, which is the whole
     /// difference between "a shell" and "a shell on the other machine".
     fn shell(&mut self, fallback: &str) -> Shell {
+        // The program is `svr`, which says nothing; the title says which board.
         let name = match self.work.master.process_group_leader() {
+            _ if self.relay.is_some() => Some("relay".to_string()),
             Some(pid) => {
                 if self.running.as_ref().map(|(was, _)| *was) != Some(pid) {
                     self.running = process_name(pid).map(|name| (pid, name));
@@ -893,6 +902,7 @@ impl Tabs {
                 drew: false,
                 opened: false,
                 remote: None,
+                relay: None,
             }],
             current: 0,
         }
@@ -1096,6 +1106,25 @@ impl Tabs {
         if index < self.open.len() {
             self.current = index;
         }
+    }
+
+    /// The tab relaying `repo`'s board, running or stopped.
+    fn relay_at(&self, repo: &str) -> Option<usize> {
+        self.open
+            .iter()
+            .position(|tab| tab.relay.as_deref() == Some(repo))
+    }
+
+    /// The repositories whose board a tab is relaying right now.
+    fn relays(&mut self) -> Vec<String> {
+        self.open
+            .iter_mut()
+            .filter(|tab| tab.relay.is_some())
+            .filter_map(|tab| match tab.work.exit_code() {
+                None => tab.relay.clone(),
+                Some(_) => None,
+            })
+            .collect()
     }
 
     fn push(&mut self, tab: Pane) {
@@ -1456,6 +1485,7 @@ fn event_loop(
             };
             app.set_tabs(front, session.tabs.shorts(), named);
             app.set_open_boards(session.boards.repos());
+            app.set_relays(session.tabs.relays());
             terminal
                 .draw(|frame| draw(frame, &mut app, &session, focus, dead, confirming.as_ref()))?;
             last_draw = Instant::now();
@@ -1613,6 +1643,35 @@ fn event_loop(
                             app.error = Some(
                                 "no session of this machine's is selected, so there is \
                                  no repository to show a board for"
+                                    .to_string(),
+                            )
+                        }
+                    },
+                    Action::Relay => match app.selected_repo() {
+                        Some(repo)
+                            if crate::board::Boards::at(app.board_dir.clone()).exists(&repo) =>
+                        {
+                            match relay_tab(&mut session, &repo) {
+                                Ok(()) => {
+                                    session.boards.hide();
+                                    focus = Focus::Work;
+                                    repaint(terminal)?;
+                                }
+                                Err(e) => {
+                                    app.error = Some(format!("could not start the relay: {e}"))
+                                }
+                            }
+                        }
+                        Some(repo) => {
+                            app.error = Some(format!(
+                                "{} has no board to relay — b opens it, and c there makes one",
+                                crate::board::topic_name(&repo)
+                            ))
+                        }
+                        None => {
+                            app.error = Some(
+                                "no session of this machine's is selected, so there is \
+                                 no repository to relay a board for"
                                     .to_string(),
                             )
                         }
@@ -1965,6 +2024,7 @@ fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool>
         drew: false,
         opened: true,
         remote: None,
+        relay: None,
     });
     // Going to a session is the clearest possible way of saying you saw which
     // one it was.
@@ -1984,7 +2044,10 @@ fn close_finished_shells(session: &mut Session) -> bool {
     let done: Vec<usize> = (0..session.tabs.open.len())
         .filter(|i| {
             let tab = &mut session.tabs.open[*i];
+            // A relay keeps its last screen, like a session: why it stopped
+            // is on it.
             tab.short.is_none()
+                && tab.relay.is_none()
                 && tab.work.origin == Origin::Opened
                 && tab.work.exit_code().is_some()
         })
@@ -2057,6 +2120,50 @@ fn new_tab(session: &mut Session, app: &App, focus: Focus) -> Result<()> {
         drew: false,
         opened: false,
         remote: None,
+        relay: None,
+    });
+    Ok(())
+}
+
+/// Bring a repository's board relay to the front, starting it if it is not
+/// running — `R` in the panel.
+///
+/// A tab rather than a thread in the panel, for two reasons: what the relay
+/// did is a log you want to read, and it spends the owner's usage, so it
+/// should be somewhere you can see it and stop it. It runs the `svr` that is
+/// running this panel, so the relay is the same build as the panel showing it.
+fn relay_tab(session: &mut Session, repo: &str) -> Result<()> {
+    if let Some(at) = session.tabs.relay_at(repo) {
+        if session.tabs.open[at].work.exit_code().is_none() {
+            session.tabs.current = at;
+            return Ok(());
+        }
+        // Stopped: its last screen was worth keeping until now, and now a
+        // fresh one takes its place.
+        session.tabs.close(at);
+    }
+    let exe = std::env::current_exe().context("finding the svr binary to run the relay")?;
+    let command = vec![
+        exe.to_string_lossy().to_string(),
+        "board".to_string(),
+        "relay".to_string(),
+        "--repo".to_string(),
+        repo.to_string(),
+    ];
+    let cwd = PathBuf::from(repo);
+    let (cols, rows) = session.work_size();
+    let work = Work::spawn(&command, Some(&cwd), cols, rows, Origin::Opened)?;
+    session.tabs.push(Pane {
+        short: None,
+        reopen: Some((command, cwd)),
+        work,
+        redraw: None,
+        running: None,
+        standing: None,
+        drew: false,
+        opened: false,
+        remote: None,
+        relay: Some(repo.to_string()),
     });
     Ok(())
 }
@@ -2101,6 +2208,7 @@ fn new_remote_tab(session: &mut Session, host: &str) -> Result<()> {
         drew: false,
         opened: false,
         remote: Some((host.to_string(), name)),
+        relay: None,
     });
     Ok(())
 }
@@ -2531,6 +2639,9 @@ fn panel_key(bytes: &[u8], app: &mut App, confirming: Option<&Confirm>) -> Actio
         // Empty the board under the cursor, having asked. On any other row
         // there is nothing to empty, and nothing happens.
         [b'c'] => return Action::ConfirmClean,
+        // Capital, like `Q`: a relay spends the owner's Claude usage, so it
+        // should not start on a slip of the finger meant for `r`.
+        [b'R'] => return Action::Relay,
         [b'j'] | [ESC, b'[', b'B'] => app.step(1),
         [b'k'] | [ESC, b'[', b'A'] => app.step(-1),
         [b'g'] => app.jump(false),
@@ -3391,6 +3502,7 @@ mod tests {
             drew: false,
             opened: true,
             remote: None,
+            relay: None,
         }
     }
 
@@ -3797,6 +3909,37 @@ mod tests {
         assert_eq!(session.tabs.shells(), 1);
         // The session panes are untouched, dead or alive.
         assert_eq!(session.tabs.shorts(), ["aaa", "bbb"]);
+    }
+
+    #[test]
+    fn a_relay_tab_keeps_its_last_screen_and_is_marked_only_while_it_runs() {
+        // Why a relay stopped — a usage limit, no board — is on its screen,
+        // so it stays like a session's pane does. The board row's mark is
+        // about what is running, not what is open.
+        let mut tabs = three_tabs();
+        let mut relay = pane(None);
+        relay.work.origin = Origin::Opened;
+        relay.relay = Some("/code/web-app".into());
+        tabs.push(relay);
+        let mut session = session_with(tabs);
+        assert_eq!(session.tabs.relay_at("/code/web-app"), Some(3));
+        assert_eq!(session.tabs.relay_at("/code/other"), None);
+        assert_eq!(session.tabs.relays(), ["/code/web-app"]);
+        assert_eq!(session.tabs.open[3].shell("zsh").name, "relay");
+
+        let _ = session.tabs.open[3].work.child.kill();
+        let _ = session.tabs.open[3].work.child.wait();
+        assert!(!close_finished_shells(&mut session));
+        assert_eq!(session.tabs.relay_at("/code/web-app"), Some(3));
+        assert!(session.tabs.relays().is_empty());
+    }
+
+    #[test]
+    fn capital_r_asks_for_the_relay_and_small_r_still_refreshes() {
+        let f = three_sessions();
+        let mut app = App::new(f.0.clone());
+        assert!(matches!(panel_key(b"R", &mut app, None), Action::Relay));
+        assert!(matches!(panel_key(b"r", &mut app, None), Action::Nothing));
     }
 
     /// A `Session` around a set of tabs, for the bookkeeping that needs one.

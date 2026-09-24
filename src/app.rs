@@ -151,6 +151,8 @@ pub struct App {
     pub board_rows: Vec<BoardRow>,
     /// Which boards are open as tabs in the working pane, by repository.
     open_boards: Vec<String>,
+    /// Which boards a relay tab is relaying right now, by repository.
+    relays: Vec<String>,
     /// Which repository a directory belongs to, worked out once per directory.
     /// See [`App::board_for`].
     topics: HashMap<PathBuf, String>,
@@ -423,6 +425,7 @@ impl App {
             },
             board_rows: Vec::new(),
             open_boards: Vec::new(),
+            relays: Vec::new(),
             topics: HashMap::new(),
             should_quit: false,
         };
@@ -470,6 +473,16 @@ impl App {
     /// about a shell or a session needs to know they exist.
     pub fn set_open_boards(&mut self, open: Vec<String>) {
         self.open_boards = open;
+    }
+
+    /// Tell the panel which boards a relay tab is running for.
+    pub fn set_relays(&mut self, relays: Vec<String>) {
+        self.relays = relays;
+    }
+
+    /// Whether a relay is running for this repository's board.
+    pub fn relayed(&self, repo: &str) -> bool {
+        self.relays.iter().any(|r| r == repo)
     }
 
     /// What the nth pane of your own is called.
