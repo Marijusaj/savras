@@ -356,6 +356,68 @@ pub fn stop_remote(host: &str, pid: u32) -> Result<String> {
     Ok(String::new())
 }
 
+/// Delete a Codex session: stop whatever has it open, then have Codex forget
+/// it. Codex's own files are left to Codex — Savras only reads them.
+///
+/// A session nobody has asked anything has no rollout yet, so there is nothing
+/// for `codex delete` to find; stopping its process is all there is, and the
+/// row goes when the lock does.
+pub fn delete_codex(dir: &Path, id: &str) -> Result<String> {
+    if let Some(pid) = crate::codex::holder_now(dir, id) {
+        let _ = Command::new("kill")
+            .arg(pid.to_string())
+            .stdin(Stdio::null())
+            .output();
+        // A signalled Codex is still writing its way out, lock held, for a
+        // moment. Deleting under it races its last writes — the same reason
+        // `claude stop` finishes before `claude rm`.
+        let released = let_go(
+            || crate::codex::holder_now(dir, id).is_some(),
+            15, // each look is a pgrep and an lsof, ~100ms: about 3s in all
+            std::time::Duration::from_millis(100),
+        );
+        if !released {
+            anyhow::bail!("Codex did not stop (pid {pid}), so it was not deleted");
+        }
+    }
+    if !crate::codex::has_rollout(dir, id) {
+        return Ok(String::new());
+    }
+    // `--force` because the panel has already asked, and without a terminal
+    // Codex refuses rather than asking again. It wants the UUID for that,
+    // which is what `id` is.
+    let out = Command::new("codex")
+        .args(["delete", "--force"])
+        .arg(id)
+        .stdin(Stdio::null())
+        .output()
+        .context("running `codex delete` — is Codex on your PATH?")?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        let why = why.trim();
+        anyhow::bail!(
+            "codex delete failed{}",
+            if why.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", first_line(why))
+            }
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Whether something let go within `tries` looks, `every` apart.
+fn let_go(mut held: impl FnMut() -> bool, tries: u32, every: std::time::Duration) -> bool {
+    for _ in 0..tries {
+        if !held() {
+            return true;
+        }
+        std::thread::sleep(every);
+    }
+    !held()
+}
+
 pub fn delete(short: &str) -> Result<String> {
     let _ = Command::new("claude")
         .arg("stop")
@@ -798,5 +860,31 @@ mod tests {
         assert!(!said.contains("starting"), "nothing was started: {said}");
         // And nothing was handed to the errand thread to do.
         assert!(rx.try_recv().is_err(), "an errand was queued anyway");
+    }
+
+    #[test]
+    fn a_codex_session_never_asked_anything_is_gone_once_nothing_holds_it() {
+        // No lock held and no rollout: nothing for `codex delete` to find, so
+        // it is not run, and not failing is the whole answer.
+        let dir = std::env::temp_dir().join(format!("savras-test-codex-rm-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        let id = "0b1d2c3e-4f50-7162-8374-95a6b7c8d9e0";
+        assert!(delete_codex(&dir, id).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_codex_that_will_not_stop_is_not_deleted_under_it() {
+        let quick = std::time::Duration::from_millis(1);
+        assert!(!let_go(|| true, 3, quick), "still held is not let go");
+        let mut looks = 0;
+        assert!(let_go(
+            || {
+                looks += 1;
+                looks < 3
+            },
+            5,
+            quick
+        ));
     }
 }

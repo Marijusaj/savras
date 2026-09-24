@@ -373,6 +373,9 @@ enum Confirm {
         /// row it is about, so answering cannot act on a different session
         /// than the one named.
         on: Option<(String, u32)>,
+        /// The Codex session id, when it is Codex's: `claude rm` has never
+        /// heard of it, and Codex keeps it somewhere else entirely.
+        codex: Option<String>,
     },
     /// Empty a repository's board. Named and counted, because what goes is
     /// what the agents said, and nothing brings it back.
@@ -1523,6 +1526,8 @@ fn event_loop(
                                     .machine
                                     .as_ref()
                                     .and_then(|remote| Some((remote.host.clone(), remote.pid?))),
+                                codex: (job.client == crate::job::Client::Codex)
+                                    .then(|| job.session_id.clone()),
                             });
                         }
                     }
@@ -1538,7 +1543,13 @@ fn event_loop(
                             app.refresh();
                             app.error = Some(said);
                         }
-                        if let Some(Confirm::Delete { short, name, on }) = &was_confirming {
+                        if let Some(Confirm::Delete {
+                            short,
+                            name,
+                            on,
+                            codex,
+                        }) = &was_confirming
+                        {
                             // Where you land is decided now, while the row is
                             // still there to be next to. See `App::successor`.
                             let next = app.successor(short);
@@ -1550,6 +1561,7 @@ fn event_loop(
                                 short.clone(),
                                 name.clone(),
                                 on.clone(),
+                                codex.clone(),
                             );
                             // The session you were in is replaced by its
                             // neighbour, opened as flipping would open it; one
@@ -2252,11 +2264,23 @@ fn delete_session(
     short: String,
     name: String,
     on: Option<(String, u32)>,
+    codex: Option<String>,
 ) {
     if let Some(index) = session.tabs.position(&short) {
         session.tabs.close(index);
     }
     let outcome = outcome.clone();
+    if let Some(id) = codex {
+        let dir = app.codex_dir.clone();
+        app.error = Some(format!("deleting {name}…"));
+        std::thread::spawn(move || {
+            let _ = outcome.send(
+                crate::agents::delete_codex(&dir, &id)
+                    .with_context(|| format!("could not delete {name}")),
+            );
+        });
+        return;
+    }
     match on {
         // On another machine there is no daemon to ask and nothing local to
         // remove: the session is a process over there, and stopping it is what
@@ -2297,6 +2321,9 @@ fn attend_front(session: &mut Session, app: &mut App) {
 /// what to do next, not about typing into a dead terminal.
 fn dead_pane_key(bytes: &[u8]) -> Action {
     match bytes {
+        // The banner offers it, and it is the only way to the panel — where
+        // `d` gets rid of a session that will never open again.
+        _ if bytes.contains(&FOCUS_TOGGLE) => Action::Focus(Focus::Panel),
         [b'\r'] | [b'\n'] => Action::Reopen,
         // Closing the tab, not Savras: the other sessions you have open are
         // not implicated in this one exiting.
@@ -3058,6 +3085,7 @@ mod tests {
             short: "aaa".into(),
             name: "OLD".into(),
             on: None,
+            codex: None,
         };
         assert!(asking.question().contains("OLD"), "{}", asking.question());
         assert!(matches!(
@@ -4125,6 +4153,7 @@ mod tests {
             short: "claude-box:915226".into(),
             name: "webapp-f9".into(),
             on: Some(("claude-box".into(), 915226)),
+            codex: None,
         };
         let said = asking.question();
         assert!(said.contains("stop"), "{said}");
@@ -4198,6 +4227,16 @@ mod tests {
         // not implicated in this one exiting.
         assert!(matches!(dead_pane_key(b"q"), Action::CloseFront));
         assert!(matches!(dead_pane_key(b"z"), Action::Nothing));
+    }
+
+    #[test]
+    fn ctrl_g_on_a_dead_pane_goes_to_the_panel_as_the_banner_says() {
+        // Swallowed once, which left a tab that could not be resumed with no
+        // way to the panel and so no way to delete it.
+        assert!(matches!(
+            dead_pane_key(&[FOCUS_TOGGLE]),
+            Action::Focus(Focus::Panel)
+        ));
     }
 
     #[test]
