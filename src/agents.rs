@@ -368,6 +368,17 @@ pub fn delete_codex(dir: &Path, id: &str) -> Result<String> {
             .arg(pid.to_string())
             .stdin(Stdio::null())
             .output();
+        // A signalled Codex is still writing its way out, lock held, for a
+        // moment. Deleting under it races its last writes — the same reason
+        // `claude stop` finishes before `claude rm`.
+        let released = let_go(
+            || crate::codex::holder_now(dir, id).is_some(),
+            15, // each look is a pgrep and an lsof, ~100ms: about 3s in all
+            std::time::Duration::from_millis(100),
+        );
+        if !released {
+            anyhow::bail!("Codex did not stop (pid {pid}), so it was not deleted");
+        }
     }
     if !crate::codex::has_rollout(dir, id) {
         return Ok(String::new());
@@ -394,6 +405,17 @@ pub fn delete_codex(dir: &Path, id: &str) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Whether something let go within `tries` looks, `every` apart.
+fn let_go(mut held: impl FnMut() -> bool, tries: u32, every: std::time::Duration) -> bool {
+    for _ in 0..tries {
+        if !held() {
+            return true;
+        }
+        std::thread::sleep(every);
+    }
+    !held()
 }
 
 pub fn delete(short: &str) -> Result<String> {
@@ -849,5 +871,20 @@ mod tests {
         let id = "0b1d2c3e-4f50-7162-8374-95a6b7c8d9e0";
         assert!(delete_codex(&dir, id).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_codex_that_will_not_stop_is_not_deleted_under_it() {
+        let quick = std::time::Duration::from_millis(1);
+        assert!(!let_go(|| true, 3, quick), "still held is not let go");
+        let mut looks = 0;
+        assert!(let_go(
+            || {
+                looks += 1;
+                looks < 3
+            },
+            5,
+            quick
+        ));
     }
 }
