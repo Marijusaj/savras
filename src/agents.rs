@@ -372,8 +372,11 @@ pub fn delete_codex(dir: &Path, id: &str) -> Result<String> {
     if !crate::codex::has_rollout(dir, id) {
         return Ok(String::new());
     }
+    // `--force` because the panel has already asked, and without a terminal
+    // Codex refuses rather than asking again. It wants the UUID for that,
+    // which is what `id` is.
     let out = Command::new("codex")
-        .arg("delete")
+        .args(["delete", "--force"])
         .arg(id)
         .stdin(Stdio::null())
         .output()
@@ -835,5 +838,16 @@ mod tests {
         assert!(!said.contains("starting"), "nothing was started: {said}");
         // And nothing was handed to the errand thread to do.
         assert!(rx.try_recv().is_err(), "an errand was queued anyway");
+    }
+
+    #[test]
+    fn a_codex_session_never_asked_anything_is_gone_once_nothing_holds_it() {
+        // No lock held and no rollout: nothing for `codex delete` to find, so
+        // it is not run, and not failing is the whole answer.
+        let dir = std::env::temp_dir().join(format!("savras-test-codex-rm-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("sessions")).unwrap();
+        let id = "0b1d2c3e-4f50-7162-8374-95a6b7c8d9e0";
+        assert!(delete_codex(&dir, id).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
