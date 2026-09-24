@@ -79,12 +79,7 @@ pub fn load(dir: &Path) -> Vec<Job> {
     }
     let names = names(dir);
     let rollouts = rollouts(&dir.join("sessions"), &live);
-    let unstarted: Vec<&str> = live
-        .iter()
-        .map(String::as_str)
-        .filter(|id| !rollouts.contains_key(*id))
-        .collect();
-    let standing = standing(&dir.join("thread-writer-locks"), &unstarted);
+    let held = hold(&dir.join("thread-writer-locks"), &live);
     live.iter()
         .map(|id| {
             let named = names.get(id).cloned();
@@ -96,7 +91,10 @@ pub fn load(dir: &Path) -> Vec<Job> {
             // name and no rollout — Codex writes that on the first turn. It is
             // a session you can type into, so it is a row; it simply has
             // nothing to say yet.
-            .unwrap_or_else(|| waiting_to_start(dir, id, named, standing.get(id).cloned()))
+            .unwrap_or_else(|| {
+                let cwd = held.get(id).and_then(|holder| holder.cwd.clone());
+                waiting_to_start(dir, id, named, cwd)
+            })
         })
         .collect()
 }
@@ -186,7 +184,7 @@ fn rollouts(sessions: &Path, live: &[String]) -> HashMap<String, PathBuf> {
 /// Its lock is the only file it has, so the lock is where its age comes from,
 /// and where it is working is not written down anywhere until it answers
 /// something — so it is asked of the process holding that lock, see
-/// [`standing`]. When nothing can say, it is drawn with no repository rather
+/// [`hold`]. When nothing can say, it is drawn with no repository rather
 /// than a guessed one, and moves under its heading the moment it is used.
 fn waiting_to_start(dir: &Path, id: &str, name: Option<String>, cwd: Option<PathBuf>) -> Job {
     let lock = dir.join("thread-writer-locks").join(format!("{id}.lock"));
@@ -214,8 +212,9 @@ fn waiting_to_start(dir: &Path, id: &str, name: Option<String>, cwd: Option<Path
     }
 }
 
-/// Where each Codex process holding a session's lock is standing — the only
-/// thing that says where a session is before its first turn.
+/// Which process holds each session's lock, and where it stands — the only
+/// thing that says where a session is before its first turn, and the only
+/// thing that says which tab it is running in.
 ///
 /// Codex writes the directory into the rollout, and the rollout on the first
 /// turn: until then a session started in a tab beside the panel sat under "no
@@ -223,38 +222,92 @@ fn waiting_to_start(dir: &Path, id: &str, name: Option<String>, cwd: Option<Path
 /// open from the moment the session starts, so whoever holds it is the
 /// session, and its working directory is where it was started.
 ///
+/// The holder's pid matters as much as its directory. Codex refuses `codex
+/// resume` on a session another process holds — "This conversation is open
+/// in another app" — so enter on the row has to know who has it, and
+/// [`holders`] is how the panel finds the tab that does.
+///
 /// One pass for every session that needs it: `pgrep` for the Codex processes,
 /// then one `lsof` over just those, which lists each one's locks and its
 /// working directory together — tens of milliseconds, on the panel's own
 /// thread. Asking `lsof` by file instead walks every process on the machine,
-/// a quarter of a second per session. An answer is kept for good, since a
-/// process's start directory does not move; a miss is asked again, but not
-/// more than every [`RETRY`].
-fn standing(locks: &Path, unstarted: &[&str]) -> HashMap<String, PathBuf> {
-    struct Known {
-        cwds: HashMap<String, PathBuf>,
-        asked: Option<Instant>,
-    }
-    static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
-    let known = KNOWN.get_or_init(|| {
-        Mutex::new(Known {
-            cwds: HashMap::new(),
-            asked: None,
-        })
-    });
-    let Ok(mut known) = known.lock() else {
+/// a quarter of a second per session. An answer is kept for as long as the
+/// session's lock is there, since a holder neither moves nor changes pid; a
+/// miss is asked again, but not more than every [`RETRY`].
+fn hold(locks: &Path, live: &[String]) -> HashMap<String, Holder> {
+    let Ok(mut known) = known().lock() else {
         return HashMap::new();
     };
-    let missing = unstarted.iter().any(|id| !known.cwds.contains_key(*id));
+    // A session that exited is forgotten, so the same id resumed later is
+    // asked about again rather than handed its old holder.
+    known.held.retain(|id, _| live.contains(id));
+    let missing = live.iter().any(|id| !known.held.contains_key(id));
     if missing && known.asked.is_none_or(|at| at.elapsed() >= RETRY) {
         known.asked = Some(Instant::now());
         let found = held_by(&codex_pids(), locks);
-        known.cwds.extend(found);
+        known.held.extend(found);
     }
-    unstarted
-        .iter()
-        .filter_map(|id| Some((id.to_string(), known.cwds.get(*id)?.clone())))
-        .collect()
+    known.held.clone()
+}
+
+/// The pid holding each running session's lock, by session id, as [`load`]
+/// last found it. Costs nothing: it is the answer `load` already paid for.
+pub fn holders() -> HashMap<String, i32> {
+    known()
+        .lock()
+        .map(|known| {
+            known
+                .held
+                .iter()
+                .map(|(id, holder)| (id.clone(), holder.pid))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The pid holding this one session's lock, asked now rather than remembered.
+///
+/// For the moment enter is pressed on its row: a remembered holder can have
+/// exited since, and the session been resumed somewhere else, in the two
+/// seconds between refreshes. A keypress can afford the `lsof`.
+pub fn holder_now(dir: &Path, id: &str) -> Option<i32> {
+    let found = held_by(&codex_pids(), &dir.join("thread-writer-locks"));
+    let pid = found.get(id).map(|holder| holder.pid);
+    if let Ok(mut known) = known().lock() {
+        known.held.remove(id);
+        known.held.extend(found);
+    }
+    pid
+}
+
+/// Whether a session has a rollout — that is, whether it was ever asked
+/// anything. Codex writes the file on the first turn, and `codex resume`
+/// finds nothing to resume without it: "No saved session found".
+pub fn has_rollout(dir: &Path, id: &str) -> bool {
+    rollouts(&dir.join("sessions"), &[id.to_string()]).contains_key(id)
+}
+
+/// Who holds a session's lock: the process, and where it stands when that
+/// says anything.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Holder {
+    pid: i32,
+    cwd: Option<PathBuf>,
+}
+
+struct Known {
+    held: HashMap<String, Holder>,
+    asked: Option<Instant>,
+}
+
+fn known() -> &'static Mutex<Known> {
+    static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
+    KNOWN.get_or_init(|| {
+        Mutex::new(Known {
+            held: HashMap::new(),
+            asked: None,
+        })
+    })
 }
 
 /// How long a session nobody could place waits before it is asked about again.
@@ -267,8 +320,8 @@ fn codex_pids() -> Vec<String> {
         .collect()
 }
 
-/// For each session lock these processes hold, where the holder stands.
-fn held_by(pids: &[String], locks: &Path) -> HashMap<String, PathBuf> {
+/// For each session lock these processes hold, who holds it.
+fn held_by(pids: &[String], locks: &Path) -> HashMap<String, Holder> {
     if pids.is_empty() {
         return HashMap::new();
     }
@@ -281,25 +334,32 @@ fn held_by(pids: &[String], locks: &Path) -> HashMap<String, PathBuf> {
 }
 
 /// `lsof -F fn` output — `p<pid>`, then `f<fd>` and `n<name>` per open file —
-/// as session id to the holder's working directory.
-fn parse_held(text: &str, lock_dir: &Path) -> HashMap<String, PathBuf> {
+/// as session id to the process holding it and where that process stands.
+fn parse_held(text: &str, lock_dir: &Path) -> HashMap<String, Holder> {
     let mut held = HashMap::new();
+    let mut pid: Option<i32> = None;
     let mut cwd: Option<PathBuf> = None;
     let mut locks: Vec<String> = Vec::new();
     let mut fd = "";
-    // One process's worth: its locks go to where it stands. A daemon holding
-    // a lock stands at `/`, which says nothing.
-    let mut flush = |cwd: &mut Option<PathBuf>, locks: &mut Vec<String>| {
-        if let Some(at) = cwd.take().filter(|at| at.parent().is_some()) {
+    // One process's worth: its locks go to it. A daemon holding a lock
+    // stands at `/`, which says nothing about where the session is — but it
+    // is still the holder, and still why a resume would be refused.
+    let mut flush = |pid: Option<i32>, cwd: &mut Option<PathBuf>, locks: &mut Vec<String>| {
+        let at = cwd.take().filter(|at| at.parent().is_some());
+        if let Some(pid) = pid {
             for id in locks.drain(..) {
-                held.insert(id, at.clone());
+                let cwd = at.clone();
+                held.insert(id, Holder { pid, cwd });
             }
         }
         locks.clear();
     };
     for line in text.lines() {
         match line.split_at_checked(1) {
-            Some(("p", _)) => flush(&mut cwd, &mut locks),
+            Some(("p", next)) => {
+                flush(pid, &mut cwd, &mut locks);
+                pid = next.parse().ok();
+            }
             Some(("f", f)) => fd = f,
             Some(("n", name)) if fd == "cwd" => cwd = Some(PathBuf::from(name)),
             Some(("n", name)) => {
@@ -310,7 +370,7 @@ fn parse_held(text: &str, lock_dir: &Path) -> HashMap<String, PathBuf> {
             _ => {}
         }
     }
-    flush(&mut cwd, &mut locks);
+    flush(pid, &mut cwd, &mut locks);
     held
 }
 
@@ -669,6 +729,16 @@ mod tests {
         // put anywhere.
         assert_eq!(jobs[0].repo(), "no directory");
         assert_eq!(jobs[0].open_command(), ["codex", "resume", ID]);
+        // And nothing to resume: enter must not start a `codex resume` that
+        // answers "No saved session found" and leaves a dead tab.
+        assert!(!has_rollout(&s.0, ID));
+    }
+
+    #[test]
+    fn a_session_that_has_been_asked_something_has_a_rollout() {
+        let s = Scratch::new("rollout").session(ID, &[&meta("/tmp/repo"), STARTED]);
+        assert!(has_rollout(&s.0, ID));
+        assert!(!has_rollout(&s.0, "01a0cfa4-7b7e-7250-8008-6df63f7f61b0"));
     }
 
     #[test]
@@ -684,13 +754,32 @@ mod tests {
         let held = parse_held(lsof, Path::new("/h/.codex/thread-writer-locks"));
         assert_eq!(
             held.get("01a0cfa4-7b7e-7250-8008-6df63f7f61b0"),
-            Some(&PathBuf::from("/code/savras"))
+            Some(&Holder {
+                pid: 8048,
+                cwd: Some(PathBuf::from("/code/savras"))
+            })
         );
         assert_eq!(
-            held.len(),
-            1,
-            "a holder at / says nothing, and a lock that is not a session is no session"
+            held.get(ID),
+            Some(&Holder { pid: 99, cwd: None }),
+            "a holder at / says nothing about where, but it is still who holds it"
         );
+        assert_eq!(held.len(), 2, "a lock that is not a session is no session");
+    }
+
+    #[test]
+    fn each_session_is_held_by_the_process_whose_locks_it_is_among() {
+        // Two Codex processes, one session each: the pid that comes before a
+        // lock is its holder, not the one before that. This is what enter on
+        // the row joins to a tab with.
+        let lsof = "p8048\nfcwd\nn/code/a\n\
+                    f19\nn/h/locks/01a0cfa4-7b7e-7250-8008-6df63f7f61b0.lock\n\
+                    p8101\nfcwd\nn/code/b\n\
+                    f7\nn/h/locks/01a0ccda-8ca8-7902-94df-5786dc86d974.lock\n";
+        let held = parse_held(lsof, Path::new("/h/locks"));
+        assert_eq!(held["01a0cfa4-7b7e-7250-8008-6df63f7f61b0"].pid, 8048);
+        assert_eq!(held[ID].pid, 8101);
+        assert_eq!(held[ID].cwd, Some(PathBuf::from("/code/b")));
     }
 
     #[test]
@@ -707,7 +796,13 @@ mod tests {
             &[std::process::id().to_string()],
             &s.0.join("thread-writer-locks"),
         );
-        assert_eq!(held.get(ID), Some(&std::env::current_dir().unwrap()));
+        assert_eq!(
+            held.get(ID),
+            Some(&Holder {
+                pid: std::process::id() as i32,
+                cwd: Some(std::env::current_dir().unwrap())
+            })
+        );
     }
 
     #[test]

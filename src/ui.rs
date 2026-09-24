@@ -1025,9 +1025,13 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
         // it is the only thing you do without coming here first.
         (None, Hint::Background) => Span::styled(
             truncate(
-                &match app.switch_hint() {
-                    Some(keys) => format!("ctrl-g focus · {keys} tabs · ctrl-t new"),
-                    None => "ctrl-g focus · ctrl-t new tab".to_string(),
+                // Only the keys that are Savras's: with `--new-tab off` the
+                // key is the pane's, and offering it would be a lie.
+                &match (app.switch_hint(), app.new_tab_hint()) {
+                    (Some(keys), Some(new)) => format!("ctrl-g focus · {keys} tabs · {new} new"),
+                    (None, Some(new)) => format!("ctrl-g focus · {new} new tab"),
+                    (Some(keys), None) => format!("ctrl-g focus · {keys} tabs"),
+                    (None, None) => "ctrl-g focus".to_string(),
                 },
                 area.width as usize,
             ),

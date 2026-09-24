@@ -26,7 +26,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::{App, Front, GroupBy, Row, Shell};
 use crate::focus;
-use crate::job::Job;
+use crate::job::{Client, Job};
 use crate::ping::Ping;
 use crate::ui::{self, Hint};
 use crate::watch::Watch;
@@ -47,7 +47,15 @@ const REPAINT: u8 = 0x0c; // Ctrl-L
 /// is not in the terminal's modifier encoding at all, so the terminal keeps
 /// every Command chord for its own tabs and the program inside never sees one.
 /// A control byte, on the other hand, arrives unchanged everywhere.
-const NEW_TAB: u8 = 0x14; // Ctrl-T
+///
+/// The default only: `--new-tab` moves it, and `--new-tab off` leaves it to
+/// the program in the pane — Codex reads it as its transcript.
+pub const NEW_TAB: u8 = 0x14; // Ctrl-T
+
+/// `ctrl-t`, for a control byte: the letter with its top three bits put back.
+fn ctrl_name(key: u8) -> String {
+    format!("ctrl-{}", (key | 0x60) as char)
+}
 
 /// Set in every pane Savras opens, so a Savras started inside one can tell
 /// that it would be the second panel in the same terminal.
@@ -60,7 +68,7 @@ const NESTED: &str = "SAVRAS_PANE";
 /// most of them, since Command chords and unmodified arrows are indistinguish-
 /// able from plain arrows in the byte stream — or it sent something Savras
 /// does not read. This says which, in the terminal you are actually using.
-pub fn keys(switch: Switch) -> Result<()> {
+pub fn keys(switch: Switch, new_tab: Option<u8>) -> Result<()> {
     println!("Press keys to see what this terminal sends. Ctrl-C to stop.\n");
     // Best effort: raw mode is what makes a bare `esc` or a ctrl chord reach
     // us at all, but a pipe has no terminal to put into it and reading the
@@ -75,7 +83,11 @@ pub fn keys(switch: Switch) -> Result<()> {
         }
         let bytes = &buffer[..n];
         // Raw mode means nothing moves the cursor for us.
-        print!("{:<24} {}\r\n", escaped(bytes), meaning(bytes, switch));
+        print!(
+            "{:<24} {}\r\n",
+            escaped(bytes),
+            meaning(bytes, switch, new_tab)
+        );
         let _ = std::io::stdout().flush();
         // Said after it is shown, so the key that stops this is reported like
         // any other — and a pipe, which arrives all at once, still says
@@ -88,6 +100,12 @@ pub fn keys(switch: Switch) -> Result<()> {
         crossterm::terminal::disable_raw_mode()?;
     }
     Ok(())
+}
+
+/// Whether these bytes are the new-tab key. With it given back, never: the
+/// byte goes on to the program in the pane like any other.
+fn opens_tab(bytes: &[u8], new_tab: Option<u8>) -> bool {
+    new_tab.is_some_and(|key| bytes.contains(&key))
 }
 
 /// Bytes as you would write them in a string, which is how they appear in
@@ -104,11 +122,11 @@ fn escaped(bytes: &[u8]) -> String {
 }
 
 /// What Savras would do with those bytes, said in the words the footer uses.
-fn meaning(bytes: &[u8], switch: Switch) -> &'static str {
+fn meaning(bytes: &[u8], switch: Switch, new_tab: Option<u8>) -> &'static str {
     if bytes.contains(&FOCUS_TOGGLE) {
         "ctrl-g — move the keyboard between the panel and your work"
-    } else if bytes.contains(&NEW_TAB) {
-        "ctrl-t — open a tab of your own"
+    } else if opens_tab(bytes, new_tab) {
+        "the new-tab key — open a tab of your own"
     } else if switch.back.is_some_and(|k| bytes.contains(&k)) {
         "the switch key — flip back a tab"
     } else if switch.forward.is_some_and(|k| bytes.contains(&k)) {
@@ -486,6 +504,12 @@ impl Work {
         self.exited
     }
 
+    /// The process Savras started in this pane — your shell, usually — which
+    /// everything you run in the tab descends from.
+    fn pid(&self) -> Option<i32> {
+        self.child.process_id().map(|pid| pid as i32)
+    }
+
     fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
         self.master.resize(PtySize {
             rows,
@@ -702,6 +726,122 @@ struct Tabs {
     current: usize,
     /// Which process group holds which session — see `adopt_sessions`.
     groups: Groups,
+    /// Whose child each Codex session's process is — see [`Lineage`].
+    lineage: Lineage,
+}
+
+/// The ancestors of each process holding a Codex session, which is what says
+/// which tab it is running in.
+///
+/// A Claude Code session is joined to its tab by process group, because
+/// Claude writes the pid it runs under. Codex writes none: the only pid there
+/// is the one holding its lock (see `codex::holders`), and that process may be
+/// a child of what is in the pane's foreground rather than its leader — so
+/// the join is by descent from the process the tab started, which everything
+/// run in it descends from.
+///
+/// A process's ancestors do not change while it lives, so one `ps` of the
+/// whole machine is paid once per Codex session, not once per refresh.
+#[derive(Default)]
+struct Lineage {
+    chains: HashMap<i32, Vec<i32>>,
+}
+
+impl Lineage {
+    /// The ancestors of each of these pids, asking only about the new ones.
+    fn of(&mut self, pids: &[i32]) -> &HashMap<i32, Vec<i32>> {
+        self.chains.retain(|pid, _| pids.contains(pid));
+        if pids.iter().any(|pid| !self.chains.contains_key(pid)) {
+            let parents = parents();
+            for pid in pids {
+                self.chains
+                    .entry(*pid)
+                    .or_insert_with(|| ancestors(*pid, &parents));
+            }
+        }
+        &self.chains
+    }
+}
+
+/// Every process's parent, in one `ps` — not one per pid, which is a fork
+/// each and would be most of a frame for a handful of sessions.
+fn parents() -> HashMap<i32, i32> {
+    Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid="])
+        .output()
+        .map(|out| parse_parents(&String::from_utf8_lossy(&out.stdout)))
+        .unwrap_or_default()
+}
+
+/// `ps -o pid=,ppid=` output as pid to parent.
+fn parse_parents(text: &str) -> HashMap<i32, i32> {
+    text.lines()
+        .filter_map(|line| {
+            let mut said = line.split_whitespace();
+            Some((said.next()?.parse().ok()?, said.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+/// A process and every process above it, nearest first. Stops at the top, at
+/// a pid `ps` did not list, and at a loop — a `ps` taken while processes come
+/// and go can say anything.
+fn ancestors(pid: i32, parents: &HashMap<i32, i32>) -> Vec<i32> {
+    let mut chain = vec![pid];
+    let mut at = pid;
+    while let Some(&parent) = parents.get(&at) {
+        if parent <= 0 || chain.contains(&parent) {
+            break;
+        }
+        chain.push(parent);
+        at = parent;
+    }
+    chain
+}
+
+/// Which of these panes a process runs in: the one whose own process is
+/// among its ancestors. Indices are into `roots`, one per pane.
+fn hosting(chain: &[i32], roots: &[Option<i32>]) -> Option<usize> {
+    roots
+        .iter()
+        .position(|root| root.is_some_and(|root| chain.contains(&root)))
+}
+
+/// The process each pane of your own started, or `None` for a pane that
+/// cannot host a session found this way: one Savras opened onto a session,
+/// or one on another machine, whose local process is only an ssh client.
+fn roots(open: &[Pane]) -> Vec<Option<i32>> {
+    open.iter()
+        .map(|pane| match pane.opened || pane.remote.is_some() {
+            true => None,
+            false => pane.work.pid(),
+        })
+        .collect()
+}
+
+/// Which pane each running Codex session on this machine is in, as pane
+/// index to the session's short id.
+fn codex_panes(
+    open: &[Pane],
+    known: &[Job],
+    codex: &HashMap<String, i32>,
+    lineage: &mut Lineage,
+) -> HashMap<usize, String> {
+    let pids: Vec<i32> = codex.values().copied().collect();
+    // With no Codex running this is an empty map and no `ps`.
+    let chains = lineage.of(&pids);
+    let roots = roots(open);
+    let mut found = HashMap::new();
+    for job in known
+        .iter()
+        .filter(|job| matches!(job.client, Client::Codex) && job.machine.is_none())
+    {
+        let chain = codex.get(&job.session_id).and_then(|pid| chains.get(pid));
+        if let Some(at) = chain.and_then(|chain| hosting(chain, &roots)) {
+            found.entry(at).or_insert_with(|| job.short.clone());
+        }
+    }
+    found
 }
 
 /// The session-holding process groups, and when they were last asked for.
@@ -730,6 +870,7 @@ impl Tabs {
     fn new(work: Work) -> Self {
         Tabs {
             groups: Groups::default(),
+            lineage: Lineage::default(),
             open: vec![Pane {
                 short: None,
                 reopen: None,
@@ -793,10 +934,20 @@ impl Tabs {
     /// What it is asked about is the process *group*, not the leader — see
     /// `jobs_by_group`, which is where the answer to "why are there still two
     /// rows" turned out to be.
-    fn adopt_sessions(&mut self, known: &[Job], jobs_dir: &Path) {
+    ///
+    /// A Codex session is joined differently, by which pane its process
+    /// descends from — see [`Lineage`]. `codex` is each running Codex
+    /// session's lock holder, by session id.
+    fn adopt_sessions(&mut self, known: &[Job], jobs_dir: &Path, codex: &HashMap<String, i32>) {
         // Destructured so the map and the panes are borrowed apart: the map is
         // taken once for the whole pass rather than once per pane.
-        let Tabs { open, groups, .. } = self;
+        let Tabs {
+            open,
+            groups,
+            lineage,
+            ..
+        } = self;
+        let codex_in = codex_panes(open, known, codex, lineage);
         // And only while a pane of your own still does not know what it is.
         // Once they all do, nothing here forks anything: an adopted pane keeps
         // its group, so the answer it already has stays the right one until
@@ -806,7 +957,7 @@ impl Tabs {
             .iter()
             .any(|pane| !pane.opened && pane.remote.is_none() && pane.short.is_none());
         let groups = groups.take(jobs_dir, asking);
-        for pane in open.iter_mut().filter(|pane| !pane.opened) {
+        for (at, pane) in open.iter_mut().enumerate().filter(|(_, pane)| !pane.opened) {
             let found = match &pane.remote {
                 // On another machine a pid means nothing here: the pane's own
                 // process group leader is the local ssh client, which owns no
@@ -829,9 +980,6 @@ impl Tabs {
                 // Here, the process group the pane has in the foreground. Not
                 // the group *leader's* session file: the leader of a `claude`
                 // is a launcher that never writes one.
-                // Here, the process group the pane has in the foreground. Not
-                // the group *leader's* session file: the leader of a `claude`
-                // is a launcher that never writes one.
                 //
                 // And when even the group says nothing, the title does. A
                 // session with `backend: daemon` — which is every session
@@ -848,6 +996,7 @@ impl Tabs {
                     .process_group_leader()
                     .and_then(|pgid| groups.get(&pgid).cloned())
                     .filter(|id| known.iter().any(|job| &job.short == id))
+                    .or_else(|| codex_in.get(&at).cloned())
                     .or_else(|| job_named(&pane.title(), known)),
             };
             if pane.short != found {
@@ -975,6 +1124,9 @@ pub struct Setup {
     pub command: Vec<String>,
     pub jobs_dir: PathBuf,
     pub switch: Switch,
+    /// The key that opens a tab from either side, or `None` to leave it to
+    /// the program in the pane.
+    pub new_tab: Option<u8>,
     pub open: Open,
     pub group_by: GroupBy,
     pub ping: Ping,
@@ -989,6 +1141,7 @@ pub fn run(setup: Setup) -> Result<()> {
         command,
         jobs_dir,
         switch,
+        new_tab,
         open,
         group_by,
         ping,
@@ -1014,6 +1167,7 @@ pub fn run(setup: Setup) -> Result<()> {
         tabs: Tabs::new(work),
         command,
         switch,
+        new_tab,
         ping,
         boards: BoardTabs::default(),
     };
@@ -1046,6 +1200,8 @@ struct Session {
     command: Vec<String>,
     /// The keys that flip tabs, or given back to the child by `--switch off`.
     switch: Switch,
+    /// The key that opens a tab, or given back to the child by `--new-tab off`.
+    new_tab: Option<u8>,
     ping: Ping,
     /// Boards open as tabs, and whether one is in front. See [`BoardTabs`].
     boards: BoardTabs,
@@ -1184,6 +1340,7 @@ fn event_loop(
     // Ctrl-O renders as "ctrl-o": the byte is the letter with its top three
     // bits cleared, so putting them back names the key again.
     app.set_switch(session.switch.label());
+    app.set_new_tab(session.new_tab.map(ctrl_name));
     // Starting an agent runs `claude --bg`, which takes long enough that doing
     // it on this thread would visibly stall the panel. The outcome comes back
     // here, since a session that failed to start must say so rather than
@@ -1316,7 +1473,7 @@ fn event_loop(
                     // A paste into a board is words, whatever bytes are in it:
                     // a ctrl-w inside pasted text must not flip the tab.
                     board_tab_key(&bytes, &mut session.boards, &mut app)
-                } else if bytes.contains(&NEW_TAB) {
+                } else if opens_tab(&bytes, session.new_tab) {
                     // From either side of the divider, and without going
                     // through the panel: this is the key you reach for
                     // *because* the terminal's own cmd-T is the wrong tab.
@@ -1648,9 +1805,11 @@ fn event_loop(
             // this refresh is for, and the cadence the session's own row
             // appears at anyway. On the draw path it ran up to sixty times a
             // second to learn something that changes once an hour.
-            session
-                .tabs
-                .adopt_sessions(&app.snapshot.jobs, &session.jobs_dir);
+            session.tabs.adopt_sessions(
+                &app.snapshot.jobs,
+                &session.jobs_dir,
+                &crate::codex::holders(),
+            );
             // The session in the pane is only "in front of you" while the
             // terminal has focus; in another application it is as invisible
             // as any other, and must ping like one. A session open in a tab
@@ -1718,6 +1877,42 @@ fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool>
         return Ok(false);
     };
     let short = short.to_string();
+
+    // A Codex session some process already holds cannot be resumed a second
+    // time — Codex refuses, with "This conversation is open in another app".
+    // Running in a tab of ours, it is that tab; anywhere else, there is
+    // nothing to open, and a tab that could only show the refusal is not one
+    // worth making. Asked now, not from the last refresh: it may have moved.
+    if matches!(job.client, Client::Codex) && job.machine.is_none() {
+        if let Some(pid) = crate::codex::holder_now(&app.codex_dir, &job.session_id) {
+            let chain = ancestors(pid, &parents());
+            match hosting(&chain, &roots(&session.tabs.open)) {
+                Some(index) => {
+                    session.tabs.open[index].short = Some(short.clone());
+                    session.tabs.go_to(index);
+                    app.attend_to(&short);
+                    app.select(&short);
+                    return Ok(true);
+                }
+                None => {
+                    app.error = Some(format!(
+                        "{} is open in another terminal; close it there to open it here",
+                        job.name
+                    ));
+                    return Ok(false);
+                }
+            }
+        }
+        // Held by nobody, and never asked anything: there is no rollout for
+        // `codex resume` to read, and the tab would only say so and die.
+        if !crate::codex::has_rollout(&app.codex_dir, &job.session_id) {
+            app.error = Some(format!(
+                "{} was never asked anything, so there is nothing to resume",
+                job.name
+            ));
+            return Ok(false);
+        }
+    }
     let (command, cwd) = resume(job);
     let (cols, rows) = session.work_size();
     // Spawn before touching the tab list, so a failure changes nothing.
@@ -3147,6 +3342,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_process_is_placed_in_the_tab_it_descends_from() {
+        // The owner's case: `codex` started by hand in a ctrl-t tab. The tab
+        // runs a shell (700), the shell runs codex's launcher (800), and the
+        // launcher runs the process that holds the session's lock (900).
+        let parents = parse_parents(
+            "  1     0\n 600     1\n 700   600\n 800   700\n 900   800\n 950   600\n",
+        );
+        let chain = ancestors(900, &parents);
+        assert_eq!(chain, [900, 800, 700, 600, 1]);
+        // Panes started 650 and 700: the second one has it.
+        assert_eq!(hosting(&chain, &[Some(650), Some(700)]), Some(1));
+        // A session run from another terminal descends from no pane of ours.
+        assert_eq!(
+            hosting(&ancestors(950, &parents), &[Some(650), Some(700)]),
+            None
+        );
+        // A pane that cannot be asked — opened onto a session, or on another
+        // machine — hosts nothing, whatever the numbers say.
+        assert_eq!(hosting(&chain, &[None, None]), None);
+    }
+
+    #[test]
+    fn a_ps_that_contradicts_itself_ends_the_walk_rather_than_looping() {
+        // Taken while processes come and go, a `ps` can say anything —
+        // including a pid that is its own grandparent.
+        let parents = parse_parents("10 20\n20 10\nnot a line\n");
+        assert_eq!(ancestors(10, &parents), [10, 20]);
+        assert_eq!(ancestors(42, &parents), [42], "a pid ps did not list");
+    }
+
+    #[test]
+    fn a_codex_session_running_in_a_tab_of_your_own_is_that_tab() {
+        // The session's row and the tab's row become one, and enter on the
+        // row finds the tab rather than starting a resume Codex will refuse.
+        let codex = std::env::temp_dir().join(format!("savras-host-codex-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&codex);
+        std::fs::create_dir_all(codex.join("thread-writer-locks")).unwrap();
+        let id = "01a0cfa4-7b7e-7250-8008-6df63f7f61b0";
+        std::fs::write(
+            codex.join("thread-writer-locks").join(format!("{id}.lock")),
+            "",
+        )
+        .unwrap();
+        let known = crate::codex::load(&codex);
+        let _ = std::fs::remove_dir_all(&codex);
+        assert_eq!(known.len(), 1);
+
+        let mut tabs = Tabs::new(pane(None).work);
+        let mut yours = pane(None);
+        yours.opened = false;
+        let root = yours.work.pid().unwrap();
+        tabs.push(yours);
+        tabs.go_to(0);
+        // The holder, two processes under the tab's own; the chain is given
+        // rather than asked, so the test does not depend on what is running.
+        let holder = 999_999;
+        tabs.lineage
+            .chains
+            .insert(holder, vec![holder, 999_998, root, 1]);
+        let holders = HashMap::from([(id.to_string(), holder)]);
+
+        tabs.adopt_sessions(&known, Path::new("/nonexistent/jobs"), &holders);
+        assert_eq!(tabs.open[1].short.as_deref(), Some("01a0cfa4"));
+        assert_eq!(tabs.position("01a0cfa4"), Some(1));
+
+        // Leave Codex, and the tab is a tab of your own again.
+        tabs.adopt_sessions(&known, Path::new("/nonexistent/jobs"), &HashMap::new());
+        assert_eq!(tabs.open[1].short, None);
+        assert!(
+            tabs.lineage.chains.is_empty(),
+            "a holder that is gone is forgotten"
+        );
+    }
+
+    #[test]
+    fn with_the_new_tab_key_given_back_ctrl_t_reaches_the_pane() {
+        // What Codex needed: its transcript is ctrl-t.
+        assert!(opens_tab(b"\x14", Some(NEW_TAB)));
+        assert!(!opens_tab(b"\x14", None));
+        assert_eq!(
+            meaning(b"\x14", Switch::default(), None),
+            "passed to the program in the pane"
+        );
+        // Moved, the new key opens a tab and ctrl-t is the pane's.
+        assert!(opens_tab(b"\x19", Some(0x19)));
+        assert!(!opens_tab(b"\x14", Some(0x19)));
+        assert_eq!(
+            meaning(b"\x19", Switch::default(), Some(0x19)),
+            "the new-tab key — open a tab of your own"
+        );
+        assert_eq!(ctrl_name(0x19), "ctrl-y");
+        assert_eq!(ctrl_name(NEW_TAB), "ctrl-t");
+    }
+
     fn three_tabs() -> Tabs {
         let mut tabs = Tabs::new(pane(None).work);
         tabs.push(pane(Some("aaa")));
@@ -3468,6 +3758,7 @@ mod tests {
             tabs,
             command: Vec::new(),
             switch: Switch::default(),
+            new_tab: Some(NEW_TAB),
             ping: crate::ping::Ping::new(
                 crate::ping::When::default(),
                 false,

@@ -134,6 +134,9 @@ pub struct App {
     /// there is a session to flip to: a key that would do nothing is worse
     /// than no key at all, because you try it and conclude it is broken.
     switch_label: Option<String>,
+    /// What to call the key that opens a tab, or `None` when `--new-tab off`
+    /// gave it to the pane and the footer has no key to offer.
+    new_tab_label: Option<String>,
     /// The board, while it is on screen in place of the rows.
     pub board: Option<BoardView>,
     /// Where the boards are kept. A field of its own so a test can point it at
@@ -405,6 +408,7 @@ impl App {
             groups: Vec::new(),
             nested: HashSet::new(),
             switch_label: None,
+            new_tab_label: Some("ctrl-t".to_string()),
             board: None,
             // The path only: opening the boards migrates the old log, and that
             // is for a panel starting up, not for every `App` a test builds.
@@ -490,6 +494,15 @@ impl App {
     /// Name the key that flips tabs, for the footer to offer.
     pub fn set_switch(&mut self, label: Option<String>) {
         self.switch_label = label;
+    }
+
+    /// Name the key that opens a tab, or none when the pane keeps it.
+    pub fn set_new_tab(&mut self, label: Option<String>) {
+        self.new_tab_label = label;
+    }
+
+    pub fn new_tab_hint(&self) -> Option<&str> {
+        self.new_tab_label.as_deref()
     }
 
     /// The keys to advertise for flipping sessions — only once there is a
