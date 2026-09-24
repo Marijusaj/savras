@@ -280,6 +280,13 @@ pub fn holder_now(dir: &Path, id: &str) -> Option<i32> {
     pid
 }
 
+/// Whether a session has a rollout — that is, whether it was ever asked
+/// anything. Codex writes the file on the first turn, and `codex resume`
+/// finds nothing to resume without it: "No saved session found".
+pub fn has_rollout(dir: &Path, id: &str) -> bool {
+    rollouts(&dir.join("sessions"), &[id.to_string()]).contains_key(id)
+}
+
 /// Who holds a session's lock: the process, and where it stands when that
 /// says anything.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -722,6 +729,16 @@ mod tests {
         // put anywhere.
         assert_eq!(jobs[0].repo(), "no directory");
         assert_eq!(jobs[0].open_command(), ["codex", "resume", ID]);
+        // And nothing to resume: enter must not start a `codex resume` that
+        // answers "No saved session found" and leaves a dead tab.
+        assert!(!has_rollout(&s.0, ID));
+    }
+
+    #[test]
+    fn a_session_that_has_been_asked_something_has_a_rollout() {
+        let s = Scratch::new("rollout").session(ID, &[&meta("/tmp/repo"), STARTED]);
+        assert!(has_rollout(&s.0, ID));
+        assert!(!has_rollout(&s.0, "01a0cfa4-7b7e-7250-8008-6df63f7f61b0"));
     }
 
     #[test]

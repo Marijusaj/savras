@@ -1903,6 +1903,15 @@ fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool>
                 }
             }
         }
+        // Held by nobody, and never asked anything: there is no rollout for
+        // `codex resume` to read, and the tab would only say so and die.
+        if !crate::codex::has_rollout(&app.codex_dir, &job.session_id) {
+            app.error = Some(format!(
+                "{} was never asked anything, so there is nothing to resume",
+                job.name
+            ));
+            return Ok(false);
+        }
     }
     let (command, cwd) = resume(job);
     let (cols, rows) = session.work_size();

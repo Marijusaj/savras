@@ -503,7 +503,9 @@ conversation is open in another app"), so `enter` first asks who holds it.
 **Started by hand in a tab of your own, the session *is* that tab**: the tab's
 row and the session's row become one, and `enter` brings the tab to the front.
 Open in a terminal Savras does not host, `enter` says so in the panel rather
-than opening a tab that could only show Codex's refusal.
+than opening a tab that could only show Codex's refusal. And a session nobody
+holds that was never asked anything has nothing on disk to resume, so `enter`
+says that too.
 
 ```
 ◈ CODEX SETUP  IDLE                  50%  25m
