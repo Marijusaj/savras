@@ -2102,6 +2102,9 @@ fn attend_front(session: &mut Session, app: &mut App) {
 /// what to do next, not about typing into a dead terminal.
 fn dead_pane_key(bytes: &[u8]) -> Action {
     match bytes {
+        // The banner offers it, and it is the only way to the panel — where
+        // `d` gets rid of a session that will never open again.
+        _ if bytes.contains(&FOCUS_TOGGLE) => Action::Focus(Focus::Panel),
         [b'\r'] | [b'\n'] => Action::Reopen,
         // Closing the tab, not Savras: the other sessions you have open are
         // not implicated in this one exiting.
@@ -3907,6 +3910,16 @@ mod tests {
         // not implicated in this one exiting.
         assert!(matches!(dead_pane_key(b"q"), Action::CloseFront));
         assert!(matches!(dead_pane_key(b"z"), Action::Nothing));
+    }
+
+    #[test]
+    fn ctrl_g_on_a_dead_pane_goes_to_the_panel_as_the_banner_says() {
+        // Swallowed once, which left a tab that could not be resumed with no
+        // way to the panel and so no way to delete it.
+        assert!(matches!(
+            dead_pane_key(&[FOCUS_TOGGLE]),
+            Action::Focus(Focus::Panel)
+        ));
     }
 
     #[test]
