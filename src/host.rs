@@ -262,6 +262,10 @@ const REDRAW_AFTER: Duration = Duration::from_millis(1200);
 const DIVIDER: u16 = 1;
 /// Turns every mouse reporting mode back off.
 const MOUSE_OFF: &str = "\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l";
+/// Bracketed paste (mode 2004): the terminal wraps a paste in `ESC [ 200 ~` …
+/// `ESC [ 201 ~`, so the program can tell a pasted newline from Enter.
+const PASTE_ON: &str = "\x1b[?2004h";
+const PASTE_OFF: &str = "\x1b[?2004l";
 
 /// Which side of the terminal the panel sits on.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -531,6 +535,11 @@ impl Work {
             parser.screen().mouse_protocol_mode(),
             parser.screen().mouse_protocol_encoding(),
         )
+    }
+
+    /// Whether the child has asked for bracketed paste.
+    fn bracketed_paste(&self) -> bool {
+        self.parser.lock().unwrap().screen().bracketed_paste()
     }
 }
 
@@ -1182,6 +1191,7 @@ pub fn run(setup: Setup) -> Result<()> {
     let result = event_loop(&mut terminal, session, open, group_by, machines);
     // Leave the terminal's mouse and focus handling as we found it.
     let _ = std::io::stdout().write_all(MOUSE_OFF.as_bytes());
+    let _ = std::io::stdout().write_all(PASTE_OFF.as_bytes());
     let _ = std::io::stdout().write_all(focus::DISABLE.as_bytes());
     crate::restore_terminal(&mut terminal)?;
     result
@@ -1369,6 +1379,7 @@ fn event_loop(
         vt100::MouseProtocolMode::None,
         vt100::MouseProtocolEncoding::Default,
     );
+    let mut paste = false;
     // Whether the terminal *window* has you — distinct from `focus` above,
     // which is only about which pane the keyboard is typing into. Unknown
     // counts as away: missing a question because we assumed you were watching
@@ -1399,6 +1410,19 @@ fn event_loop(
             mouse = wanted;
             let mut out = std::io::stdout();
             out.write_all(mouse_sequence(mouse.0, mouse.1).as_bytes())?;
+            out.flush()?;
+        }
+
+        // Bracketed paste, the same way and for the same reason. Without it
+        // the terminal hands over a paste as bare keystrokes — Ghostty warns
+        // that it is unsafe first — and every newline in it reaches Claude
+        // Code as Enter, sending the paste as a string of separate messages.
+        // A board takes pastes as words, and reads the brackets to know one.
+        let wanted = showing_board || session.tabs.work().bracketed_paste();
+        if wanted != paste {
+            paste = wanted;
+            let mut out = std::io::stdout();
+            out.write_all(if paste { PASTE_ON } else { PASTE_OFF }.as_bytes())?;
             out.flush()?;
         }
 
@@ -4204,6 +4228,20 @@ mod tests {
         let off = mouse_sequence(M::None, E::Default);
         assert!(!off.contains('h'), "nothing should be enabled: {off:?}");
         assert!(off.contains("\x1b[?1006l"), "{off:?}");
+    }
+
+    #[test]
+    fn a_childs_bracketed_paste_is_seen_so_it_can_be_mirrored() {
+        // What `Work::bracketed_paste` reads: the request reaches our parser,
+        // never the terminal, which is the whole bug this mirrors around.
+        let mut parser = vt100::Parser::new(24, 80, 0);
+        assert!(!parser.screen().bracketed_paste());
+        parser.process(b"\x1b[?1049;2004h");
+        assert!(parser.screen().bracketed_paste());
+        parser.process(PASTE_OFF.as_bytes());
+        assert!(!parser.screen().bracketed_paste());
+        parser.process(PASTE_ON.as_bytes());
+        assert!(parser.screen().bracketed_paste());
     }
 
     #[test]
