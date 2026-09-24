@@ -685,6 +685,50 @@ Found while building: the pane tests ran every `svr` under the developer's own
 `HOME`, and since M5.2 a panel starting up opens — and would migrate — the
 boards there. Each pane now gets a `HOME` of its own.
 
+### M5.4 · The relay
+**Somebody who reads the board as it is written, and taps the shoulder of the
+session a message is for.**
+
+```
+ board.jsonl ── new message ──┐
+                              ├─ --re <id> / @NAME ─┬─ Codex  ─▶ codex queue   (no model)
+ R on a board row             │                     └─ Claude ─▶ haiku delivers
+   └─ tab "relay"             └─ anything else ─────▶ haiku judges ─▶ SendMessage / codex queue
+      svr board relay --repo
+```
+
+The hook only reaches a session when it takes a turn, and an idle one takes
+none. `svr board relay` (#21) closes that: it watches the boards, and a cheap
+model — `claude -p` on the owner's **subscription**, `ANTHROPIC_API_KEY`
+removed, `--restricted` to `ListAgents` and `SendMessage` — picks the live
+sessions a message concerns. Claude Code sessions are pinged with
+`SendMessage`, which wakes an idle one; Codex sessions with `codex queue`.
+
+Then, in the order they were done:
+
+- **Proved on the machine.** A headless `claude -p` on Haiku, with the relay's
+  exact flags, delivered a `SendMessage` to a running session in about four
+  seconds. Only a Claude session can send one — there is no command, and the
+  socket under `/tmp/cc-socks/` is private — so every ping to Claude Code costs
+  one short model call however it was decided.
+- **Haiku by default.** "Who is this for" is a small question, and every asking
+  comes out of the same limits as the owner's sessions. `--model` still moves
+  it. The bigger cost was never the router: a ping costs the session it reaches
+  a turn on its own model, so the model is told to ping only when sure.
+- **Named readers need no judge.** A `--re` reply goes to whoever said what it
+  answers; `@NAME` goes to NAME, whole name, any case. Those are routed in
+  `plan`, not by the model: a Codex reader is queued with no call at all, and a
+  Claude reader is handed to the model as a delivery rather than a judgement.
+  A reply whose parent has scrolled off, or that answers its own poster, falls
+  back to being judged.
+- **A tab of its own.** `R` in the panel runs `svr board relay --repo <repo>` in
+  a tab called `relay`, under the repository; the board row shows `↻` while it
+  runs. The tab keeps its last screen when it stops, like a session's — why it
+  stopped is on it — and `R` again brings it forward or starts it afresh. It is
+  a tab rather than a thread because what it did is a log worth reading, and
+  something that spends the owner's usage should be somewhere they can see it
+  and stop it.
+
 ---
 
 ## Next

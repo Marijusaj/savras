@@ -224,6 +224,7 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
                 Some(board) => ListItem::new(board_line(
                     board,
                     app.board_tab(&board.repo),
+                    app.relayed(&board.repo),
                     name_width,
                     area.width,
                 )),
@@ -259,8 +260,15 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
 ///
 /// Marked like any tab — filled in front, hollow behind — because it is one,
 /// and with its own glyph when it is not open, so a board never reads as a
-/// session. The count is flush right, where a session's age sits.
-fn board_line(board: &BoardRow, tab: Tab, name_width: u16, total_width: u16) -> Line<'static> {
+/// session. The count is flush right, where a session's age sits. A `↻` after
+/// the name says a relay is running for it — `R` — and spending your usage.
+fn board_line(
+    board: &BoardRow,
+    tab: Tab,
+    relayed: bool,
+    name_width: u16,
+    total_width: u16,
+) -> Line<'static> {
     let mark = match tab {
         Tab::Front => Span::styled(
             "▶ ",
@@ -271,13 +279,20 @@ fn board_line(board: &BoardRow, tab: Tab, name_width: u16, total_width: u16) -> 
         Tab::Behind => Span::styled("▷ ", Style::default().fg(Color::Indexed(245))),
         Tab::None => Span::styled("≡ ", Style::default().fg(Color::Blue)),
     };
-    let name = pad("board", (name_width as usize).max(5));
+    let relay = if relayed { " ↻" } else { "" };
+    let name = pad(
+        "board",
+        (name_width as usize)
+            .max(5)
+            .saturating_sub(relay.chars().count()),
+    );
     let count = board.count.to_string();
-    let gap =
-        (total_width as usize).saturating_sub(2 + name.chars().count() + count.chars().count());
+    let gap = (total_width as usize)
+        .saturating_sub(2 + name.chars().count() + relay.chars().count() + count.chars().count());
     Line::from(vec![
         mark,
         Span::styled(name, Style::default().fg(Color::Blue)),
+        Span::styled(relay, Style::default().fg(Color::Green)),
         Span::raw(" ".repeat(gap)),
         Span::styled(count, Style::default().fg(Color::DarkGray)),
     ])
@@ -982,7 +997,9 @@ fn draw_footer(frame: &mut Frame, area: Rect, app: &App, hint: Hint<'_>) {
         // A board row has verbs of its own, and none of a session's.
         (None, Hint::Focused) if app.selected_board().is_some() => Span::styled(
             truncate(
-                "enter open · c clean · d delete · x close",
+                // `R` last: at the default width it is cut, and `c` and `d`,
+                // which cannot be undone, must never be the ones that are.
+                "enter open · c clean · d delete · x close · R relay",
                 area.width as usize,
             ),
             Style::default().fg(Color::DarkGray),
