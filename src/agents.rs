@@ -356,6 +356,43 @@ pub fn stop_remote(host: &str, pid: u32) -> Result<String> {
     Ok(String::new())
 }
 
+/// Delete a Codex session: stop whatever has it open, then have Codex forget
+/// it. Codex's own files are left to Codex — Savras only reads them.
+///
+/// A session nobody has asked anything has no rollout yet, so there is nothing
+/// for `codex delete` to find; stopping its process is all there is, and the
+/// row goes when the lock does.
+pub fn delete_codex(dir: &Path, id: &str) -> Result<String> {
+    if let Some(pid) = crate::codex::holder_now(dir, id) {
+        let _ = Command::new("kill")
+            .arg(pid.to_string())
+            .stdin(Stdio::null())
+            .output();
+    }
+    if !crate::codex::has_rollout(dir, id) {
+        return Ok(String::new());
+    }
+    let out = Command::new("codex")
+        .arg("delete")
+        .arg(id)
+        .stdin(Stdio::null())
+        .output()
+        .context("running `codex delete` — is Codex on your PATH?")?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        let why = why.trim();
+        anyhow::bail!(
+            "codex delete failed{}",
+            if why.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", first_line(why))
+            }
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 pub fn delete(short: &str) -> Result<String> {
     let _ = Command::new("claude")
         .arg("stop")
