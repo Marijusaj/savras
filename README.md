@@ -238,6 +238,11 @@ keeps `cmd-t` for itself and always will, so the new tab it gives you is the
 wrong one: a window *beside* Savras, without the panel and without the sessions
 you have open. This is the same gesture, one level in.
 
+`ctrl-t` is taken from either side of the divider, so the program in the pane
+never sees it — and Codex reads `ctrl-t` as its transcript. `--new-tab y` moves
+the key to `ctrl-y`; `--new-tab off` hands `ctrl-t` back to the pane, and `n`
+in the focused panel still opens a tab.
+
 **A tab can open on another machine.** With hosts written in
 `<config>/savras/machines`, `ctrl-t` asks where first — `1 here`, `2 claude-box`
 — and with none written down it asks nothing and opens here, exactly as it
@@ -493,6 +498,13 @@ repository it is working in, ordered by when it started, with the model it is
 on and how much of its context window it has spent. It wears `◈` where a Claude
 Code session wears `✳`, and `enter` opens it with `codex resume`.
 
+Codex will not resume a session that is already open somewhere ("This
+conversation is open in another app"), so `enter` first asks who holds it.
+**Started by hand in a tab of your own, the session *is* that tab**: the tab's
+row and the session's row become one, and `enter` brings the tab to the front.
+Open in a terminal Savras does not host, `enter` says so in the panel rather
+than opening a tab that could only show Codex's refusal.
+
 ```
 ◈ CODEX SETUP  IDLE                  50%  25m
   └ codex      └ between turns       └ its own window, as Codex reports it
@@ -725,6 +737,7 @@ svr --ping <when>      ping on needs (the default), done, or off
 svr --no-sound         notify without a sound
 svr --quiet <seconds>  silence after a ping; news is held, not lost (default 20)
 svr --switch <keys>    ctrl-<back><forward> flips tabs (default ws), or off
+svr --new-tab <key>    ctrl-<key> opens a tab (default t), or off to leave it to the pane
 svr --open <what>      what the pane starts on: top (default), a name, or shell
 svr --once             print the current sessions as plain text and exit
 svr --keys             print what this terminal sends for each key
@@ -765,7 +778,7 @@ Press keys to see what this terminal sends. Ctrl-C to stop.
 | `r` | refresh now | refresh now |
 | `s` | group by repository, or by status | group by repository, or by status |
 | `enter` | open the selected session | — |
-| `n` / `ctrl-t` | a tab of your own | — |
+| `n` / `ctrl-t` | a tab of your own (`--new-tab` moves `ctrl-t`) | — |
 | `x` | close the selected tab | — |
 | `d` | delete the selected session, after asking | — |
 | `a` | start a parallel agent under its lead | start a parallel agent under its lead |

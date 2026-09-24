@@ -65,6 +65,9 @@ options:
   --quiet <seconds>   silence after a ping, news held until it ends (default 20)
   --group <what>      group rows by repo (the default) or status; s flips it
   --switch <keys>     ctrl-<back><forward> flips tabs (default ws), or off
+  --new-tab <key>     ctrl-<key> opens a tab of your own (default t), or off
+                      to hand ctrl-t to the program in the pane — Codex's
+                      transcript, say; n in the panel still opens one
   --open <what>       what the working pane starts on: top, the first session
                       in the panel (the default), a session name, or shell
   --once              print the current sessions as plain text and exit
@@ -99,7 +102,8 @@ keys, with the panel focused:
              in the directory of the session you are on;
              n does the same with the panel focused. With machines
              written down it asks where first: 1 here, 2.. the box,
-             and a tab on a box is a tmux window that survives it
+             and a tab on a box is a tmux window that survives it.
+             --new-tab moves ctrl-t, or gives it back to the pane
   x          close the selected tab, yours or a session's
   a          start a parallel agent under this session's lead
   s          group by repository or by status
@@ -161,6 +165,9 @@ struct Options {
     quiet: Duration,
     /// The keys that flip between tabs.
     switch: Switch,
+    /// The key that opens a tab from either side, or `None` when the pane
+    /// keeps it.
+    new_tab: Option<u8>,
     /// What the working pane starts on, once the default is worked out.
     open: host::Open,
     /// Whether the panel groups its rows by repository or by status.
@@ -233,6 +240,7 @@ fn main() -> Result<()> {
             command,
             jobs_dir: jobs_dir(options.jobs_dir)?,
             switch: options.switch,
+            new_tab: options.new_tab,
             open: options.open,
             group_by: options.group_by,
             ping: Ping::new(options.ping, options.sound, options.quiet),
@@ -243,7 +251,7 @@ fn main() -> Result<()> {
     let jobs_dir = jobs_dir(options.jobs_dir)?;
 
     match options.mode {
-        Mode::Keys => host::keys(options.switch),
+        Mode::Keys => host::keys(options.switch, options.new_tab),
         Mode::Once => print_once(&jobs_dir),
         _ => run_tui(
             jobs_dir,
@@ -264,6 +272,7 @@ fn parse_switch(raw: &str) -> Result<Switch> {
         return Ok(Switch::OFF);
     }
     let letters: Vec<char> = raw.chars().collect();
+    let control = |letter| control("--switch", letter);
     match letters.as_slice() {
         // Two letters are back and forward, in that order — `ws` is the
         // default written out.
@@ -290,20 +299,38 @@ fn parse_switch(raw: &str) -> Result<Switch> {
     }
 }
 
+/// `--new-tab t` is Ctrl-T, the default, and `--new-tab off` hands it to the
+/// program in the pane.
+///
+/// Codex reads ctrl-t as its transcript, and a panel that takes the key from
+/// either side of the divider takes it from Codex too. The default stays: it
+/// is the key cmd-T sends your hand to, and a Claude Code pane has no use for
+/// it. `n` in the panel opens a tab either way.
+fn parse_new_tab(raw: &str) -> Result<Option<u8>> {
+    if raw == "off" || raw == "none" {
+        return Ok(None);
+    }
+    match raw.chars().collect::<Vec<_>>().as_slice() {
+        [only] => Ok(Some(control("--new-tab", *only)?)),
+        _ => anyhow::bail!("--new-tab takes one letter, or off, not {raw}"),
+    }
+}
+
 /// The control byte a letter makes, refusing the ones that are already
-/// something else.
-fn control(letter: char) -> Result<u8> {
+/// something else. Which of Savras's own keys a letter would collide with —
+/// the new-tab key and the flip keys can each be moved — is checked once all
+/// of them are known.
+fn control(flag: &str, letter: char) -> Result<u8> {
     if !letter.is_ascii_alphabetic() {
-        anyhow::bail!("--switch takes letters, not {letter}");
+        anyhow::bail!("{flag} takes letters, not {letter}");
     }
     let letter = letter.to_ascii_lowercase();
-    // Letters whose control byte is already something else entirely: g, l and
-    // t are Savras's own keys, and the rest are enter, tab, backspace and the
+    // Letters whose control byte is already something else entirely: g and l
+    // are Savras's own keys, and the rest are enter, tab, backspace and the
     // signals, none of which can be handed to anything.
     if let Some(what) = match letter {
         'g' => Some("ctrl-g, which focuses the panel"),
         'l' => Some("ctrl-l, which repaints the screen"),
-        't' => Some("ctrl-t, which opens a tab"),
         'c' => Some("ctrl-c, which interrupts"),
         'd' => Some("ctrl-d, which is end-of-file"),
         'h' => Some("backspace"),
@@ -311,7 +338,7 @@ fn control(letter: char) -> Result<u8> {
         'j' | 'm' => Some("enter"),
         _ => None,
     } {
-        anyhow::bail!("--switch {letter} is {what}; pick another letter");
+        anyhow::bail!("{flag} {letter} is {what}; pick another letter");
     }
     // Ctrl-<letter> is the letter with its top three bits cleared.
     Ok(letter.to_ascii_uppercase() as u8 & 0x1f)
@@ -338,6 +365,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
         sound: true,
         quiet: ping::QUIET,
         switch: Switch::default(),
+        new_tab: Some(host::NEW_TAB),
         // Filled in below: what the pane starts on depends on whether you
         // named a command for it.
         open: host::Open::Shell,
@@ -420,6 +448,10 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
                 let raw = args.next().context("--switch needs a letter, or off")?;
                 options.switch = parse_switch(&raw)?;
             }
+            "--new-tab" => {
+                let raw = args.next().context("--new-tab needs a letter, or off")?;
+                options.new_tab = parse_new_tab(&raw)?;
+            }
             "--quiet" => {
                 let raw = args.next().context("--quiet needs a number of seconds")?;
                 let secs: f64 = raw
@@ -459,6 +491,18 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
                 options.jobs_dir = Some(PathBuf::from(dir));
             }
             other => anyhow::bail!("unknown option {other}"),
+        }
+    }
+
+    // One key cannot both open a tab and flip to the next one. Checked here,
+    // with both known, since either may have been moved.
+    if let Some(key) = options.new_tab {
+        if [options.switch.back, options.switch.forward].contains(&Some(key)) {
+            let name = (key | 0x60) as char;
+            anyhow::bail!(
+                "ctrl-{name} would both open a tab and flip tabs; \
+                 move one of them with --switch or --new-tab"
+            );
         }
     }
 
@@ -885,6 +929,43 @@ mod tests {
         assert!(parse(vec!["--switch".into(), "oo".into()]).is_err());
         assert!(parse(vec!["--switch".into(), "1".into()]).is_err());
         assert!(parse(vec!["--switch".into()]).is_err());
+    }
+
+    #[test]
+    fn the_new_tab_key_can_be_moved_or_given_back_to_the_pane() {
+        assert_eq!(parse_ok(&[]).new_tab, Some(0x14), "ctrl-t by default");
+        assert_eq!(parse_ok(&["--new-tab", "t"]).new_tab, Some(0x14));
+        assert_eq!(parse_ok(&["--new-tab", "Y"]).new_tab, Some(0x19));
+        // What the owner wanted it for: Codex reads ctrl-t as its transcript.
+        assert_eq!(parse_ok(&["--new-tab", "off"]).new_tab, None);
+        assert_eq!(parse_ok(&["--new-tab", "none"]).new_tab, None);
+
+        for taken in ["g", "l", "c", "m"] {
+            assert!(
+                parse(vec!["--new-tab".into(), taken.into()]).is_err(),
+                "--new-tab {taken} must be refused"
+            );
+        }
+        assert!(parse(vec!["--new-tab".into(), "ty".into()]).is_err());
+        assert!(parse(vec!["--new-tab".into(), "1".into()]).is_err());
+        assert!(parse(vec!["--new-tab".into()]).is_err());
+    }
+
+    #[test]
+    fn one_key_cannot_both_open_a_tab_and_flip_tabs() {
+        // ctrl-t opens a tab by default, so the flip keys cannot have it...
+        assert!(parse(vec!["--switch".into(), "t".into()]).is_err());
+        assert!(parse(vec!["--switch".into(), "wt".into()]).is_err());
+        // ...and the new-tab key cannot move onto a flip key.
+        assert!(parse(vec!["--new-tab".into(), "w".into()]).is_err());
+        // Moved out of the way, either one is free to take the other's old key.
+        let options = parse_ok(&["--new-tab", "y", "--switch", "t"]);
+        assert_eq!(options.new_tab, Some(0x19));
+        assert_eq!(options.switch.forward, Some(0x14));
+        assert_eq!(
+            parse_ok(&["--new-tab", "off", "--switch", "t"]).new_tab,
+            None
+        );
     }
 
     #[test]
