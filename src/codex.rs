@@ -293,6 +293,31 @@ pub fn holder_now(dir: &Path, id: &str) -> Option<i32> {
     pid
 }
 
+/// The process showing this session to somebody, asked now: the one holding
+/// its lock — unless that is Codex's app-server daemon, which since 0.157
+/// holds every lock itself and serves the terminal windows as clients. Then
+/// it is the `codex resume <id>` naming the session, if one is running; `None`
+/// when nothing is, and the daemon is only keeping the session loaded.
+///
+/// A window that started the session with a bare `codex` does not name it,
+/// and cannot be told from any other Codex window — so that one is not found,
+/// and resuming it again is left to Codex to allow or refuse in the tab.
+pub fn shown_by(dir: &Path, id: &str) -> Option<i32> {
+    let pid = holder_now(dir, id)?;
+    if !is_daemon(pid) {
+        return Some(pid);
+    }
+    run("pgrep", &["-f", &format!("codex resume {id}")])
+        .split_whitespace()
+        .find_map(|pid| pid.parse().ok())
+}
+
+/// Whether a pid is Codex's app-server daemon rather than a Codex someone is
+/// looking at.
+fn is_daemon(pid: i32) -> bool {
+    run("ps", &["-o", "command=", "-p", &pid.to_string()]).contains(" app-server")
+}
+
 /// Whether a session has a rollout — that is, whether it was ever asked
 /// anything. Codex writes the file on the first turn, and `codex resume`
 /// finds nothing to resume without it: "No saved session found".

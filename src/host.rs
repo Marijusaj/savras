@@ -1973,13 +1973,15 @@ fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool>
     };
     let short = short.to_string();
 
-    // A Codex session some process already holds cannot be resumed a second
-    // time — Codex refuses, with "This conversation is open in another app".
-    // Running in a tab of ours, it is that tab; anywhere else, there is
+    // A Codex session some window is already showing cannot be resumed a
+    // second time — Codex refuses, with "This conversation is open in another
+    // app". Running in a tab of ours, it is that tab; anywhere else, there is
     // nothing to open, and a tab that could only show the refusal is not one
     // worth making. Asked now, not from the last refresh: it may have moved.
+    // Not simply whoever holds the lock: since Codex 0.157 that is its daemon,
+    // which no tab descends from, and every session read as open elsewhere.
     if matches!(job.client, Client::Codex) && job.machine.is_none() {
-        if let Some(pid) = crate::codex::holder_now(&app.codex_dir, &job.session_id) {
+        if let Some(pid) = crate::codex::shown_by(&app.codex_dir, &job.session_id) {
             let chain = ancestors(pid, &parents());
             match hosting(&chain, &roots(&session.tabs.open)) {
                 Some(index) => {

@@ -363,7 +363,10 @@ pub fn stop_remote(host: &str, pid: u32) -> Result<String> {
 /// for `codex delete` to find; stopping its process is all there is, and the
 /// row goes when the lock does.
 pub fn delete_codex(dir: &Path, id: &str) -> Result<String> {
-    if let Some(pid) = crate::codex::holder_now(dir, id) {
+    // The window showing it, never the lock's holder as such: since Codex
+    // 0.157 that is the daemon serving every session, and killing it to
+    // delete one would have taken all of them with it.
+    if let Some(pid) = crate::codex::shown_by(dir, id) {
         let _ = Command::new("kill")
             .arg(pid.to_string())
             .stdin(Stdio::null())
@@ -372,7 +375,7 @@ pub fn delete_codex(dir: &Path, id: &str) -> Result<String> {
         // moment. Deleting under it races its last writes — the same reason
         // `claude stop` finishes before `claude rm`.
         let released = let_go(
-            || crate::codex::holder_now(dir, id).is_some(),
+            || crate::codex::shown_by(dir, id) == Some(pid),
             15, // each look is a pgrep and an lsof, ~100ms: about 3s in all
             std::time::Duration::from_millis(100),
         );
