@@ -65,7 +65,7 @@ concluded.
 - **The name** — in white, with no colour badge, for the session in the pane
   beside the panel. That is the one your keystrokes are going to.
 - **One word.** `WAITING` wants you, `WORKING` does not, `DONE` is finished,
-  `FAILED` broke, and `IDLE` is a Codex session between turns. It sits where the summary used to and answers the question you
+  `FAILED` broke, and `IDLE` is a Codex session loaded between turns. It sits where the summary used to and answers the question you
   actually scan ten rows for.
 - **The pull request**, if the session produced one: `READY` when its checks are
   green, `CHECKS` while they run, `FAILED` when one has not, then `MERGED` or
@@ -493,39 +493,37 @@ can now *start* one, with `claude --bg`, in that group's own repository.
 
 ### Codex sessions
 
-**A Codex session running on this machine is a row like any other**, under the
+**A Codex session on this machine is a row like any other**, under the
 repository it is working in, ordered by when it started, with the model it is
 on and how much of its context window it has spent. It wears `◈` where a Claude
 Code session wears `✳`, and `enter` opens it with `codex resume`.
 
-Codex will not resume a session that is already open somewhere ("This
-conversation is open in another app"), so `enter` first asks who holds it.
-**Started by hand in a tab of your own, the session *is* that tab**: the tab's
-row and the session's row become one, and `enter` brings the tab to the front.
-Open in a terminal Savras does not host, `enter` says so in the panel rather
-than opening a tab that could only show Codex's refusal. And a session nobody
-holds that was never asked anything has nothing on disk to resume, so `enter`
-says that too.
-
 ```
-◈ CODEX SETUP  IDLE                  50%  25m
-  └ codex      └ between turns       └ its own window, as Codex reports it
+◈ CODE REVIEW  IDLE                   4%  25m
+  └ codex      └ Codex's own status  └ its own window, as Codex counts it
 ```
 
-Only *running* Codex sessions are listed. Codex keeps every session it has ever
-written, months back, and the lock file it holds open while a session lives is
-what tells the two apart. Nothing is written: the panel reads
-`~/.codex/sessions/…jsonl`, `session_index.jsonl` and `thread-writer-locks/`,
-and the long rollout files are read from the end, since everything a row needs
-was said in the last few events.
+**Savras asks Codex.** Every Codex window — the terminal UI and the desktop app
+alike — is a client of one local app-server daemon, and Savras asks that daemon
+over its control socket, in Codex's own protocol, which threads it has and what
+each is doing. So the word is Codex's, not a guess:
 
-**The one word a Codex row cannot say is `WAITING`.** Codex records no approval
-event, so "waiting for you to approve a command" and "waiting for your next
-prompt" look the same on disk — both are simply a turn that has ended. Savras's
-`WAITING` is a claim that a session asked *you* something, and the ping is built
-on it, so a Codex session between turns says `IDLE` instead. None of these files
-are documented by Codex, so a field that changes shape costs a column rather
-than the row.
+- `WORKING` — a turn is running.
+- `WAITING` — a turn is stopped on you: Codex wants your approval, or asked you
+  something. It pings, like a Claude session that asks.
+- `IDLE` — loaded, between turns: a window you can type into.
+- `DONE` — nobody has it open. Sessions touched in the last day stay listed, so
+  a window you closed — or a panel restart that took its tab — leaves a row
+  that `enter` resumes.
+- `FAILED` — Codex reports an error for the thread.
+
+One-shot `codex exec` runs and sub-agents are not listed. `d` asks Codex to
+delete the session; nothing is killed from here. With no daemon running there
+are no Codex rows, and Savras never starts one.
+
+The one thing still read from disk is how full the context is: the end of the
+session's rollout, counted the way Codex's own footer counts it. Nothing is
+written to `~/.codex`.
 
 This closes a gap the board already had: a Codex session could post to a
 repository's board while having no row on the panel it was talking through.

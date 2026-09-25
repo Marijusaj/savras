@@ -514,12 +514,6 @@ impl Work {
         self.exited
     }
 
-    /// The process Savras started in this pane — your shell, usually — which
-    /// everything you run in the tab descends from.
-    fn pid(&self) -> Option<i32> {
-        self.child.process_id().map(|pid| pid as i32)
-    }
-
     fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
         self.master.resize(PtySize {
             rows,
@@ -747,122 +741,6 @@ struct Tabs {
     current: usize,
     /// Which process group holds which session — see `adopt_sessions`.
     groups: Groups,
-    /// Whose child each Codex session's process is — see [`Lineage`].
-    lineage: Lineage,
-}
-
-/// The ancestors of each process holding a Codex session, which is what says
-/// which tab it is running in.
-///
-/// A Claude Code session is joined to its tab by process group, because
-/// Claude writes the pid it runs under. Codex writes none: the only pid there
-/// is the one holding its lock (see `codex::holders`), and that process may be
-/// a child of what is in the pane's foreground rather than its leader — so
-/// the join is by descent from the process the tab started, which everything
-/// run in it descends from.
-///
-/// A process's ancestors do not change while it lives, so one `ps` of the
-/// whole machine is paid once per Codex session, not once per refresh.
-#[derive(Default)]
-struct Lineage {
-    chains: HashMap<i32, Vec<i32>>,
-}
-
-impl Lineage {
-    /// The ancestors of each of these pids, asking only about the new ones.
-    fn of(&mut self, pids: &[i32]) -> &HashMap<i32, Vec<i32>> {
-        self.chains.retain(|pid, _| pids.contains(pid));
-        if pids.iter().any(|pid| !self.chains.contains_key(pid)) {
-            let parents = parents();
-            for pid in pids {
-                self.chains
-                    .entry(*pid)
-                    .or_insert_with(|| ancestors(*pid, &parents));
-            }
-        }
-        &self.chains
-    }
-}
-
-/// Every process's parent, in one `ps` — not one per pid, which is a fork
-/// each and would be most of a frame for a handful of sessions.
-fn parents() -> HashMap<i32, i32> {
-    Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid="])
-        .output()
-        .map(|out| parse_parents(&String::from_utf8_lossy(&out.stdout)))
-        .unwrap_or_default()
-}
-
-/// `ps -o pid=,ppid=` output as pid to parent.
-fn parse_parents(text: &str) -> HashMap<i32, i32> {
-    text.lines()
-        .filter_map(|line| {
-            let mut said = line.split_whitespace();
-            Some((said.next()?.parse().ok()?, said.next()?.parse().ok()?))
-        })
-        .collect()
-}
-
-/// A process and every process above it, nearest first. Stops at the top, at
-/// a pid `ps` did not list, and at a loop — a `ps` taken while processes come
-/// and go can say anything.
-fn ancestors(pid: i32, parents: &HashMap<i32, i32>) -> Vec<i32> {
-    let mut chain = vec![pid];
-    let mut at = pid;
-    while let Some(&parent) = parents.get(&at) {
-        if parent <= 0 || chain.contains(&parent) {
-            break;
-        }
-        chain.push(parent);
-        at = parent;
-    }
-    chain
-}
-
-/// Which of these panes a process runs in: the one whose own process is
-/// among its ancestors. Indices are into `roots`, one per pane.
-fn hosting(chain: &[i32], roots: &[Option<i32>]) -> Option<usize> {
-    roots
-        .iter()
-        .position(|root| root.is_some_and(|root| chain.contains(&root)))
-}
-
-/// The process each pane of your own started, or `None` for a pane that
-/// cannot host a session found this way: one Savras opened onto a session,
-/// or one on another machine, whose local process is only an ssh client.
-fn roots(open: &[Pane]) -> Vec<Option<i32>> {
-    open.iter()
-        .map(|pane| match pane.opened || pane.remote.is_some() {
-            true => None,
-            false => pane.work.pid(),
-        })
-        .collect()
-}
-
-/// Which pane each running Codex session on this machine is in, as pane
-/// index to the session's short id.
-fn codex_panes(
-    open: &[Pane],
-    known: &[Job],
-    codex: &HashMap<String, i32>,
-    lineage: &mut Lineage,
-) -> HashMap<usize, String> {
-    let pids: Vec<i32> = codex.values().copied().collect();
-    // With no Codex running this is an empty map and no `ps`.
-    let chains = lineage.of(&pids);
-    let roots = roots(open);
-    let mut found = HashMap::new();
-    for job in known
-        .iter()
-        .filter(|job| matches!(job.client, Client::Codex) && job.machine.is_none())
-    {
-        let chain = codex.get(&job.session_id).and_then(|pid| chains.get(pid));
-        if let Some(at) = chain.and_then(|chain| hosting(chain, &roots)) {
-            found.entry(at).or_insert_with(|| job.short.clone());
-        }
-    }
-    found
 }
 
 /// The session-holding process groups, and when they were last asked for.
@@ -891,7 +769,6 @@ impl Tabs {
     fn new(work: Work) -> Self {
         Tabs {
             groups: Groups::default(),
-            lineage: Lineage::default(),
             open: vec![Pane {
                 short: None,
                 reopen: None,
@@ -957,19 +834,13 @@ impl Tabs {
     /// `jobs_by_group`, which is where the answer to "why are there still two
     /// rows" turned out to be.
     ///
-    /// A Codex session is joined differently, by which pane its process
-    /// descends from — see [`Lineage`]. `codex` is each running Codex
-    /// session's lock holder, by session id.
-    fn adopt_sessions(&mut self, known: &[Job], jobs_dir: &Path, codex: &HashMap<String, i32>) {
+    /// A Codex session has no pid to join on — every Codex window is a client
+    /// of Codex's daemon — so it is joined by the title, like a Claude
+    /// session run under Claude's daemon.
+    fn adopt_sessions(&mut self, known: &[Job], jobs_dir: &Path) {
         // Destructured so the map and the panes are borrowed apart: the map is
         // taken once for the whole pass rather than once per pane.
-        let Tabs {
-            open,
-            groups,
-            lineage,
-            ..
-        } = self;
-        let codex_in = codex_panes(open, known, codex, lineage);
+        let Tabs { open, groups, .. } = self;
         // And only while a pane of your own still does not know what it is.
         // Once they all do, nothing here forks anything: an adopted pane keeps
         // its group, so the answer it already has stays the right one until
@@ -979,7 +850,7 @@ impl Tabs {
             .iter()
             .any(|pane| !pane.opened && pane.remote.is_none() && pane.short.is_none());
         let groups = groups.take(jobs_dir, asking);
-        for (at, pane) in open.iter_mut().enumerate().filter(|(_, pane)| !pane.opened) {
+        for pane in open.iter_mut().filter(|pane| !pane.opened) {
             let found = match &pane.remote {
                 // On another machine a pid means nothing here: the pane's own
                 // process group leader is the local ssh client, which owns no
@@ -1018,7 +889,6 @@ impl Tabs {
                     .process_group_leader()
                     .and_then(|pgid| groups.get(&pgid).cloned())
                     .filter(|id| known.iter().any(|job| &job.short == id))
-                    .or_else(|| codex_in.get(&at).cloned())
                     .or_else(|| job_named(&pane.title(), known)),
             };
             if pane.short != found {
@@ -1900,11 +1770,9 @@ fn event_loop(
             // this refresh is for, and the cadence the session's own row
             // appears at anyway. On the draw path it ran up to sixty times a
             // second to learn something that changes once an hour.
-            session.tabs.adopt_sessions(
-                &app.snapshot.jobs,
-                &session.jobs_dir,
-                &crate::codex::holders(),
-            );
+            session
+                .tabs
+                .adopt_sessions(&app.snapshot.jobs, &session.jobs_dir);
             // The session in the pane is only "in front of you" while the
             // terminal has focus; in another application it is as invisible
             // as any other, and must ping like one. A session open in a tab
@@ -1973,40 +1841,19 @@ fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool>
     };
     let short = short.to_string();
 
-    // A Codex session some process already holds cannot be resumed a second
-    // time — Codex refuses, with "This conversation is open in another app".
-    // Running in a tab of ours, it is that tab; anywhere else, there is
-    // nothing to open, and a tab that could only show the refusal is not one
-    // worth making. Asked now, not from the last refresh: it may have moved.
-    if matches!(job.client, Client::Codex) && job.machine.is_none() {
-        if let Some(pid) = crate::codex::holder_now(&app.codex_dir, &job.session_id) {
-            let chain = ancestors(pid, &parents());
-            match hosting(&chain, &roots(&session.tabs.open)) {
-                Some(index) => {
-                    session.tabs.open[index].short = Some(short.clone());
-                    session.tabs.go_to(index);
-                    app.attend_to(&short);
-                    app.select(&short);
-                    return Ok(true);
-                }
-                None => {
-                    app.error = Some(format!(
-                        "{} is open in another terminal; close it there to open it here",
-                        job.name
-                    ));
-                    return Ok(false);
-                }
-            }
-        }
-        // Held by nobody, and never asked anything: there is no rollout for
-        // `codex resume` to read, and the tab would only say so and die.
-        if !crate::codex::has_rollout(&app.codex_dir, &job.session_id) {
-            app.error = Some(format!(
-                "{} was never asked anything, so there is nothing to resume",
-                job.name
-            ));
-            return Ok(false);
-        }
+    // A Codex session never asked anything has no rollout, and `codex
+    // resume` would only say so and exit. Asked of Codex, now: the row may be
+    // a refresh old. Whether some other window has it open is Codex's to
+    // settle when the tab attaches — every window is a client of one daemon.
+    if matches!(job.client, Client::Codex)
+        && job.machine.is_none()
+        && !crate::codex::saved(&app.codex_dir, &job.session_id)
+    {
+        app.error = Some(format!(
+            "{} was never asked anything, so there is nothing to resume",
+            job.name
+        ));
+        return Ok(false);
     }
     let (command, cwd) = resume(job);
     let (cols, rows) = session.work_size();
@@ -3504,81 +3351,6 @@ mod tests {
             remote: None,
             relay: None,
         }
-    }
-
-    #[test]
-    fn a_process_is_placed_in_the_tab_it_descends_from() {
-        // The owner's case: `codex` started by hand in a ctrl-t tab. The tab
-        // runs a shell (700), the shell runs codex's launcher (800), and the
-        // launcher runs the process that holds the session's lock (900).
-        let parents = parse_parents(
-            "  1     0\n 600     1\n 700   600\n 800   700\n 900   800\n 950   600\n",
-        );
-        let chain = ancestors(900, &parents);
-        assert_eq!(chain, [900, 800, 700, 600, 1]);
-        // Panes started 650 and 700: the second one has it.
-        assert_eq!(hosting(&chain, &[Some(650), Some(700)]), Some(1));
-        // A session run from another terminal descends from no pane of ours.
-        assert_eq!(
-            hosting(&ancestors(950, &parents), &[Some(650), Some(700)]),
-            None
-        );
-        // A pane that cannot be asked — opened onto a session, or on another
-        // machine — hosts nothing, whatever the numbers say.
-        assert_eq!(hosting(&chain, &[None, None]), None);
-    }
-
-    #[test]
-    fn a_ps_that_contradicts_itself_ends_the_walk_rather_than_looping() {
-        // Taken while processes come and go, a `ps` can say anything —
-        // including a pid that is its own grandparent.
-        let parents = parse_parents("10 20\n20 10\nnot a line\n");
-        assert_eq!(ancestors(10, &parents), [10, 20]);
-        assert_eq!(ancestors(42, &parents), [42], "a pid ps did not list");
-    }
-
-    #[test]
-    fn a_codex_session_running_in_a_tab_of_your_own_is_that_tab() {
-        // The session's row and the tab's row become one, and enter on the
-        // row finds the tab rather than starting a resume Codex will refuse.
-        let codex = std::env::temp_dir().join(format!("savras-host-codex-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&codex);
-        std::fs::create_dir_all(codex.join("thread-writer-locks")).unwrap();
-        let id = "01a0cfa4-7b7e-7250-8008-6df63f7f61b0";
-        std::fs::write(
-            codex.join("thread-writer-locks").join(format!("{id}.lock")),
-            "",
-        )
-        .unwrap();
-        let known = crate::codex::load(&codex);
-        let _ = std::fs::remove_dir_all(&codex);
-        assert_eq!(known.len(), 1);
-
-        let mut tabs = Tabs::new(pane(None).work);
-        let mut yours = pane(None);
-        yours.opened = false;
-        let root = yours.work.pid().unwrap();
-        tabs.push(yours);
-        tabs.go_to(0);
-        // The holder, two processes under the tab's own; the chain is given
-        // rather than asked, so the test does not depend on what is running.
-        let holder = 999_999;
-        tabs.lineage
-            .chains
-            .insert(holder, vec![holder, 999_998, root, 1]);
-        let holders = HashMap::from([(id.to_string(), holder)]);
-
-        tabs.adopt_sessions(&known, Path::new("/nonexistent/jobs"), &holders);
-        assert_eq!(tabs.open[1].short.as_deref(), Some("01a0cfa4"));
-        assert_eq!(tabs.position("01a0cfa4"), Some(1));
-
-        // Leave Codex, and the tab is a tab of your own again.
-        tabs.adopt_sessions(&known, Path::new("/nonexistent/jobs"), &HashMap::new());
-        assert_eq!(tabs.open[1].short, None);
-        assert!(
-            tabs.lineage.chains.is_empty(),
-            "a holder that is gone is forgotten"
-        );
     }
 
     #[test]

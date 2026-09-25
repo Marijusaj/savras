@@ -279,11 +279,11 @@ impl Job {
             (true, ..) => "FAILED",
             (_, Status::NeedsInput, _) => "WAITING",
             (_, Status::Working, _) => "WORKING",
-            // A Codex session is only on the panel while it is running, so a
-            // turn that ended is a session between turns — `DONE` would be a
-            // lie about a session you can type into.
-            (_, Status::Done, Client::Codex) => "IDLE",
-            (_, Status::Done, Client::Claude) => "DONE",
+            // A Codex thread loaded in Codex's daemon has a window you can
+            // type into, so a turn that ended there is `IDLE` — `DONE` would
+            // be a lie. One nobody has open is done until it is resumed.
+            (_, Status::Done, Client::Codex) if self.backend.is_some() => "IDLE",
+            (_, Status::Done, _) => "DONE",
         }
     }
 

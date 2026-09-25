@@ -1368,37 +1368,20 @@ mod tests {
             )
     }
 
-    /// A `~/.codex` holding one running session, started at `at`, in `cwd`.
-    fn with_a_codex_session(tag: &str, cwd: &str, at: &str) -> PathBuf {
-        const ID: &str = "01a0ccda-8ca8-7902-94df-5786dc86d974";
-        let dir =
-            std::env::temp_dir().join(format!("savras-app-codex-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(dir.join("thread-writer-locks")).unwrap();
-        std::fs::write(
-            dir.join("thread-writer-locks").join(format!("{ID}.lock")),
-            "",
-        )
-        .unwrap();
-        let day = dir.join("sessions").join("2026").join("09").join("23");
-        std::fs::create_dir_all(&day).unwrap();
-        std::fs::write(
-            day.join(format!("rollout-2026-09-23T09-01-10-{ID}.jsonl")),
-            format!(
-                "{}\n{}\n",
-                format_args!(
-                    r#"{{"type":"session_meta","payload":{{"session_id":"{ID}","timestamp":"{at}","cwd":"{cwd}"}}}}"#
-                ),
-                r#"{"type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}"#
-            ),
-        )
-        .unwrap();
-        std::fs::write(
-            dir.join("session_index.jsonl"),
-            format!(r#"{{"id":"{ID}","thread_name":"CODEX SETUP"}}"#),
-        )
-        .unwrap();
-        dir
+    /// Codex's daemon, with one session loaded: started at `at`, in `cwd`.
+    fn with_a_codex_session(tag: &str, cwd: &str, at: &str) -> codex::tests::FakeCodex {
+        let mut thread = codex::tests::thread(
+            codex::tests::ID,
+            "CODEX SETUP",
+            serde_json::json!({ "type": "active", "activeFlags": [] }),
+            0,
+        );
+        thread["cwd"] = serde_json::json!(cwd);
+        thread["createdAt"] = serde_json::json!(at
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap()
+            .timestamp());
+        codex::tests::FakeCodex::start(tag, &[codex::tests::ID], vec![thread])
     }
 
     #[test]
@@ -1414,7 +1397,7 @@ mod tests {
             "2026-09-22T09:30:00Z",
         );
         let mut app = App::new(f.0.clone());
-        app.codex_dir = codex.clone();
+        app.codex_dir = codex.dir.clone();
         app.set_group_by(GroupBy::Repo);
         app.refresh();
 
@@ -1432,7 +1415,6 @@ mod tests {
         assert_eq!(job.client, job::Client::Codex);
         assert_eq!(job.repo(), "beta", "grouped by the same rule as the rest");
         assert_eq!(job.open_command()[0], "codex");
-        let _ = std::fs::remove_dir_all(codex);
     }
 
     #[test]
