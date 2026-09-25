@@ -326,6 +326,25 @@ fn a_board_opens_as_a_tab_and_what_is_typed_there_is_posted() {
     assert!(read.contains("owner: just a quick note"), "{read}");
 }
 
+#[test]
+fn capital_r_on_a_board_row_starts_its_relay_in_a_tab() {
+    let mut pane = Pane::start_watching("relay-tab", "cat", true);
+    pane.wait_for("OTHER");
+    let made = pane.board(&["create", "--repo", "/tmp"]);
+    assert!(made.contains("created a board for tmp"), "{made}");
+    pane.wait_for("\u{2261} board");
+
+    pane.press_for(b"\x07", "enter open");
+    let on_row = pane.press_for(b"g", "c clean");
+    assert!(on_row.contains("c clean"), "{on_row}");
+
+    let relay = pane.press_for(b"R", "relaying");
+    assert!(
+        relay.contains("relaying the tmp board"),
+        "R on the board row should have started its relay in a tab; it drew:\n{relay}"
+    );
+}
+
 /// A real `svr` hosting a command of the test's choosing, in a real pty.
 struct Pane {
     dir: PathBuf,
@@ -419,6 +438,12 @@ impl Pane {
         // one of these fails with "already running in this terminal", which
         // says nothing about the code under test.
         command.env_remove("SAVRAS_PANE");
+        // The panel is the owner, as it is when a person starts it. Run from
+        // inside an agent, the relay it starts would otherwise refuse — and
+        // with a `HOME` of its own it has no Claude login to spend anyway.
+        command.env_remove("CLAUDECODE");
+        command.env_remove("CLAUDE_CODE_AGENT");
+        command.env_remove("CLAUDE_JOB_DIR");
         command.env("TERM", "xterm-256color");
         let child = pty.slave.spawn_command(command).unwrap();
         drop(pty.slave);

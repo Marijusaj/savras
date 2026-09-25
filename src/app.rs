@@ -643,12 +643,18 @@ impl App {
         self.board = Some(BoardView::new(self.board_dir.clone(), repo));
     }
 
-    /// The repository the cursor is in: a board row's own, or the one a
-    /// session of this machine's is working in. `None` for a pane of your own
-    /// or a session on another machine, whose path is never looked up here.
+    /// The repository the cursor is in: a board row's own, the one a session
+    /// of this machine's is working in, or the one a pane of your own is
+    /// standing in — it sits under that repository's heading, so `b` and `R`
+    /// on it mean that repository. `None` for a session or pane on another
+    /// machine, whose path is never looked up here.
     pub fn selected_repo(&self) -> Option<String> {
         if let Some(board) = self.selected_board() {
             return Some(board.repo.clone());
+        }
+        if let Some(i) = self.selected_shell() {
+            // Only ever known for a pane on this machine: see `Shell::cwd`.
+            return self.shells.get(i)?.cwd.as_deref().map(board::topic_of);
         }
         match self.selected_job() {
             Some(job) if job.machine.is_none() => Some(board::topic_of(&job.cwd)),
@@ -1477,6 +1483,16 @@ mod tests {
         }
         assert_eq!(under(&app, 0).as_deref(), Some("beta"));
         assert_eq!(under(&app, 1).as_deref(), Some("delta"));
+
+        // And under its heading it means that repository to `b` and `R`,
+        // which said "no session is selected" on a pane of your own.
+        app.select_shell(0);
+        assert_eq!(
+            app.selected_repo().as_deref(),
+            Some("/tmp/savras-test-repos/beta")
+        );
+        app.select_shell(2);
+        assert_eq!(app.selected_repo(), None);
 
         // A pane that walks into another repository follows on the next draw.
         panes[1].cwd = at("gamma");
