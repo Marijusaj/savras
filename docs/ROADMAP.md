@@ -729,6 +729,40 @@ Then, in the order they were done:
   something that spends the owner's usage should be somewhere they can see it
   and stop it.
 
+### M5.5 · Ask Codex
+**A Codex row says what Codex says, because Savras asks it.**
+
+```
+BEFORE: guess from Codex's files            AFTER: ask Codex's daemon
+ thread-writer-locks + pgrep + lsof ─┐       app-server-control.sock (websocket JSON-RPC)
+ rollout tail + backward scan        ├─▶ row   thread/loaded/list · thread/list · thread/read
+ session_index.jsonl · ps ancestry  ─┘       status: active[waitingOn…] · idle · notLoaded
+ 5 modules knew Codex's files                 codex.rs knows the protocol; the rest ask it
+```
+
+Codex 0.157 put every window — terminal and desktop app — behind one local
+app-server daemon, and broke every inference Savras made about it in a day:
+the daemon holds the writer locks, so the lock holder stopped being the window
+("open in another terminal" with none open, and `d` would have killed the
+daemon and every session with it); a long turn's `task_started` scrolls out of
+any tail, so rows read `IDLE` mid-turn; a thread open in the desktop app has
+no lock, so it had no row at all. Three fixes in three PRs, each correct, each
+at the wrong layer — the next release would break the next guess.
+
+The daemon answers these questions itself, in a protocol Codex documents by
+generating its schema (`codex app-server generate-json-schema`) and speaks to
+its own windows in. So `codex.rs` is now a client of it: loaded threads and the
+last day's, each with Codex's own status. `active` is `WORKING`; `active` with
+`waitingOnApproval` or `waitingOnUserInput` is **`WAITING`**, which the files
+never held and which now pings; `idle` is `IDLE`; `notLoaded` is `DONE`, and
+stays a row for a day so a closed window or a panel restart leaves something to
+resume. `d` asks the daemon to delete; nothing is killed. The process-ancestry
+walk that joined a Codex pid to a tab went with the locks — every Codex window
+is a client now, and there is no pid to join on.
+
+What is still read from disk: the rollout's last `token_count`, for the context
+percentage, since the protocol only streams usage to the window driving a turn.
+
 ---
 
 ## Next

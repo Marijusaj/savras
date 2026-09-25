@@ -1,76 +1,76 @@
-//! Codex sessions, read the way the Claude Code ones are: by looking.
+//! Codex sessions, asked of Codex.
 //!
-//! Savras's claim is that it shows the agents you have running, and until now
-//! that meant Claude Code alone — a Codex session could post to a repository's
-//! board while having no row on the panel it was talking through. Codex keeps
-//! its own state under `~/.codex`, so the fix is another reader feeding the
-//! same [`Job`], not a second panel.
+//! Savras's claim is that it shows the agents you have running, and a Codex
+//! session is one — it can post to a repository's board, so it should have a
+//! row on the panel it was talking through. The rows are built from the same
+//! [`Job`] the Claude Code ones are.
 //!
-//! # What is read, and what is not
+//! # Asking, not inferring
 //!
-//! Three things on disk, none of them documented by Codex:
+//! Since 0.157 every Codex window — the terminal UI and the desktop app alike
+//! — is a client of one local **app-server daemon**, and the daemon answers
+//! questions about its threads over a control socket in its own documented
+//! protocol (`codex app-server generate-json-schema` prints it). So this
+//! module asks it: which threads are loaded, and for each one its name,
+//! directory, model, and **status** — `active`, `active` waiting on your
+//! approval or your answer, `idle`, `notLoaded`, or `systemError`.
 //!
-//! - `thread-writer-locks/<id>.lock` — one file per session the moment it
-//!   starts, held open for as long as it runs. That is the liveness signal,
-//!   and it is why **only running sessions are shown**: Codex keeps every
-//!   rollout it has ever written, back months, and a panel that listed them
-//!   all would bury today's work under February's.
-//! - `sessions/<yyyy>/<mm>/<dd>/rollout-…-<id>.jsonl` — the session itself,
-//!   appended per event. The first line says where it is working and when it
-//!   started; the last few thousand bytes say what it is doing now.
-//! - `session_index.jsonl` — the name the owner gave a thread, when they gave
-//!   one.
+//! It used to work that out instead: a writer lock meant running, the process
+//! holding it meant the window, the last `task_started` in the rollout's tail
+//! meant working. Every one of those was a guess about Codex's private files,
+//! and 0.157 broke all of them at once — the daemon holds the locks, a long
+//! turn's start scrolls out of any tail, a thread open in the desktop app has
+//! no lock at all, and "waiting for your approval" was never in the files to
+//! be found. A question Codex answers itself cannot drift from its answer.
 //!
-//! The rollout is read from **the end**: these files reach megabytes within an
-//! hour, the panel re-reads them every tick, and everything a row needs was
-//! said in the last few events. A session that has said nothing in its last
-//! 64 KiB is a session mid-answer, and it keeps the name and age it already
-//! had rather than blanking.
+//! # What is still read from disk
 //!
-//! # What it cannot say
+//! One thing: the rollout — `Thread::path` — for how much context the session
+//! holds and the last thing it said. The protocol streams token usage to the
+//! window driving a turn; nothing asks it after the fact. The rollout is read
+//! from its end and leniently: a format change costs the percentage, never
+//! the row.
 //!
-//! **Nothing here distinguishes "waiting for your approval" from "waiting for
-//! your next prompt".** Codex writes no approval event, so both look the same:
-//! no turn in flight. Savras's `Needs input` is a claim that a session asked
-//! *you* something, and the ping and the alert mark are built on it — so an
-//! idle Codex session is not put there. It is a finished turn, drawn `IDLE`,
-//! and the word is the honest one.
+//! # Which threads are rows
 //!
-//! Being undocumented, every field here is read leniently: a Codex upgrade
-//! that renames something costs a column, never the row.
+//! Every thread loaded in the daemon, and every other thread touched in the
+//! last [`RECENT`] — so a session whose window you closed, or that a panel
+//! restart took down with its tab, is still a row you can resume with enter.
+//! One-shot `codex exec` runs and sub-agents are not: they are a command's
+//! work, not a session you would go back to.
+//!
+//! No daemon, no rows: reading must not start one, and with no daemon nothing
+//! is running. This is the common case for anyone who does not use Codex, and
+//! it costs one failed `connect`.
 
-use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use serde_json::Value;
+use serde::Deserialize;
+use serde_json::{json, Value};
 
 use crate::job::{Client, Job, Status};
+
+/// How far back a thread nobody has open is still a row.
+const RECENT: chrono::Duration = chrono::Duration::hours(24);
+
+/// How many of the most recently updated threads are looked through for the
+/// recent ones. More than a day of sessions for anyone; the loaded ones are
+/// asked for by id regardless.
+const PAGE: u32 = 50;
+
+/// How long the daemon has to answer before the panel stops waiting for it.
+/// It answers a listing in a few milliseconds; this is for a daemon that is
+/// wedged, which must cost the Codex rows and not the panel.
+const PATIENCE: Duration = Duration::from_secs(1);
 
 /// How much of the end of a rollout is read. Big enough for a turn's worth of
 /// events — a tool call and its output are the long ones — and small enough
 /// that a megabyte file costs a seek and one read.
 const TAIL: u64 = 64 * 1024;
-
-/// How much of a rollout is read at a time when looking further back than the
-/// tail for where its turn stands.
-const CHUNK: u64 = 256 * 1024;
-
-/// What a turn event looks like in a rollout, and whether it means a turn is
-/// in flight. Matched as bytes: Codex writes compact JSON, and the same words
-/// quoted inside a message are escaped (`\"type\":…`), so they cannot match.
-const TURNS: [(&[u8], bool); 3] = [
-    (br#""type":"task_started""#, true),
-    (br#""type":"task_complete""#, false),
-    (br#""type":"turn_aborted""#, false),
-];
-
-/// How far into the tree `sessions/` is walked: year, month, day, file.
-const DEPTH: usize = 4;
 
 /// Where Codex keeps its state.
 ///
@@ -80,385 +80,313 @@ pub fn default_dir() -> Option<PathBuf> {
     directories::UserDirs::new().map(|dirs| dirs.home_dir().join(".codex"))
 }
 
-/// Every Codex session running on this machine, as panel rows.
-///
-/// No Codex, no directory, no sessions: an empty list, like a `jobs` directory
-/// that is not there. This is the common case for anyone who does not use
-/// Codex, and it must cost nothing and say nothing.
+/// Every Codex session worth a row on this machine: the ones running, and the
+/// ones touched in the last day. Nothing at all when Codex's daemon is not
+/// running, or does not answer.
 pub fn load(dir: &Path) -> Vec<Job> {
-    let live = live_ids(dir);
-    if live.is_empty() {
+    let Ok(mut daemon) = Daemon::connect(dir) else {
         return Vec::new();
-    }
-    let names = names(dir);
-    let rollouts = rollouts(&dir.join("sessions"), &live);
-    let held = hold(&dir.join("thread-writer-locks"), &live);
-    live.iter()
-        .map(|id| {
-            let named = names.get(id).cloned();
-            match rollouts.get(id) {
-                Some(path) => read_one(id, path, named.clone()),
-                None => None,
-            }
-            // A session that has not been asked anything yet has a lock and a
-            // name and no rollout — Codex writes that on the first turn. It is
-            // a session you can type into, so it is a row; it simply has
-            // nothing to say yet.
-            .unwrap_or_else(|| {
-                let cwd = held.get(id).and_then(|holder| holder.cwd.clone());
-                waiting_to_start(dir, id, named, cwd)
-            })
-        })
-        .collect()
-}
-
-/// The sessions with a writer lock: the ones a Codex process is holding open.
-///
-/// A lock left behind by a process that died reads as a live session until
-/// Codex cleans it up. That is the same trade the rest of the panel makes —
-/// a `state.json` outlives its session too — and it fails towards showing a
-/// row that can still be resumed.
-fn live_ids(dir: &Path) -> Vec<String> {
-    let mut ids: Vec<String> = std::fs::read_dir(dir.join("thread-writer-locks"))
+    };
+    threads(&mut daemon, Utc::now())
+        .unwrap_or_default()
         .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|entry| {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let id = name.strip_suffix(".lock")?;
-            // Codex keeps a `.coordination.lock` of its own in here, and
-            // whatever else it grows is not ours to draw either. A session id
-            // is a uuid, and nothing else in this directory is one.
-            is_uuid(id).then(|| id.to_string())
-        })
-        .collect();
-    ids.sort();
-    ids
-}
-
-/// `01a0ccda-8ca8-7902-94df-5786dc86d974`, and nothing else.
-fn is_uuid(name: &str) -> bool {
-    name.len() == 36
-        && name.chars().enumerate().all(|(at, c)| match at {
-            8 | 13 | 18 | 23 => c == '-',
-            _ => c.is_ascii_hexdigit(),
-        })
-}
-
-/// The name the owner gave each thread, latest line winning.
-///
-/// Append-only, one line per renaming, so the file is read whole and the last
-/// answer for an id is the current one.
-fn names(dir: &Path) -> HashMap<String, String> {
-    let mut names = HashMap::new();
-    let Ok(text) = std::fs::read_to_string(dir.join("session_index.jsonl")) else {
-        return names;
-    };
-    for line in text.lines() {
-        let Ok(entry) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if let (Some(id), Some(name)) = (str_at(&entry, "id"), str_at(&entry, "thread_name")) {
-            names.insert(id.to_string(), name.to_string());
-        }
-    }
-    names
-}
-
-/// Where each live session's rollout file is.
-///
-/// Walked rather than read from Codex's sqlite: the tree is one directory per
-/// day and the walk stops at the sessions we are looking for, which is a few
-/// dozen `stat`s against a database that another process is writing to.
-fn rollouts(sessions: &Path, live: &[String]) -> HashMap<String, PathBuf> {
-    let mut found = HashMap::new();
-    let mut todo = vec![(sessions.to_path_buf(), 0usize)];
-    while let Some((at, depth)) = todo.pop() {
-        if depth >= DEPTH || found.len() == live.len() {
-            continue;
-        }
-        for entry in std::fs::read_dir(&at).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if entry.file_type().is_ok_and(|t| t.is_dir()) {
-                todo.push((path, depth + 1));
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if let Some(id) = live.iter().find(|id| name.contains(id.as_str())) {
-                found.insert(id.clone(), path);
-            }
-        }
-    }
-    found
-}
-
-/// A session that is open but has not had its first turn.
-///
-/// Its lock is the only file it has, so the lock is where its age comes from,
-/// and where it is working is not written down anywhere until it answers
-/// something — so it is asked of the process holding that lock, see
-/// [`hold`]. When nothing can say, it is drawn with no repository rather
-/// than a guessed one, and moves under its heading the moment it is used.
-fn waiting_to_start(dir: &Path, id: &str, name: Option<String>, cwd: Option<PathBuf>) -> Job {
-    let lock = dir.join("thread-writer-locks").join(format!("{id}.lock"));
-    Job {
-        short: short(id).to_string(),
-        name: flatten(&name.unwrap_or_else(|| format!("codex {}", short(id))), 32),
-        color: None,
-        status: Status::Done,
-        summary: "nothing asked yet".to_string(),
-        cwd: cwd.unwrap_or_default(),
-        session_id: id.to_string(),
-        tokens: 0,
-        updated_at: modified(&lock),
-        links: Vec::new(),
-        backend: None,
-        daemon_short: None,
-        machine: None,
-        created_at: modified(&lock),
-        model: None,
-        context: None,
-        context_window: None,
-        failed: false,
-        deploy: None,
-        client: Client::Codex,
-    }
-}
-
-/// Which process holds each session's lock, and where it stands — the only
-/// thing that says where a session is before its first turn, and the only
-/// thing that says which tab it is running in.
-///
-/// Codex writes the directory into the rollout, and the rollout on the first
-/// turn: until then a session started in a tab beside the panel sat under "no
-/// directory", away from the repository it was opened in. The lock is held
-/// open from the moment the session starts, so whoever holds it is the
-/// session, and its working directory is where it was started.
-///
-/// The holder's pid matters as much as its directory. Codex refuses `codex
-/// resume` on a session another process holds — "This conversation is open
-/// in another app" — so enter on the row has to know who has it, and
-/// [`holders`] is how the panel finds the tab that does.
-///
-/// One pass for every session that needs it: `pgrep` for the Codex processes,
-/// then one `lsof` over just those, which lists each one's locks and its
-/// working directory together — tens of milliseconds, on the panel's own
-/// thread. Asking `lsof` by file instead walks every process on the machine,
-/// a quarter of a second per session. An answer is kept for as long as the
-/// session's lock is there, since a holder neither moves nor changes pid; a
-/// miss is asked again, but not more than every [`RETRY`].
-fn hold(locks: &Path, live: &[String]) -> HashMap<String, Holder> {
-    let Ok(mut known) = known().lock() else {
-        return HashMap::new();
-    };
-    // A session that exited is forgotten, so the same id resumed later is
-    // asked about again rather than handed its old holder.
-    known.held.retain(|id, _| live.contains(id));
-    let missing = live.iter().any(|id| !known.held.contains_key(id));
-    if missing && known.asked.is_none_or(|at| at.elapsed() >= RETRY) {
-        known.asked = Some(Instant::now());
-        let found = held_by(&codex_pids(), locks);
-        known.held.extend(found);
-    }
-    known.held.clone()
-}
-
-/// The pid holding each running session's lock, by session id, as [`load`]
-/// last found it. Costs nothing: it is the answer `load` already paid for.
-pub fn holders() -> HashMap<String, i32> {
-    known()
-        .lock()
-        .map(|known| {
-            known
-                .held
-                .iter()
-                .map(|(id, holder)| (id.clone(), holder.pid))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// The pid holding this one session's lock, asked now rather than remembered.
-///
-/// For the moment enter is pressed on its row: a remembered holder can have
-/// exited since, and the session been resumed somewhere else, in the two
-/// seconds between refreshes. A keypress can afford the `lsof`.
-pub fn holder_now(dir: &Path, id: &str) -> Option<i32> {
-    let found = held_by(&codex_pids(), &dir.join("thread-writer-locks"));
-    let pid = found.get(id).map(|holder| holder.pid);
-    if let Ok(mut known) = known().lock() {
-        known.held.remove(id);
-        known.held.extend(found);
-    }
-    pid
-}
-
-/// Whether a session has a rollout — that is, whether it was ever asked
-/// anything. Codex writes the file on the first turn, and `codex resume`
-/// finds nothing to resume without it: "No saved session found".
-pub fn has_rollout(dir: &Path, id: &str) -> bool {
-    rollouts(&dir.join("sessions"), &[id.to_string()]).contains_key(id)
-}
-
-/// Who holds a session's lock: the process, and where it stands when that
-/// says anything.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Holder {
-    pid: i32,
-    cwd: Option<PathBuf>,
-}
-
-struct Known {
-    held: HashMap<String, Holder>,
-    asked: Option<Instant>,
-}
-
-fn known() -> &'static Mutex<Known> {
-    static KNOWN: OnceLock<Mutex<Known>> = OnceLock::new();
-    KNOWN.get_or_init(|| {
-        Mutex::new(Known {
-            held: HashMap::new(),
-            asked: None,
-        })
-    })
-}
-
-/// How long a session nobody could place waits before it is asked about again.
-const RETRY: Duration = Duration::from_secs(10);
-
-fn codex_pids() -> Vec<String> {
-    run("pgrep", &["-x", "codex"])
-        .split_whitespace()
-        .map(str::to_string)
+        .map(row)
         .collect()
 }
 
-/// For each session lock these processes hold, who holds it.
-fn held_by(pids: &[String], locks: &Path) -> HashMap<String, Holder> {
-    if pids.is_empty() {
-        return HashMap::new();
-    }
-    let pids = pids.join(",");
-    // `lsof` names files by their resolved path, and `/var` on macOS — or a
-    // symlinked home anywhere — is not one.
-    let locks = locks.canonicalize().unwrap_or_else(|_| locks.to_path_buf());
-    let locks = locks.as_path();
-    parse_held(&run("lsof", &["-w", "-a", "-p", &pids, "-F", "fn"]), locks)
+/// Whether a session has anything saved to resume. A thread opened and never
+/// asked anything has no rollout, and `codex resume` would only say "No saved
+/// session found" and exit.
+pub fn saved(dir: &Path, id: &str) -> bool {
+    Daemon::connect(dir)
+        .and_then(|mut daemon| daemon.read(id))
+        .is_ok_and(|thread| thread.path.is_some_and(|path| path.exists()))
 }
 
-/// `lsof -F fn` output — `p<pid>`, then `f<fd>` and `n<name>` per open file —
-/// as session id to the process holding it and where that process stands.
-fn parse_held(text: &str, lock_dir: &Path) -> HashMap<String, Holder> {
-    let mut held = HashMap::new();
-    let mut pid: Option<i32> = None;
-    let mut cwd: Option<PathBuf> = None;
-    let mut locks: Vec<String> = Vec::new();
-    let mut fd = "";
-    // One process's worth: its locks go to it. A daemon holding a lock
-    // stands at `/`, which says nothing about where the session is — but it
-    // is still the holder, and still why a resume would be refused.
-    let mut flush = |pid: Option<i32>, cwd: &mut Option<PathBuf>, locks: &mut Vec<String>| {
-        let at = cwd.take().filter(|at| at.parent().is_some());
-        if let Some(pid) = pid {
-            for id in locks.drain(..) {
-                let cwd = at.clone();
-                held.insert(id, Holder { pid, cwd });
+/// Delete a session, by asking Codex to. Codex stops it if it is running and
+/// removes its history; nothing is killed from here.
+pub fn delete(dir: &Path, id: &str) -> Result<()> {
+    Daemon::connect(dir)
+        .context("Codex's daemon is not running")?
+        .call("thread/delete", json!({ "threadId": id }))
+        .map(|_| ())
+}
+
+/// The threads worth a row, as Codex describes them.
+fn threads(daemon: &mut Daemon, now: DateTime<Utc>) -> Result<Vec<Thread>> {
+    let loaded: Vec<String> =
+        serde_json::from_value(daemon.call("thread/loaded/list", json!({}))?["data"].take())
+            .unwrap_or_default();
+    let listed: Vec<Thread> = serde_json::from_value(
+        daemon.call(
+            "thread/list",
+            json!({ "limit": PAGE, "sortKey": "updated_at" }),
+        )?["data"]
+            .take(),
+    )
+    .unwrap_or_default();
+
+    let since = (now - RECENT).timestamp();
+    let mut rows: Vec<Thread> = listed
+        .into_iter()
+        .filter(|t| loaded.contains(&t.id) || t.updated_at >= since)
+        .collect();
+    // A thread loaded but not yet written to disk is not in the listing.
+    for id in &loaded {
+        if !rows.iter().any(|t| &t.id == id) {
+            if let Ok(thread) = daemon.read(id) {
+                rows.push(thread);
             }
         }
-        locks.clear();
+    }
+    rows.retain(Thread::is_a_session);
+    Ok(rows)
+}
+
+/// A thread as Codex's protocol describes it — the fields a row needs. Every
+/// one but the id is optional here, so a field Codex drops costs a column.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Thread {
+    id: String,
+    #[serde(default)]
+    name: Option<String>,
+    /// Usually the first thing the owner asked it.
+    #[serde(default)]
+    preview: String,
+    #[serde(default)]
+    cwd: PathBuf,
+    #[serde(default)]
+    created_at: i64,
+    #[serde(default)]
+    updated_at: i64,
+    #[serde(default)]
+    model: Option<String>,
+    /// The rollout. Marked unstable in the protocol; used only for tokens.
+    #[serde(default)]
+    path: Option<PathBuf>,
+    #[serde(default)]
+    status: Value,
+    #[serde(default)]
+    source: Value,
+    #[serde(default)]
+    ephemeral: bool,
+    #[serde(default)]
+    parent_thread_id: Option<String>,
+}
+
+impl Thread {
+    /// A session you would come back to: not a sub-agent, not a one-shot
+    /// `codex exec`, not a thread Codex never keeps.
+    fn is_a_session(&self) -> bool {
+        let exec = self.source.as_str() == Some("exec");
+        let sub_agent = self.source.get("subAgent").is_some();
+        !(self.ephemeral || exec || sub_agent || self.parent_thread_id.is_some())
+    }
+
+    fn run(&self) -> Run {
+        let flags = |flag: &str| {
+            self.status["activeFlags"]
+                .as_array()
+                .is_some_and(|flags| flags.iter().any(|f| f.as_str() == Some(flag)))
+        };
+        match self.status["type"].as_str() {
+            Some("active") if flags("waitingOnApproval") => Run::Waiting("wants your approval"),
+            Some("active") if flags("waitingOnUserInput") => Run::Waiting("asked you something"),
+            Some("active") => Run::Working,
+            Some("idle") => Run::Idle,
+            Some("systemError") => Run::Broken,
+            // `notLoaded`, or a status this panel has not heard of: not
+            // running, as far as anyone can tell.
+            _ => Run::Stopped,
+        }
+    }
+}
+
+/// What a thread is doing, in the terms the panel draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Run {
+    Working,
+    /// In a turn, and stopped on you: the words say for what.
+    Waiting(&'static str),
+    /// Loaded, between turns: a window you can type into.
+    Idle,
+    /// Not loaded: resumable, and nothing more.
+    Stopped,
+    Broken,
+}
+
+/// One thread, as a row.
+fn row(thread: Thread) -> Job {
+    let now = thread.path.as_deref().map(tail).unwrap_or_default();
+    let run = thread.run();
+    let short = short(&thread.id).to_string();
+    let name = thread
+        .name
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| (!thread.preview.trim().is_empty()).then(|| thread.preview.clone()))
+        .unwrap_or_else(|| format!("codex {short}"));
+    let summary = match run {
+        Run::Waiting(why) => why.to_string(),
+        _ => now.said.clone().unwrap_or_default(),
     };
-    for line in text.lines() {
-        match line.split_at_checked(1) {
-            Some(("p", next)) => {
-                flush(pid, &mut cwd, &mut locks);
-                pid = next.parse().ok();
-            }
-            Some(("f", f)) => fd = f,
-            Some(("n", name)) if fd == "cwd" => cwd = Some(PathBuf::from(name)),
-            Some(("n", name)) => {
-                if let Some(id) = session_lock(Path::new(name), lock_dir) {
-                    locks.push(id.to_string());
-                }
-            }
-            _ => {}
-        }
-    }
-    flush(pid, &mut cwd, &mut locks);
-    held
-}
-
-/// The session id a path names, when it is a session's writer lock in the
-/// Codex directory being read — not one of another `CODEX_HOME`'s.
-fn session_lock<'a>(path: &'a Path, locks: &Path) -> Option<&'a str> {
-    let id = path.file_name()?.to_str()?.strip_suffix(".lock")?;
-    (path.parent() == Some(locks) && is_uuid(id)).then_some(id)
-}
-
-/// A helper program's output, or nothing when it is not there.
-fn run(program: &str, args: &[&str]) -> String {
-    Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-        .unwrap_or_default()
-}
-
-/// One session, from the two ends of its rollout.
-fn read_one(id: &str, path: &Path, name: Option<String>) -> Option<Job> {
-    let start = head(path)?;
-    let now = tail(path);
-
-    // A thread the owner named, else the first thing they asked it, else the
-    // id — something is always drawn, because a row with no name is a row
-    // that cannot be talked about.
-    let name = name
-        .or_else(|| start.first_prompt.clone())
-        .unwrap_or_else(|| format!("codex {}", short(id)));
-
-    Some(Job {
-        short: short(id).to_string(),
+    Job {
+        short,
         name: flatten(&name, 32),
         color: None,
-        status: if now.working {
-            Status::Working
-        } else {
-            Status::Done
+        status: match run {
+            Run::Working => Status::Working,
+            Run::Waiting(_) => Status::NeedsInput,
+            Run::Idle | Run::Stopped | Run::Broken => Status::Done,
         },
-        summary: now.said.map(|s| flatten(&s, 400)).unwrap_or_default(),
-        cwd: start.cwd,
-        session_id: id.to_string(),
+        summary: flatten(&summary, 400),
+        cwd: thread.cwd,
+        session_id: thread.id,
         tokens: now.tokens,
-        updated_at: modified(path),
+        updated_at: at(thread.updated_at),
         links: Vec::new(),
-        backend: None,
+        // Loaded in Codex's daemon, which is what makes a finished turn
+        // `IDLE` — a window you can type into — rather than `DONE`.
+        backend: (run != Run::Stopped).then(|| "daemon".to_string()),
         daemon_short: None,
         machine: None,
-        created_at: start.at,
-        model: now.model,
+        created_at: at(thread.created_at),
+        model: thread.model.or(now.model),
         context: Some(now.held),
         // Codex says its own window, per turn, so the panel does not have to
         // know what `gpt-6-astra` holds — and is not wrong when that changes.
         context_window: now.window,
-        failed: false,
+        failed: run == Run::Broken,
         deploy: None,
         client: Client::Codex,
-    })
+    }
 }
 
-/// What the first line of a rollout says: where the session is working, and
-/// when it started.
-struct Start {
-    cwd: PathBuf,
-    at: Option<DateTime<Utc>>,
-    first_prompt: Option<String>,
+fn at(seconds: i64) -> Option<DateTime<Utc>> {
+    (seconds > 0)
+        .then(|| DateTime::from_timestamp(seconds, 0))
+        .flatten()
 }
 
-/// What the end of a rollout says: what the session is doing now.
+// --- the daemon ------------------------------------------------------------
+
+/// What the daemon is reached over: its control socket, a Unix socket.
+#[cfg(unix)]
+type Stream = std::os::unix::net::UnixStream;
+/// Codex's daemon is reached over a Unix socket, so elsewhere there is none
+/// to reach; the type is only here so the rest compiles, and never connects.
+#[cfg(not(unix))]
+type Stream = std::net::TcpStream;
+
+/// A connection to Codex's app-server daemon: JSON-RPC over a websocket on its
+/// control socket, which is how Codex's own windows talk to it.
+struct Daemon {
+    socket: tungstenite::WebSocket<Stream>,
+    next: u64,
+}
+
+/// The control socket, opened.
+#[cfg(unix)]
+fn open(dir: &Path) -> Result<Stream> {
+    let link = dir
+        .join("app-server-control")
+        .join("app-server-control.sock");
+    // Codex links it into a short directory, and a Unix socket path has a
+    // hard length limit that the link's own path can exceed.
+    let path = std::fs::canonicalize(&link).unwrap_or(link);
+    Stream::connect(&path).with_context(|| format!("connecting to {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn open(_dir: &Path) -> Result<Stream> {
+    anyhow::bail!("Codex's daemon is only reachable on Unix")
+}
+
+impl Daemon {
+    /// Connect and introduce ourselves. Fails fast when there is no daemon.
+    fn connect(dir: &Path) -> Result<Self> {
+        let stream = open(dir)?;
+        stream.set_read_timeout(Some(PATIENCE))?;
+        stream.set_write_timeout(Some(PATIENCE))?;
+        let (socket, _) = tungstenite::client("ws://localhost/", stream)
+            .map_err(|e| anyhow::anyhow!("websocket handshake: {e}"))?;
+        let mut daemon = Daemon { socket, next: 0 };
+        daemon.call(
+            "initialize",
+            json!({ "clientInfo": {
+                "name": "savras",
+                "title": "Savras",
+                "version": env!("CARGO_PKG_VERSION"),
+            }}),
+        )?;
+        daemon.notify("initialized")?;
+        Ok(daemon)
+    }
+
+    fn read(&mut self, id: &str) -> Result<Thread> {
+        let mut answer = self.call("thread/read", json!({ "threadId": id }))?;
+        serde_json::from_value(answer["thread"].take()).context("a thread in an unexpected shape")
+    }
+
+    /// Ask one thing and wait for its answer, passing over whatever the
+    /// daemon announces in between.
+    fn call(&mut self, method: &str, params: Value) -> Result<Value> {
+        self.next += 1;
+        let id = self.next;
+        self.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))?;
+        loop {
+            let message = self
+                .socket
+                .read()
+                .map_err(|e| anyhow::anyhow!("{method}: {e}"))?;
+            let tungstenite::Message::Text(text) = message else {
+                continue;
+            };
+            let Ok(mut answer) = serde_json::from_str::<Value>(text.as_str()) else {
+                continue;
+            };
+            // Notifications, and requests the daemon makes of its clients,
+            // carry a method; an answer to us carries our id and no method.
+            if answer.get("method").is_some() || answer["id"].as_u64() != Some(id) {
+                continue;
+            }
+            if let Some(error) = answer.get("error") {
+                anyhow::bail!(
+                    "{method}: {}",
+                    error["message"]
+                        .as_str()
+                        .unwrap_or("an error with no words")
+                );
+            }
+            return Ok(answer["result"].take());
+        }
+    }
+
+    fn notify(&mut self, method: &str) -> Result<()> {
+        self.send(json!({ "jsonrpc": "2.0", "method": method }))
+    }
+
+    fn send(&mut self, message: Value) -> Result<()> {
+        self.socket
+            .send(tungstenite::Message::text(message.to_string()))
+            .map_err(|e| anyhow::anyhow!("sending to Codex: {e}"))
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.socket.close(None);
+        let _ = self.socket.flush();
+    }
+}
+
+// --- the rollout ------------------------------------------------------------
+
+/// What the end of a rollout says: how full the context is, and the last
+/// thing the session said.
 #[derive(Default)]
 struct Now {
-    working: bool,
     said: Option<String>,
     /// Every token the session has spent, turn after turn — what it cost.
     tokens: u64,
@@ -468,24 +396,6 @@ struct Now {
     held: u64,
     window: Option<u64>,
     model: Option<String>,
-}
-
-fn head(path: &Path) -> Option<Start> {
-    // One line, which carries the whole system prompt and is therefore large.
-    // Read as a chunk rather than by line so a rollout whose first line is a
-    // megabyte costs a megabyte and not the file.
-    let mut file = std::fs::File::open(path).ok()?;
-    let mut buffer = vec![0u8; 512 * 1024];
-    let read = file.read(&mut buffer).ok()?;
-    let text = String::from_utf8_lossy(&buffer[..read]);
-    let line = text.lines().next()?;
-    let entry: Value = serde_json::from_str(line).ok()?;
-    let payload = entry.get("payload")?;
-    Some(Start {
-        cwd: PathBuf::from(str_at(payload, "cwd")?),
-        at: str_at(payload, "timestamp").and_then(parsed),
-        first_prompt: None,
-    })
 }
 
 fn tail(path: &Path) -> Now {
@@ -509,8 +419,6 @@ fn tail(path: &Path) -> Now {
         lines.remove(0);
     }
 
-    // Where the turn stands, once a turn event has been seen.
-    let mut turn = None;
     for line in lines {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -519,22 +427,15 @@ fn tail(path: &Path) -> Now {
             continue;
         };
         match str_at(payload, "type") {
-            // A turn begins and ends; whichever came last is what the session
-            // is doing. `task_started` carries the window this model was
-            // given, which is the honest denominator for the percentage.
             Some("task_started") => {
-                turn = Some(true);
                 now.window = payload
                     .get("model_context_window")
                     .and_then(Value::as_u64)
                     .or(now.window);
             }
             Some("task_complete") => {
-                turn = Some(false);
                 now.said = str_at(payload, "last_agent_message").map(str::to_string);
             }
-            // Interrupted with esc: over, and without a last word.
-            Some("turn_aborted") => turn = Some(false),
             Some("token_count") => {
                 let usage = |key: &str| {
                     payload
@@ -567,76 +468,10 @@ fn tail(path: &Path) -> Now {
             _ => {}
         }
     }
-    // A long turn's tool calls push its `task_started` out of the tail within
-    // minutes, and a session read as idle while it works is the row lying.
-    now.working = match turn {
-        Some(working) => working,
-        // Up to the end of the half line the tail dropped, so an event cut in
-        // two there is still found.
-        None if from > 0 => {
-            let cut = bytes.iter().position(|b| *b == b'\n').unwrap_or(0) as u64;
-            turn_before(path, &mut file, from + cut).unwrap_or(false)
-        }
-        None => false,
-    };
     now
 }
 
-/// Where the turn stood at byte `end` of a rollout: whether the last turn
-/// event before it started a turn. `None` when there is none at all.
-///
-/// Rollouts reach megabytes and the panel asks every tick, so what was found
-/// is kept with how far it was looked for, and the next asking reads only
-/// what was written since. A file shorter than what was kept is a new file.
-fn turn_before(path: &Path, file: &mut std::fs::File, end: u64) -> Option<bool> {
-    /// Per rollout: how far it has been looked through, and what was found.
-    type Seen = HashMap<PathBuf, (u64, Option<bool>)>;
-    static TURNS_SEEN: OnceLock<Mutex<Seen>> = OnceLock::new();
-    let seen = TURNS_SEEN.get_or_init(|| Mutex::new(HashMap::new()));
-    let (from, before) = match seen.lock().unwrap().get(path) {
-        Some(&(upto, before)) if upto <= end => (upto, before),
-        _ => (0, None),
-    };
-    let found = last_turn_between(file, from, end).or(before);
-    seen.lock()
-        .unwrap()
-        .insert(path.to_path_buf(), (end, found));
-    found
-}
-
-/// The last turn event in bytes `start..end`, read backwards a chunk at a time
-/// so that the answer nearest the end costs the least.
-fn last_turn_between(file: &mut std::fs::File, start: u64, end: u64) -> Option<bool> {
-    // Chunks overlap by the longest needle, so none is cut in two.
-    let overlap = TURNS.iter().map(|(n, _)| n.len()).max().unwrap_or(0) as u64;
-    let mut hi = end;
-    while hi > start {
-        let lo = hi.saturating_sub(CHUNK).max(start);
-        let mut bytes = vec![0u8; (hi - lo) as usize];
-        file.seek(SeekFrom::Start(lo)).ok()?;
-        file.read_exact(&mut bytes).ok()?;
-        let last = TURNS
-            .iter()
-            .filter_map(|(needle, working)| {
-                bytes
-                    .windows(needle.len())
-                    .rposition(|w| w == *needle)
-                    .map(|at| (at, *working))
-            })
-            .max_by_key(|(at, _)| *at);
-        if let Some((_, working)) = last {
-            return Some(working);
-        }
-        if lo == start {
-            break;
-        }
-        hi = lo + overlap;
-    }
-    None
-}
-
-/// The eight characters of the session id the row is known by, which is also
-/// what `codex resume` takes.
+/// The eight characters of the session id the row is known by.
 fn short(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
@@ -645,21 +480,8 @@ fn str_at<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
 }
 
-fn parsed(text: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(text)
-        .ok()
-        .map(|at| at.with_timezone(&Utc))
-}
-
-fn modified(path: &Path) -> Option<DateTime<Utc>> {
-    let at = std::fs::metadata(path).ok()?.modified().ok()?;
-    Some(DateTime::<Utc>::from(at))
-}
-
-/// One line, cut to `limit`.
-///
-/// Everything on a row is one line, and an agent's last message is prose with
-/// newlines and markdown in it. The same rule the board applies to a message.
+/// One line, for a row: Codex's words come with newlines and markdown in
+/// them. The same rule the board applies to a message.
 fn flatten(text: &str, limit: usize) -> String {
     let one: String = text
         .chars()
@@ -675,370 +497,283 @@ fn flatten(text: &str, limit: usize) -> String {
         + "…"
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, unix))]
+pub mod tests {
     use super::*;
+    use std::os::unix::net::UnixListener;
+    use std::sync::{Arc, Mutex};
 
-    /// A `~/.codex` of the test's own.
-    struct Scratch(PathBuf);
+    /// A `~/.codex` with a fake daemon behind its control socket, answering
+    /// from a table of threads — the part of the protocol this module speaks.
+    pub struct FakeCodex {
+        pub dir: PathBuf,
+        socket: PathBuf,
+        /// What `thread/delete` was asked to delete.
+        pub deleted: Arc<Mutex<Vec<String>>>,
+    }
 
-    impl Scratch {
-        fn new(tag: &str) -> Self {
+    impl FakeCodex {
+        /// `loaded` are the ids the daemon has loaded; `threads` are what
+        /// `thread/list` and `thread/read` return, as JSON.
+        pub fn start(tag: &str, loaded: &[&str], threads: Vec<Value>) -> Self {
             let dir = std::env::temp_dir().join(format!(
                 "savras-codex-{tag}-{}-{:?}",
                 std::process::id(),
                 std::thread::current().id()
             ));
             let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(dir.join("thread-writer-locks")).unwrap();
-            Scratch(dir)
-        }
-
-        /// A session: its lock, its rollout under a day, and the events given.
-        fn session(self, id: &str, events: &[&str]) -> Self {
-            std::fs::write(
-                self.0
-                    .join("thread-writer-locks")
-                    .join(format!("{id}.lock")),
-                "",
+            std::fs::create_dir_all(dir.join("app-server-control")).unwrap();
+            // Short, like Codex's own: a socket path has a length limit.
+            let socket = PathBuf::from(format!("/tmp/svr-{}-{tag}.sock", std::process::id()));
+            let _ = std::fs::remove_file(&socket);
+            let listener = UnixListener::bind(&socket).unwrap();
+            std::os::unix::fs::symlink(
+                &socket,
+                dir.join("app-server-control")
+                    .join("app-server-control.sock"),
             )
             .unwrap();
-            let day = self.0.join("sessions").join("2026").join("09").join("23");
-            std::fs::create_dir_all(&day).unwrap();
-            std::fs::write(
-                day.join(format!("rollout-2026-09-23T09-01-10-{id}.jsonl")),
-                format!("{}\n", events.join("\n")),
-            )
-            .unwrap();
-            self
-        }
 
-        fn named(self, id: &str, name: &str) -> Self {
-            let line = format!(
-                r#"{{"id":"{id}","thread_name":"{name}","updated_at":"2026-09-23T06:08:26Z"}}"#
-            );
-            let path = self.0.join("session_index.jsonl");
-            let mut text = std::fs::read_to_string(&path).unwrap_or_default();
-            text.push_str(&line);
-            text.push('\n');
-            std::fs::write(path, text).unwrap();
-            self
-        }
-
-        /// The lock is what says a session is running; dropping it is a Codex
-        /// session exiting.
-        fn exited(self, id: &str) -> Self {
-            std::fs::remove_file(
-                self.0
-                    .join("thread-writer-locks")
-                    .join(format!("{id}.lock")),
-            )
-            .unwrap();
-            self
+            let loaded: Vec<String> = loaded.iter().map(|s| s.to_string()).collect();
+            let deleted = Arc::new(Mutex::new(Vec::new()));
+            let told = deleted.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { break };
+                    let Ok(mut ws) = tungstenite::accept(stream) else {
+                        continue;
+                    };
+                    // Something to pass over, as the real one does.
+                    let _ = ws.send(tungstenite::Message::text(
+                        r#"{"method":"account/updated","params":{}}"#,
+                    ));
+                    while let Ok(message) = ws.read() {
+                        let tungstenite::Message::Text(text) = message else {
+                            continue;
+                        };
+                        let asked: Value = serde_json::from_str(text.as_str()).unwrap();
+                        let Some(id) = asked.get("id").cloned() else {
+                            continue;
+                        };
+                        let result = match asked["method"].as_str().unwrap() {
+                            "initialize" => json!({ "userAgent": "fake" }),
+                            "thread/loaded/list" => json!({ "data": loaded }),
+                            "thread/list" => json!({ "data": threads }),
+                            "thread/read" => {
+                                let want = asked["params"]["threadId"].clone();
+                                match threads.iter().find(|t| t["id"] == want) {
+                                    Some(thread) => json!({ "thread": thread }),
+                                    None => {
+                                        let _ = ws.send(tungstenite::Message::text(
+                                            json!({ "id": id, "error": { "message": "no such thread" } })
+                                                .to_string(),
+                                        ));
+                                        continue;
+                                    }
+                                }
+                            }
+                            "thread/delete" => {
+                                told.lock()
+                                    .unwrap()
+                                    .push(asked["params"]["threadId"].as_str().unwrap().into());
+                                json!({})
+                            }
+                            other => panic!("the fake does not speak {other}"),
+                        };
+                        let _ = ws.send(tungstenite::Message::text(
+                            json!({ "id": id, "result": result }).to_string(),
+                        ));
+                    }
+                }
+            });
+            FakeCodex {
+                dir,
+                socket,
+                deleted,
+            }
         }
     }
 
-    impl Drop for Scratch {
+    impl Drop for FakeCodex {
         fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_dir_all(&self.dir);
+            let _ = std::fs::remove_file(&self.socket);
         }
     }
 
-    const ID: &str = "01a0ccda-8ca8-7902-94df-5786dc86d974";
+    pub const ID: &str = "01a0ccda-8ca8-7902-94df-5786dc86d974";
+    const OTHER: &str = "01a0d957-e55e-7971-bbf8-adea1dcba9b7";
 
-    fn meta(cwd: &str) -> String {
-        format!(
-            r#"{{"timestamp":"2026-09-23T06:04:11.682Z","ordinal":0,"type":"session_meta","payload":{{"session_id":"{ID}","timestamp":"2026-09-23T06:01:10.058Z","cwd":"{cwd}","originator":"codex-tui","cli_version":"0.156.1"}}}}"#
-        )
+    /// A thread as the protocol describes one, updated `ago` seconds ago.
+    pub fn thread(id: &str, name: &str, status: Value, ago: i64) -> Value {
+        let now = Utc::now().timestamp();
+        json!({
+            "id": id,
+            "name": name,
+            "preview": "set up the mail client",
+            "cwd": "/tmp/repo",
+            "createdAt": now - ago - 60,
+            "updatedAt": now - ago,
+            "model": "gpt-6-astra",
+            "path": null,
+            "status": status,
+            "source": "cli",
+            "ephemeral": false,
+            "parentThreadId": null,
+        })
     }
 
-    const SETTINGS: &str = r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-6-astra"}}}"#;
-    const STARTED: &str = r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"t1","model_context_window":258400}}"#;
-    // The whole session has spent a million; the context holds 135,200 now.
-    const TOKENS: &str = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1000000},"last_token_usage":{"total_tokens":135200},"model_context_window":258400}}}"#;
-    const DONE: &str = r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"Copied all three\ninto ~/.codex/skills"}}"#;
+    fn active(flags: &[&str]) -> Value {
+        json!({ "type": "active", "activeFlags": flags })
+    }
+
+    fn only(codex: &FakeCodex) -> Job {
+        let jobs = load(&codex.dir);
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        jobs.into_iter().next().unwrap()
+    }
 
     #[test]
-    fn a_running_session_is_a_row_with_what_it_is_doing() {
-        let s = Scratch::new("running")
-            .session(ID, &[&meta("/tmp/repo"), SETTINGS, STARTED, TOKENS])
-            .named(ID, "CODEX SETUP");
-        let jobs = load(&s.0);
-
-        assert_eq!(jobs.len(), 1);
-        let job = &jobs[0];
-        assert_eq!(job.name, "CODEX SETUP");
+    fn a_running_turn_is_working_whatever_its_rollout_says() {
+        let codex = FakeCodex::start("working", &[ID], vec![thread(ID, "EMAIL", active(&[]), 5)]);
+        let job = only(&codex);
+        assert_eq!(job.name, "EMAIL");
         assert_eq!(job.short, "01a0ccda");
-        assert_eq!(job.session_id, ID);
         assert_eq!(job.cwd, PathBuf::from("/tmp/repo"));
-        assert_eq!(job.status, Status::Working);
         assert_eq!(job.word(), "WORKING");
         assert_eq!(job.model.as_deref(), Some("gpt-6-astra"));
-        // What the context holds, not what the session has spent.
-        assert_eq!(job.context(), 135_200);
-        assert_eq!(job.tokens, 1_000_000);
-        // Its own window, not the panel's guess, less the 12,000 Codex sets
-        // aside: 123,200 of 246,400 is half.
-        assert_eq!(job.context_percent(), Some(50));
-        assert_eq!(
-            job.created_at.map(|at| at.to_rfc3339()),
-            Some("2026-09-23T06:01:10.058+00:00".to_string())
-        );
         assert_eq!(job.open_command(), ["codex", "resume", ID]);
     }
 
     #[test]
-    fn a_finished_turn_is_idle_and_says_the_last_thing_it_said() {
-        // Not `DONE`: the session is still running and can be resumed with a
-        // word. And not `WAITING` either — see the module note.
-        let s = Scratch::new("idle").session(ID, &[&meta("/tmp/repo"), STARTED, TOKENS, DONE]);
-        let jobs = load(&s.0);
-
-        assert_eq!(jobs[0].status, Status::Done);
-        assert_eq!(jobs[0].word(), "IDLE");
-        assert_eq!(
-            jobs[0].summary, "Copied all three into ~/.codex/skills",
-            "one line, whatever the message did"
+    fn a_turn_stopped_on_you_is_waiting_and_says_for_what() {
+        // What the rollouts never held: Codex says so itself.
+        let codex = FakeCodex::start(
+            "waiting",
+            &[ID],
+            vec![thread(ID, "EMAIL", active(&["waitingOnApproval"]), 5)],
         );
+        let job = only(&codex);
+        assert_eq!(job.word(), "WAITING");
+        assert_eq!(job.status, Status::NeedsInput);
+        assert_eq!(job.summary, "wants your approval");
     }
 
     #[test]
-    fn a_session_opened_but_not_yet_asked_anything_is_still_a_row() {
-        // What the owner saw: a Codex session started in the pane beside the
-        // panel, named, waiting at its prompt — and no row, because Codex
-        // writes the rollout on the first turn and there was nothing to read.
-        let s = Scratch::new("fresh");
-        std::fs::write(
-            s.0.join("thread-writer-locks").join(format!("{ID}.lock")),
-            "",
-        )
-        .unwrap();
-        let s = s.named(ID, "CODEX SETUP 2");
-
-        let jobs = load(&s.0);
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].name, "CODEX SETUP 2");
-        assert_eq!(jobs[0].word(), "IDLE");
-        assert_eq!(jobs[0].summary, "nothing asked yet");
-        assert!(jobs[0].created_at.is_some(), "aged from its lock");
-        // Nothing holds this lock, so nothing says where it is, and it is not
-        // put anywhere.
-        assert_eq!(jobs[0].repo(), "no directory");
-        assert_eq!(jobs[0].open_command(), ["codex", "resume", ID]);
-        // And nothing to resume: enter must not start a `codex resume` that
-        // answers "No saved session found" and leaves a dead tab.
-        assert!(!has_rollout(&s.0, ID));
-    }
-
-    #[test]
-    fn a_session_that_has_been_asked_something_has_a_rollout() {
-        let s = Scratch::new("rollout").session(ID, &[&meta("/tmp/repo"), STARTED]);
-        assert!(has_rollout(&s.0, ID));
-        assert!(!has_rollout(&s.0, "01a0cfa4-7b7e-7250-8008-6df63f7f61b0"));
-    }
-
-    #[test]
-    fn a_session_not_yet_asked_anything_stands_where_its_process_does() {
-        // What the owner saw next: a Codex session opened in a tab under
-        // savras, drawn under "no directory". Its process holds the lock and
-        // stands in savras, and that is where it goes.
-        let lsof = "p8048\nfcwd\nn/code/savras\nf3\nn/dev/ttys004\n\
-                    f19\nn/h/.codex/thread-writer-locks/01a0cfa4-7b7e-7250-8008-6df63f7f61b0.lock\n\
-                    f20\nn/h/.codex/thread-writer-locks/.coordination.lock\n\
-                    p99\nfcwd\nn/\n\
-                    f7\nn/h/.codex/thread-writer-locks/01a0ccda-8ca8-7902-94df-5786dc86d974.lock\n";
-        let held = parse_held(lsof, Path::new("/h/.codex/thread-writer-locks"));
-        assert_eq!(
-            held.get("01a0cfa4-7b7e-7250-8008-6df63f7f61b0"),
-            Some(&Holder {
-                pid: 8048,
-                cwd: Some(PathBuf::from("/code/savras"))
-            })
+    fn loaded_between_turns_is_idle_and_closed_is_done() {
+        let codex = FakeCodex::start(
+            "idle-done",
+            &[ID],
+            vec![
+                thread(ID, "CODE REVIEW", json!({ "type": "idle" }), 60),
+                thread(OTHER, "EMAIL", json!({ "type": "notLoaded" }), 600),
+            ],
         );
-        assert_eq!(
-            held.get(ID),
-            Some(&Holder { pid: 99, cwd: None }),
-            "a holder at / says nothing about where, but it is still who holds it"
+        let jobs = load(&codex.dir);
+        let word = |name: &str| jobs.iter().find(|j| j.name == name).map(Job::word);
+        assert_eq!(word("CODE REVIEW"), Some("IDLE"));
+        // Closed an hour ago — a panel restart took its tab — and still a
+        // row to resume.
+        assert_eq!(word("EMAIL"), Some("DONE"));
+    }
+
+    #[test]
+    fn a_closed_thread_older_than_a_day_is_not_a_row_and_a_loaded_one_always_is() {
+        let day = 24 * 3600;
+        let codex = FakeCodex::start(
+            "old",
+            &[ID],
+            vec![
+                thread(ID, "LONG RUNNING", json!({ "type": "idle" }), 3 * day),
+                thread(OTHER, "LAST WEEK", json!({ "type": "notLoaded" }), 7 * day),
+            ],
         );
-        assert_eq!(held.len(), 2, "a lock that is not a session is no session");
+        assert_eq!(only(&codex).name, "LONG RUNNING");
     }
 
     #[test]
-    fn each_session_is_held_by_the_process_whose_locks_it_is_among() {
-        // Two Codex processes, one session each: the pid that comes before a
-        // lock is its holder, not the one before that. This is what enter on
-        // the row joins to a tab with.
-        let lsof = "p8048\nfcwd\nn/code/a\n\
-                    f19\nn/h/locks/01a0cfa4-7b7e-7250-8008-6df63f7f61b0.lock\n\
-                    p8101\nfcwd\nn/code/b\n\
-                    f7\nn/h/locks/01a0ccda-8ca8-7902-94df-5786dc86d974.lock\n";
-        let held = parse_held(lsof, Path::new("/h/locks"));
-        assert_eq!(held["01a0cfa4-7b7e-7250-8008-6df63f7f61b0"].pid, 8048);
-        assert_eq!(held[ID].pid, 8101);
-        assert_eq!(held[ID].cwd, Some(PathBuf::from("/code/b")));
+    fn exec_runs_and_sub_agents_are_not_sessions() {
+        let mut exec = thread(ID, "one-shot", json!({ "type": "notLoaded" }), 60);
+        exec["source"] = json!("exec");
+        let mut sub = thread(OTHER, "helper", active(&[]), 60);
+        sub["source"] = json!({ "subAgent": { "thread_spawn": {} } });
+        let codex = FakeCodex::start("sources", &[OTHER], vec![exec, sub]);
+        assert!(load(&codex.dir).is_empty());
     }
 
     #[test]
-    fn a_process_holding_a_lock_is_found_by_lsof() {
-        // The real `lsof`, with this test as the holder.
-        if Command::new("lsof").arg("-v").output().is_err() {
-            return;
-        }
-        let s = Scratch::new("held");
-        let lock = s.0.join("thread-writer-locks").join(format!("{ID}.lock"));
-        std::fs::write(&lock, "").unwrap();
-        let _held = std::fs::File::open(&lock).unwrap();
-        let held = held_by(
-            &[std::process::id().to_string()],
-            &s.0.join("thread-writer-locks"),
+    fn a_broken_thread_is_failed() {
+        let codex = FakeCodex::start(
+            "broken",
+            &[ID],
+            vec![thread(ID, "EMAIL", json!({ "type": "systemError" }), 5)],
         );
-        assert_eq!(
-            held.get(ID),
-            Some(&Holder {
-                pid: std::process::id() as i32,
-                cwd: Some(std::env::current_dir().unwrap())
-            })
-        );
+        assert_eq!(only(&codex).word(), "FAILED");
     }
 
     #[test]
-    fn a_lock_that_is_not_a_session_is_not_a_row() {
-        // Codex keeps a `.coordination.lock` in the same directory. Taken for
-        // a session it would be a row named after a file.
-        let s = Scratch::new("coordination").session(ID, &[&meta("/tmp/repo"), STARTED]);
-        std::fs::write(
-            s.0.join("thread-writer-locks").join(".coordination.lock"),
-            "",
-        )
-        .unwrap();
-        std::fs::write(s.0.join("thread-writer-locks").join("notes.lock"), "").unwrap();
-
-        let jobs = load(&s.0);
-        assert_eq!(jobs.len(), 1, "only the uuid is a session");
-        assert_eq!(jobs[0].session_id, ID);
-    }
-
-    #[test]
-    fn a_session_that_exited_is_not_a_row() {
-        // Codex keeps every rollout it has ever written. Only the lock says
-        // which of them is a session you could still talk to.
-        let s = Scratch::new("exited")
-            .session(ID, &[&meta("/tmp/repo"), STARTED])
-            .exited(ID);
-        assert!(load(&s.0).is_empty());
-    }
-
-    #[test]
-    fn an_unnamed_thread_still_has_something_to_call_it() {
-        let s = Scratch::new("unnamed").session(ID, &[&meta("/tmp/repo"), STARTED]);
-        assert_eq!(load(&s.0)[0].name, "codex 01a0ccda");
-    }
-
-    #[test]
-    fn no_codex_on_this_machine_is_no_rows_and_no_error() {
+    fn no_daemon_is_no_rows_and_no_error() {
         assert!(load(Path::new("/nonexistent/savras/codex")).is_empty());
+        assert!(!saved(Path::new("/nonexistent/savras/codex"), ID));
+        assert!(delete(Path::new("/nonexistent/savras/codex"), ID).is_err());
     }
 
     #[test]
-    fn a_rollout_longer_than_the_tail_is_read_from_its_end() {
-        // The real files reach megabytes within the hour. What matters is the
-        // last turn, and the first line, which is where the session says what
-        // it is and where.
-        let filler: Vec<String> = (0..4000)
-            .map(|n| {
-                format!(
-                    r#"{{"type":"response_item","payload":{{"type":"reasoning","id":"r{n}","text":"{}"}}}}"#,
-                    "x".repeat(80)
-                )
-            })
-            .collect();
-        let mut events: Vec<&str> = vec![SETTINGS, STARTED];
-        events.extend(filler.iter().map(String::as_str));
-        events.push(TOKENS);
-        events.push(DONE);
-        let meta = meta("/tmp/repo");
-        let mut all = vec![meta.as_str()];
-        all.extend(events);
-
-        let s = Scratch::new("long").session(ID, &all);
-        let jobs = load(&s.0);
-        assert_eq!(jobs[0].cwd, PathBuf::from("/tmp/repo"), "the head is read");
-        assert_eq!(jobs[0].context(), 135_200, "and so is the end");
-        assert_eq!(jobs[0].word(), "IDLE");
-    }
-
-    /// `n` lines of a turn's working, about 130 bytes each.
-    fn filler(n: usize) -> Vec<String> {
-        (0..n)
-            .map(|n| {
-                format!(
-                    r#"{{"type":"response_item","payload":{{"type":"reasoning","id":"r{n}","text":"{}"}}}}"#,
-                    "x".repeat(80)
-                )
-            })
-            .collect()
-    }
-
-    #[test]
-    fn a_turn_whose_start_is_out_of_the_tail_is_still_working() {
-        // A long turn's tool calls push `task_started` out of the last 64 KiB
-        // within minutes, and the row said IDLE for a session hard at work.
-        // The quoted words inside a message are escaped, so they are no turn.
-        let quoted = r#"{"type":"response_item","payload":{"type":"message","text":"saw \"type\":\"task_complete\" in the log"}}"#;
-        let work = filler(1000);
-        let meta = meta("/tmp/repo");
-        let mut events = vec![meta.as_str(), STARTED, quoted];
-        events.extend(work.iter().map(String::as_str));
-        events.push(TOKENS);
-        let s = Scratch::new("long-turn").session(ID, &events);
-
-        let jobs = load(&s.0);
-        assert_eq!(jobs[0].word(), "WORKING");
-        // Asked again — the panel does, every tick — from what was kept.
-        assert_eq!(load(&s.0)[0].word(), "WORKING");
-    }
-
-    #[test]
-    fn a_finished_turn_out_of_the_tail_is_idle_and_so_is_an_interrupted_one() {
-        let work = filler(1000);
-        let meta = meta("/tmp/repo");
-        let mut events = vec![meta.as_str(), STARTED, DONE];
-        events.extend(work.iter().map(String::as_str));
-        let s = Scratch::new("long-done").session(ID, &events);
-        assert_eq!(load(&s.0)[0].word(), "IDLE");
-
-        let aborted =
-            r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#;
-        let s = Scratch::new("aborted").session(ID, &[&meta, STARTED, TOKENS, aborted]);
-        assert_eq!(load(&s.0)[0].word(), "IDLE");
-    }
-
-    #[test]
-    fn the_percentage_is_the_one_codex_draws_for_itself() {
+    fn the_context_is_what_the_rollout_says_the_last_request_held() {
         // From a real session: Codex said "Context 4% used" when its last
         // request was 20,744 tokens, and the row said 39% — the whole
         // session's spend, 100,938, over the window.
-        let tokens = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100938},"last_token_usage":{"total_tokens":20744},"model_context_window":258400}}}"#;
-        let s = Scratch::new("percent").session(ID, &[&meta("/tmp/repo"), STARTED, tokens]);
-        assert_eq!(load(&s.0)[0].context_percent(), Some(4));
+        let codex = FakeCodex::start("tokens", &[ID], Vec::new());
+        let rollout = codex.dir.join("rollout.jsonl");
+        std::fs::write(
+            &rollout,
+            [
+                r#"{"type":"session_meta","payload":{"cwd":"/tmp/repo"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"task_started","model_context_window":258400}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100938},"last_token_usage":{"total_tokens":20744},"model_context_window":258400}}}"#,
+                r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Installed\nThunderbird"}}"#,
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        let mut t = thread(ID, "EMAIL", json!({ "type": "idle" }), 5);
+        t["path"] = json!(rollout);
+        let job = row(serde_json::from_value(t).unwrap());
+        assert_eq!(job.context(), 20_744);
+        assert_eq!(job.tokens, 100_938);
+        assert_eq!(job.context_percent(), Some(4));
+        assert_eq!(job.summary, "Installed Thunderbird");
     }
 
     #[test]
-    fn a_line_that_does_not_parse_does_not_lose_the_session() {
-        // Another program's format, undocumented: a field we cannot read has
-        // to cost a column, never the row.
-        let s = Scratch::new("garbage").session(
-            ID,
-            &[
-                &meta("/tmp/repo"),
-                "{not json at all",
-                r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
-            ],
+    fn saved_is_whether_codex_wrote_it_down_and_delete_asks_codex() {
+        let codex = FakeCodex::start("saved", &[ID, OTHER], Vec::new());
+        assert!(!saved(&codex.dir, ID), "no such thread");
+
+        let rollout = codex.dir.join("rollout.jsonl");
+        std::fs::write(&rollout, "").unwrap();
+        let mut asked = thread(ID, "EMAIL", json!({ "type": "idle" }), 5);
+        asked["path"] = json!(rollout);
+        let never = thread(OTHER, "NEW", json!({ "type": "idle" }), 5);
+        let codex = FakeCodex::start("saved2", &[ID, OTHER], vec![asked, never]);
+        assert!(saved(&codex.dir, ID));
+        assert!(!saved(&codex.dir, OTHER), "opened, never asked: no rollout");
+
+        delete(&codex.dir, ID).unwrap();
+        assert_eq!(*codex.deleted.lock().unwrap(), [ID]);
+    }
+
+    #[test]
+    fn an_unnamed_thread_is_called_by_what_it_was_asked_or_its_id() {
+        let mut t = thread(ID, "", json!({ "type": "idle" }), 5);
+        assert_eq!(
+            row(serde_json::from_value(t.clone()).unwrap()).name,
+            "set up the mail client"
         );
-        let jobs = load(&s.0);
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].status, Status::Working);
-        assert_eq!(jobs[0].context_percent(), Some(0), "nothing counted yet");
-        assert_eq!(jobs[0].model, None);
+        t["preview"] = json!("");
+        assert_eq!(
+            row(serde_json::from_value(t).unwrap()).name,
+            "codex 01a0ccda"
+        );
     }
 }
