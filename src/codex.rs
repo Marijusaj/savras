@@ -56,6 +56,19 @@ use crate::job::{Client, Job, Status};
 /// that a megabyte file costs a seek and one read.
 const TAIL: u64 = 64 * 1024;
 
+/// How much of a rollout is read at a time when looking further back than the
+/// tail for where its turn stands.
+const CHUNK: u64 = 256 * 1024;
+
+/// What a turn event looks like in a rollout, and whether it means a turn is
+/// in flight. Matched as bytes: Codex writes compact JSON, and the same words
+/// quoted inside a message are escaped (`\"type\":…`), so they cannot match.
+const TURNS: [(&[u8], bool); 3] = [
+    (br#""type":"task_started""#, true),
+    (br#""type":"task_complete""#, false),
+    (br#""type":"turn_aborted""#, false),
+];
+
 /// How far into the tree `sessions/` is walked: year, month, day, file.
 const DEPTH: usize = 4;
 
@@ -424,7 +437,7 @@ fn read_one(id: &str, path: &Path, name: Option<String>) -> Option<Job> {
         machine: None,
         created_at: start.at,
         model: now.model,
-        context: Some(now.tokens),
+        context: Some(now.held),
         // Codex says its own window, per turn, so the panel does not have to
         // know what `gpt-6-astra` holds — and is not wrong when that changes.
         context_window: now.window,
@@ -447,7 +460,12 @@ struct Start {
 struct Now {
     working: bool,
     said: Option<String>,
+    /// Every token the session has spent, turn after turn — what it cost.
     tokens: u64,
+    /// What the context holds now: the last request's whole size. Not
+    /// `tokens`, which counts the same history again on every turn and read
+    /// 39% for a session Codex itself said was at 4%.
+    held: u64,
     window: Option<u64>,
     model: Option<String>,
 }
@@ -491,6 +509,8 @@ fn tail(path: &Path) -> Now {
         lines.remove(0);
     }
 
+    // Where the turn stands, once a turn event has been seen.
+    let mut turn = None;
     for line in lines {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -503,24 +523,31 @@ fn tail(path: &Path) -> Now {
             // is doing. `task_started` carries the window this model was
             // given, which is the honest denominator for the percentage.
             Some("task_started") => {
-                now.working = true;
+                turn = Some(true);
                 now.window = payload
                     .get("model_context_window")
                     .and_then(Value::as_u64)
                     .or(now.window);
             }
             Some("task_complete") => {
-                now.working = false;
+                turn = Some(false);
                 now.said = str_at(payload, "last_agent_message").map(str::to_string);
             }
+            // Interrupted with esc: over, and without a last word.
+            Some("turn_aborted") => turn = Some(false),
             Some("token_count") => {
-                if let Some(total) = payload
-                    .get("info")
-                    .and_then(|i| i.get("total_token_usage"))
-                    .and_then(|u| u.get("total_tokens"))
-                    .and_then(Value::as_u64)
-                {
+                let usage = |key: &str| {
+                    payload
+                        .get("info")
+                        .and_then(|i| i.get(key))
+                        .and_then(|u| u.get("total_tokens"))
+                        .and_then(Value::as_u64)
+                };
+                if let Some(total) = usage("total_token_usage") {
                     now.tokens = total;
+                }
+                if let Some(last) = usage("last_token_usage") {
+                    now.held = last;
                 }
                 if let Some(window) = payload
                     .get("info")
@@ -540,7 +567,72 @@ fn tail(path: &Path) -> Now {
             _ => {}
         }
     }
+    // A long turn's tool calls push its `task_started` out of the tail within
+    // minutes, and a session read as idle while it works is the row lying.
+    now.working = match turn {
+        Some(working) => working,
+        // Up to the end of the half line the tail dropped, so an event cut in
+        // two there is still found.
+        None if from > 0 => {
+            let cut = bytes.iter().position(|b| *b == b'\n').unwrap_or(0) as u64;
+            turn_before(path, &mut file, from + cut).unwrap_or(false)
+        }
+        None => false,
+    };
     now
+}
+
+/// Where the turn stood at byte `end` of a rollout: whether the last turn
+/// event before it started a turn. `None` when there is none at all.
+///
+/// Rollouts reach megabytes and the panel asks every tick, so what was found
+/// is kept with how far it was looked for, and the next asking reads only
+/// what was written since. A file shorter than what was kept is a new file.
+fn turn_before(path: &Path, file: &mut std::fs::File, end: u64) -> Option<bool> {
+    /// Per rollout: how far it has been looked through, and what was found.
+    type Seen = HashMap<PathBuf, (u64, Option<bool>)>;
+    static TURNS_SEEN: OnceLock<Mutex<Seen>> = OnceLock::new();
+    let seen = TURNS_SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+    let (from, before) = match seen.lock().unwrap().get(path) {
+        Some(&(upto, before)) if upto <= end => (upto, before),
+        _ => (0, None),
+    };
+    let found = last_turn_between(file, from, end).or(before);
+    seen.lock()
+        .unwrap()
+        .insert(path.to_path_buf(), (end, found));
+    found
+}
+
+/// The last turn event in bytes `start..end`, read backwards a chunk at a time
+/// so that the answer nearest the end costs the least.
+fn last_turn_between(file: &mut std::fs::File, start: u64, end: u64) -> Option<bool> {
+    // Chunks overlap by the longest needle, so none is cut in two.
+    let overlap = TURNS.iter().map(|(n, _)| n.len()).max().unwrap_or(0) as u64;
+    let mut hi = end;
+    while hi > start {
+        let lo = hi.saturating_sub(CHUNK).max(start);
+        let mut bytes = vec![0u8; (hi - lo) as usize];
+        file.seek(SeekFrom::Start(lo)).ok()?;
+        file.read_exact(&mut bytes).ok()?;
+        let last = TURNS
+            .iter()
+            .filter_map(|(needle, working)| {
+                bytes
+                    .windows(needle.len())
+                    .rposition(|w| w == *needle)
+                    .map(|at| (at, *working))
+            })
+            .max_by_key(|(at, _)| *at);
+        if let Some((_, working)) = last {
+            return Some(working);
+        }
+        if lo == start {
+            break;
+        }
+        hi = lo + overlap;
+    }
+    None
 }
 
 /// The eight characters of the session id the row is known by, which is also
@@ -662,7 +754,8 @@ mod tests {
 
     const SETTINGS: &str = r#"{"type":"event_msg","payload":{"type":"thread_settings_applied","thread_settings":{"model":"gpt-6-astra"}}}"#;
     const STARTED: &str = r#"{"type":"event_msg","payload":{"type":"task_started","turn_id":"t1","model_context_window":258400}}"#;
-    const TOKENS: &str = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":129200},"model_context_window":258400}}}"#;
+    // The whole session has spent a million; the context holds 135,200 now.
+    const TOKENS: &str = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1000000},"last_token_usage":{"total_tokens":135200},"model_context_window":258400}}}"#;
     const DONE: &str = r#"{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"Copied all three\ninto ~/.codex/skills"}}"#;
 
     #[test]
@@ -681,8 +774,11 @@ mod tests {
         assert_eq!(job.status, Status::Working);
         assert_eq!(job.word(), "WORKING");
         assert_eq!(job.model.as_deref(), Some("gpt-6-astra"));
-        assert_eq!(job.context(), 129_200);
-        // Its own window, not the panel's guess: half of 258,400.
+        // What the context holds, not what the session has spent.
+        assert_eq!(job.context(), 135_200);
+        assert_eq!(job.tokens, 1_000_000);
+        // Its own window, not the panel's guess, less the 12,000 Codex sets
+        // aside: 123,200 of 246,400 is half.
         assert_eq!(job.context_percent(), Some(50));
         assert_eq!(
             job.created_at.map(|at| at.to_rfc3339()),
@@ -867,8 +963,64 @@ mod tests {
         let s = Scratch::new("long").session(ID, &all);
         let jobs = load(&s.0);
         assert_eq!(jobs[0].cwd, PathBuf::from("/tmp/repo"), "the head is read");
-        assert_eq!(jobs[0].context(), 129_200, "and so is the end");
+        assert_eq!(jobs[0].context(), 135_200, "and so is the end");
         assert_eq!(jobs[0].word(), "IDLE");
+    }
+
+    /// `n` lines of a turn's working, about 130 bytes each.
+    fn filler(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|n| {
+                format!(
+                    r#"{{"type":"response_item","payload":{{"type":"reasoning","id":"r{n}","text":"{}"}}}}"#,
+                    "x".repeat(80)
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_turn_whose_start_is_out_of_the_tail_is_still_working() {
+        // A long turn's tool calls push `task_started` out of the last 64 KiB
+        // within minutes, and the row said IDLE for a session hard at work.
+        // The quoted words inside a message are escaped, so they are no turn.
+        let quoted = r#"{"type":"response_item","payload":{"type":"message","text":"saw \"type\":\"task_complete\" in the log"}}"#;
+        let work = filler(1000);
+        let meta = meta("/tmp/repo");
+        let mut events = vec![meta.as_str(), STARTED, quoted];
+        events.extend(work.iter().map(String::as_str));
+        events.push(TOKENS);
+        let s = Scratch::new("long-turn").session(ID, &events);
+
+        let jobs = load(&s.0);
+        assert_eq!(jobs[0].word(), "WORKING");
+        // Asked again — the panel does, every tick — from what was kept.
+        assert_eq!(load(&s.0)[0].word(), "WORKING");
+    }
+
+    #[test]
+    fn a_finished_turn_out_of_the_tail_is_idle_and_so_is_an_interrupted_one() {
+        let work = filler(1000);
+        let meta = meta("/tmp/repo");
+        let mut events = vec![meta.as_str(), STARTED, DONE];
+        events.extend(work.iter().map(String::as_str));
+        let s = Scratch::new("long-done").session(ID, &events);
+        assert_eq!(load(&s.0)[0].word(), "IDLE");
+
+        let aborted =
+            r#"{"type":"event_msg","payload":{"type":"turn_aborted","reason":"interrupted"}}"#;
+        let s = Scratch::new("aborted").session(ID, &[&meta, STARTED, TOKENS, aborted]);
+        assert_eq!(load(&s.0)[0].word(), "IDLE");
+    }
+
+    #[test]
+    fn the_percentage_is_the_one_codex_draws_for_itself() {
+        // From a real session: Codex said "Context 4% used" when its last
+        // request was 20,744 tokens, and the row said 39% — the whole
+        // session's spend, 100,938, over the window.
+        let tokens = r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":100938},"last_token_usage":{"total_tokens":20744},"model_context_window":258400}}}"#;
+        let s = Scratch::new("percent").session(ID, &[&meta("/tmp/repo"), STARTED, tokens]);
+        assert_eq!(load(&s.0)[0].context_percent(), Some(4));
     }
 
     #[test]

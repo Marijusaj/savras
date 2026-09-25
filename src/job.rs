@@ -301,10 +301,21 @@ impl Job {
         let window = self
             .context_window
             .unwrap_or_else(|| context_window(self.model.as_deref()));
+        // Codex sets its first 12,000 tokens aside — its instructions and
+        // tools, which no conversation can free — and counts the rest against
+        // the rest of the window. Its own footer does, so the row does too:
+        // 20,744 of 258,400 is 4% there, and would be 8% here otherwise.
+        let (held, window) = match self.client {
+            Client::Codex => (
+                self.context().saturating_sub(CODEX_BASELINE),
+                window.saturating_sub(CODEX_BASELINE).max(1),
+            ),
+            Client::Claude => (self.context(), window),
+        };
         // Rounded, not truncated, so the row agrees with the status line the
         // session draws for itself: 386,839 of a million is 39% in both
         // places, and two numbers for one thing is worse than either.
-        let percent = (self.context().saturating_mul(100) + window / 2) / window;
+        let percent = (held.saturating_mul(100) + window / 2) / window;
         Some(percent.min(100) as u8)
     }
 
@@ -447,6 +458,10 @@ fn deploy_of(pr: &RawPr) -> Deploy {
 /// million. Everything else is 200k, which is the family's ordinary window —
 /// and an unknown model guessing 200k is the safe way round, since it makes a
 /// busy session look busier rather than emptier than it is.
+/// The tokens Codex sets aside before it counts a conversation against its
+/// window — `BASELINE_TOKENS` in its own source. See `Job::context_percent`.
+const CODEX_BASELINE: u64 = 12_000;
+
 fn context_window(model: Option<&str>) -> u64 {
     match model {
         Some(name) if name.contains("[1m]") => 1_000_000,
