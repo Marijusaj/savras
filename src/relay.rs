@@ -8,13 +8,18 @@
 //!
 //! # Who decides, and on whose account
 //!
-//! Some messages name their reader outright: a `--re` reply is for whoever
-//! said the message it answers, and `@NAME` is for NAME. Those are routed
-//! here, with nobody asked — see [`plan`].
+//! A post names its reader — `svr board post` refuses one that does not: a
+//! `--to` or `@NAME` is for those sessions, and a `--re` reply for whoever
+//! said the message it answers. Those are routed here, with nobody asked —
+//! see [`plan`]. A post `--everyone` is for each session's next turn, and the
+//! relay leaves it there.
 //!
-//! The rest is a judgement, not a string match — "I'm about to change
-//! `Boards::unread`" concerns whoever is editing `board.rs`, and nothing in the
-//! text names them. So a model decides: `claude -p` with a
+//! Guessing whom an unaddressed message concerns — "I'm about to change
+//! `Boards::unread`" is for whoever is editing `board.rs` — is `--judge`, and
+//! off unless asked for: nearly every such message is news that concerns
+//! nobody, so judging cost a call apiece and pinged no one, and a wrong guess
+//! costs a session a turn. Asked for, or delivering to a Claude session, a
+//! model is `claude -p` with a
 //! cheap model, on the owner's **subscription** — the same login their
 //! sessions use, never an API key (the variable is removed from its
 //! environment, so a key lying around cannot quietly start billing). It runs
@@ -52,7 +57,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::board::{self, Boards, Message, Owner, WINDOW};
-use crate::job::{self, Client, Job, Status};
+use crate::job::{self, Client, Job};
 use crate::watch::Watch;
 
 /// The reader name the relay's place on each board is kept under.
@@ -91,26 +96,34 @@ const SUMMARY: usize = 200;
 const USAGE: &str = "\
 svr board relay — ping the session a new board message is for
 
-    svr board relay [--repo <path>] [--model <m>] [--dry-run]
+    svr board relay [--repo <path>] [--model <m>] [--judge] [--dry-run]
 
-Watches every board on this machine, or one. A reply (`--re`) is relayed to
-whoever said the message it answers, and `@NAME` to NAME. Anything else, a
-cheap model (`claude -p`, on your Claude subscription, never an API key) reads
-next to the sessions working in that repository, and picks the ones it
-concerns. Claude Code sessions are pinged through SendMessage, Codex sessions
-through `codex queue`. It never posts to a board. Runs until ctrl-c; the
+Watches every board on this machine, or one. A message addressed with `--to`
+or `@NAME` is relayed to those sessions, and a reply (`--re`) to whoever said
+the message it answers. A message for everyone is left for each session's next
+turn. Claude Code sessions are pinged through SendMessage — one short call to a
+cheap model (`claude -p`, on your Claude subscription, never an API key), since
+only a Claude session can send one — and Codex sessions through `codex queue`,
+with no model at all. It never posts to a board. Runs until ctrl-c; the
 owner's to start — `R` in the panel starts it as a tab, and the panel starts
 it again when it next opens, until you stop it. One relay per board: another
 one started on the same board stands by until the first stops.
 
     --repo <path>  relay only the board of the repository at <path>
-    --model <m>    the model that decides (default haiku)
+    --model <m>    the model that delivers (default haiku)
+    --judge        also have the model guess whom an unaddressed message
+                   concerns — a call per message, and a wrong guess costs a
+                   session a turn
     --dry-run      decide and print, but ping nobody
 ";
 
 struct Options {
     model: String,
     dry_run: bool,
+    /// Ask the model whom an unaddressed message concerns. Off unless asked
+    /// for: a post names its reader, and a guess costs a call and, when
+    /// wrong, a session's turn.
+    judge: bool,
     /// The one board to relay, by repository; every board when `None`.
     repo: Option<String>,
 }
@@ -119,6 +132,7 @@ fn parse(args: &[String]) -> Result<Option<Options>> {
     let mut options = Options {
         model: MODEL.to_string(),
         dry_run: false,
+        judge: false,
         repo: None,
     };
     let mut args = args.iter();
@@ -127,6 +141,7 @@ fn parse(args: &[String]) -> Result<Option<Options>> {
             "-h" | "--help" => return Ok(None),
             "--model" => options.model = args.next().context("--model needs a name")?.clone(),
             "--dry-run" => options.dry_run = true,
+            "--judge" => options.judge = true,
             // Any path inside the repository will do, a worktree's included:
             // it is resolved the way a post from there would be.
             "--repo" => {
@@ -185,6 +200,7 @@ pub fn run(args: &[String]) -> Result<()> {
             if !held.hold(&boards, &repo) {
                 continue;
             }
+            beat(&boards, &repo);
             let (messages, mark) = boards.unread(READER, &repo, WINDOW);
             // Marked before deciding, not after: a decision that fails — a
             // usage limit, a timeout — is said here and not retried forever.
@@ -282,6 +298,41 @@ fn lock(boards: &Boards, repo: &str) -> Result<Option<std::fs::File>> {
     }
 }
 
+/// How stale a relay's heartbeat may be and it still be running. A relay
+/// beats once per pass, and a pass comes at least every [`POLL`] and
+/// [`SETTLE`] — so three missed passes is a relay that is gone.
+const ALIVE: Duration = Duration::from_secs(100);
+
+fn heartbeat(boards: &Boards, repo: &str) -> std::path::PathBuf {
+    relays_dir(boards).join(format!("{}.alive", board::encode(repo)))
+}
+
+/// Say this relay is serving `repo`'s board now. A post reads it to tell its
+/// poster whether the reader is pinged now or reads it next turn.
+fn beat(boards: &Boards, repo: &str) {
+    let path = heartbeat(boards, repo);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, Utc::now().to_rfc3339());
+}
+
+/// Whether a relay is serving `repo`'s board.
+///
+/// The heartbeat first, so a board nobody relays is answered without touching
+/// the lock. A fresh one can outlive its relay by a minute — a relay that is
+/// killed leaves it behind — so it is confirmed by the lock, which the system
+/// lets go of the moment the relay ends. Taking the lock to look can only
+/// ever make a relay starting in that same instant stand by for one pass.
+pub fn alive(boards: &Boards, repo: &str) -> bool {
+    let fresh = std::fs::metadata(heartbeat(boards, repo))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|at| at.elapsed().ok())
+        .is_some_and(|age| age < ALIVE);
+    fresh && matches!(lock(boards, repo), Ok(None))
+}
+
 /// The boards the owner asked to be relayed with `R` and has not stopped,
 /// which the panel starts again when it opens.
 pub fn wanted(boards: &Boards) -> Vec<String> {
@@ -290,7 +341,12 @@ pub fn wanted(boards: &Boards) -> Vec<String> {
     };
     let mut repos: Vec<String> = entries
         .flatten()
-        .filter(|e| e.path().extension().is_none_or(|x| x != "lock"))
+        // By suffix, not by extension: a repository's encoded path keeps its
+        // dots, so `my.app` has an extension of its own.
+        .filter(|e| {
+            let name = e.file_name().to_string_lossy().to_string();
+            !name.ends_with(".lock") && !name.ends_with(".alive")
+        })
         .filter_map(|e| std::fs::read_to_string(e.path()).ok())
         .map(|repo| repo.trim().to_string())
         .filter(|repo| !repo.is_empty())
@@ -358,9 +414,8 @@ struct Candidate<'a> {
 /// every message in the batch: nobody is pinged with their own words.
 fn candidates<'a>(jobs: &'a [Job], repo: &str, messages: &[Message]) -> Vec<Candidate<'a>> {
     let posters: HashSet<&str> = messages.iter().map(|m| m.from.as_str()).collect();
-    jobs.iter()
-        .filter(|job| job.machine.is_none())
-        .filter(|job| board::topic_of(&job.cwd) == repo)
+    crate::peers::in_repo(jobs, repo)
+        .into_iter()
         .filter(|job| !(posters.len() == 1 && posters.contains(job.name.as_str())))
         .enumerate()
         .map(|(i, job)| Candidate {
@@ -383,8 +438,11 @@ struct Plan<'a> {
     queue: Vec<Named<'a>>,
     /// Claude sessions a message names: the model delivers, and judges nothing.
     deliver: Vec<Named<'a>>,
-    /// Messages that name nobody here, for the model to judge.
+    /// Messages that name nobody here, for the model to judge — only when
+    /// the relay was asked to judge.
     judge: Vec<&'a Message>,
+    /// Messages that name nobody here, left for their readers' next turn.
+    unaddressed: Vec<&'a Message>,
 }
 
 impl Plan<'_> {
@@ -394,8 +452,9 @@ impl Plan<'_> {
     }
 }
 
-/// Whom `message` names outright, among the candidates: the poster of the
-/// message it answers, and anyone it `@`-mentions. Never its own poster.
+/// Whom `message` names outright, among the candidates: its `--to`, the
+/// poster of the message it answers, and anyone it `@`-mentions. Never its
+/// own poster.
 fn named<'a>(
     message: &Message,
     answers: Option<&Message>,
@@ -406,9 +465,15 @@ fn named<'a>(
         if c.job.name == message.from {
             continue;
         }
-        let why = if answers.is_some_and(|parent| parent.from == c.job.name) {
+        let why = if message
+            .to
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&c.job.name))
+        {
+            "addressed to them"
+        } else if answers.is_some_and(|parent| parent.from == c.job.name) {
             "answers their message"
-        } else if mentions(&message.text, &c.job.name) {
+        } else if crate::peers::mentions(&message.text, &c.job.name) {
             "names them"
         } else {
             continue;
@@ -418,33 +483,21 @@ fn named<'a>(
     out
 }
 
-/// Whether `text` says `@name`, whole — `@SAVRAS 1` is not `@SAVRAS 13`.
-fn mentions(text: &str, name: &str) -> bool {
-    if name.trim().is_empty() {
-        return false;
-    }
-    let text = text.to_lowercase();
-    let at = format!("@{}", name.to_lowercase());
-    text.match_indices(&at).any(|(i, _)| {
-        text[i + at.len()..]
-            .chars()
-            .next()
-            .is_none_or(|c| !(c.is_alphanumeric() || c == '-' || c == '_'))
-    })
-}
-
 /// Split a batch into what the relay can send itself, what the model only has
-/// to deliver, and what it has to judge. `board` is where a reply's parent is
-/// looked up; a parent that has scrolled off it leaves the reply to be judged.
+/// to deliver, and what it has to judge — or, not judging, leaves alone.
+/// `board` is where a reply's parent is looked up; a parent that has scrolled
+/// off it leaves the reply unaddressed.
 fn plan<'a>(
     messages: &'a [Message],
     board: &'a [Message],
     candidates: &'a [Candidate<'a>],
+    judge: bool,
 ) -> Plan<'a> {
     let mut plan = Plan {
         queue: Vec::new(),
         deliver: Vec::new(),
         judge: Vec::new(),
+        unaddressed: Vec::new(),
     };
     for message in messages {
         let answers = message
@@ -453,7 +506,11 @@ fn plan<'a>(
             .and_then(|id| board.iter().find(|m| &m.id == id));
         let named = named(message, answers, candidates);
         if named.is_empty() {
-            plan.judge.push(message);
+            if judge {
+                plan.judge.push(message);
+            } else {
+                plan.unaddressed.push(message);
+            }
         }
         for (to, why) in named {
             let ping = Named { message, to, why };
@@ -480,21 +537,6 @@ fn relay_text(message: &Message) -> String {
     )
 }
 
-fn client_word(client: Client) -> &'static str {
-    match client {
-        Client::Claude => "Claude Code",
-        Client::Codex => "Codex",
-    }
-}
-
-fn status_word(status: Status) -> &'static str {
-    match status {
-        Status::NeedsInput => "waiting for the owner",
-        Status::Working => "working",
-        Status::Done => "idle",
-    }
-}
-
 fn prompt(repo: &str, plan: &Plan, candidates: &[Candidate], dry_run: bool) -> String {
     let mut out = format!(
         "You are the relay for the agent board of the repository `{}`. Agents \
@@ -517,8 +559,8 @@ fn prompt(repo: &str, plan: &Plan, candidates: &[Candidate], dry_run: bool) -> S
             "- {}: name {:?} — {}, {} — in {:?} — last said: {:?}\n",
             c.key,
             c.job.name,
-            client_word(c.job.client),
-            status_word(c.job.status),
+            crate::peers::client_word(c.job.client),
+            crate::peers::status_word(c.job.status),
             place,
             clip(&c.job.summary, SUMMARY),
         ));
@@ -660,7 +702,7 @@ fn relay(
     } else {
         Vec::new()
     };
-    let plan = plan(messages, &board, &candidates);
+    let plan = plan(messages, &board, &candidates, options.judge);
     let told = |m: &Message, how: &str, to: &Job, why: &str| {
         say(&format!(
             "{name} [{}] {} → {how} {}: {}",
@@ -733,7 +775,13 @@ fn relay(
             }
         }
     }
-    if pinged == 0 {
+    for m in &plan.unaddressed {
+        say(&format!(
+            "{name} [{}] {}: for everyone — read on each session's next turn, nobody pinged",
+            m.id, m.from
+        ));
+    }
+    if pinged == 0 && plan.unaddressed.is_empty() {
         say(&format!(
             "{name}: {} — concerns nobody working here",
             match messages {
@@ -857,6 +905,7 @@ fn say(line: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::Status;
     use std::path::PathBuf;
 
     fn message(id: &str, from: &str, text: &str) -> Message {
@@ -866,6 +915,7 @@ mod tests {
             from: from.into(),
             topic: "/code/web-app".into(),
             re: None,
+            to: Vec::new(),
             text: text.into(),
         }
     }
@@ -943,7 +993,7 @@ mod tests {
         let jobs = vec![job("HELPER", "/code/web-app", Client::Claude)];
         let said = [message("1", "LEAD", "hello")];
         let c = candidates(&jobs, "/code/web-app", &said);
-        let plan = plan(&said, &[], &c);
+        let plan = plan(&said, &[], &c, true);
         assert!(!prompt("/code/web-app", &plan, &c, true).contains("[board relay]"));
         assert!(prompt("/code/web-app", &plan, &c, false).contains("[board relay]"));
     }
@@ -964,7 +1014,7 @@ mod tests {
         let board = [message("1", "LEAD", "who holds main.rs?")];
         let said = [reply("2", "HELPER", "1", "I do, until six")];
         let c = candidates(&jobs, "/code/web-app", &said);
-        let plan = plan(&said, &board, &c);
+        let plan = plan(&said, &board, &c, true);
         assert!(plan.judge.is_empty());
         assert!(plan.queue.is_empty());
         let to: Vec<_> = plan
@@ -991,7 +1041,7 @@ mod tests {
             "@codex-x can you rebase on development?",
         )];
         let c = candidates(&jobs, "/code/web-app", &said);
-        let plan = plan(&said, &[], &c);
+        let plan = plan(&said, &[], &c, true);
         assert_eq!(plan.queue.len(), 1);
         assert_eq!(plan.queue[0].to.job.name, "codex-x");
         assert!(!plan.asks());
@@ -1009,19 +1059,55 @@ mod tests {
             reply("3", "HELPER", "gone", "and the tests"),
         ];
         let c = candidates(&jobs, "/code/web-app", &said);
-        let plan = plan(&said, &board, &c);
+        let plan = plan(&said, &board, &c, true);
         assert!(plan.deliver.is_empty());
         assert_eq!(plan.judge.len(), 2);
     }
 
     #[test]
-    fn a_mention_is_the_whole_name_in_any_case() {
-        assert!(mentions("ping @SAVRAS 13, please", "SAVRAS 13"));
-        assert!(mentions("@savras 13", "SAVRAS 13"));
-        assert!(!mentions("@SAVRAS 13 is on it", "SAVRAS 1"));
-        assert!(!mentions("@LEAD-2 take this", "LEAD"));
-        assert!(!mentions("SAVRAS 13 without the at", "SAVRAS 13"));
-        assert!(!mentions("@", ""));
+    fn a_message_to_a_session_goes_to_it_and_one_to_nobody_is_left_unjudged() {
+        let jobs = vec![
+            job("LEAD", "/code/web-app", Client::Claude),
+            job("HELPER", "/code/web-app", Client::Claude),
+            job("codex-x", "/code/web-app", Client::Codex),
+        ];
+        let mut to_helper = message("1", "LEAD", "who holds main.rs?");
+        to_helper.to = vec!["helper".into()];
+        let news = message("2", "LEAD", "merged #31");
+        let said = [to_helper, news];
+        let c = candidates(&jobs, "/code/web-app", &said);
+
+        let plan = plan(&said, &[], &c, false);
+        let to: Vec<_> = plan
+            .deliver
+            .iter()
+            .map(|p| p.to.job.name.as_str())
+            .collect();
+        assert_eq!(to, ["HELPER"]);
+        assert_eq!(plan.deliver[0].why, "addressed to them");
+        assert!(plan.judge.is_empty());
+        assert_eq!(plan.unaddressed.len(), 1);
+        assert_eq!(plan.unaddressed[0].id, "2");
+
+        // Judging on, the same news goes to the model instead.
+        let plan = super::plan(&said, &[], &c, true);
+        assert_eq!(plan.judge.len(), 1);
+        assert!(plan.unaddressed.is_empty());
+    }
+
+    #[test]
+    fn a_heartbeat_says_a_relay_is_running_and_goes_stale() {
+        let fixture = crate::testing::Fixture::new("relay-alive");
+        let boards = Boards::at(fixture.0.clone());
+        assert!(!alive(&boards, "/code/web-app"));
+        let mut relay = Held::default();
+        assert!(relay.hold(&boards, "/code/web-app"));
+        beat(&boards, "/code/web-app");
+        assert!(alive(&boards, "/code/web-app"));
+        assert!(!alive(&boards, "/code/other"));
+        // Killed: the heartbeat is fresh, and the lock says it is gone.
+        drop(relay);
+        assert!(!alive(&boards, "/code/web-app"));
     }
 
     #[test]
@@ -1086,7 +1172,14 @@ mod tests {
         want(&boards, "/code/other", true).unwrap();
         // A held lock sits beside the marks and is not one.
         let _held = lock(&boards, "/code/web-app").unwrap();
-        assert_eq!(wanted(&boards), ["/code/other", "/code/web-app"]);
+        beat(&boards, "/code/web-app");
+        // A dot in a repository's name is not an extension to skip.
+        want(&boards, "/code/my.app", true).unwrap();
+        assert_eq!(
+            wanted(&boards),
+            ["/code/my.app", "/code/other", "/code/web-app"]
+        );
+        want(&boards, "/code/my.app", false).unwrap();
         want(&boards, "/code/web-app", false).unwrap();
         want(&boards, "/code/never", false).unwrap();
         assert_eq!(wanted(&boards), ["/code/other"]);
@@ -1097,6 +1190,8 @@ mod tests {
         let o = parse(&[]).unwrap().unwrap();
         assert_eq!(o.model, "haiku");
         assert!(!o.dry_run);
+        assert!(!o.judge, "judging is asked for, never assumed");
+        assert!(parse(&["--judge".into()]).unwrap().unwrap().judge);
         assert!(o.repo.is_none());
         let o = parse(&["--model".into(), "sonnet".into(), "--dry-run".into()])
             .unwrap()

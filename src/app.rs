@@ -322,7 +322,7 @@ impl BoardView {
     /// Post what has been written, as the owner. On failure the words are kept:
     /// a message you typed and lost to an error — an empty one, or a board
     /// deleted while you wrote — is one you type twice.
-    pub fn send(&mut self) -> Result<Message> {
+    pub fn send(&mut self, jobs: &[Job]) -> Result<Message> {
         let Some(compose) = self.compose.take() else {
             anyhow::bail!("nothing is being written");
         };
@@ -331,7 +331,17 @@ impl BoardView {
             anyhow::bail!("there is no repository here to post to");
         };
         let re = compose.re.as_ref().map(|m| m.id.clone());
-        match self.boards().post(board::OWNER, &repo, re, &compose.text) {
+        // The owner is held to no rule — a note to the room is theirs to
+        // write — but an `@NAME` of theirs is an address like anyone's.
+        let to: Vec<String> =
+            crate::peers::mentioned(&compose.text, &crate::peers::in_repo(jobs, &repo))
+                .into_iter()
+                .filter(|name| name != board::OWNER)
+                .collect();
+        match self
+            .boards()
+            .post_to(board::OWNER, &repo, re, &to, &compose.text)
+        {
             Ok(message) => {
                 // Onto what was just said, wherever the cursor had wandered.
                 self.selected = None;
@@ -684,7 +694,7 @@ impl App {
         let Some(view) = self.board.as_mut() else {
             return;
         };
-        self.error = Some(match view.send() {
+        self.error = Some(match view.send(&self.snapshot.jobs) {
             Ok(message) => format!("posted to {}", board::topic_name(&message.topic)),
             Err(e) => format!("could not post: {e}"),
         });
