@@ -35,7 +35,8 @@ jobs:
       - run: cargo test
 
   # The version in Cargo.toml is a promise. `ratatui-core` and `notify` both
-  # ask for 1.88, so it is one that moves and needs checking.
+  # ask for 1.88, and the relay's lock (`File::try_lock`) for 1.89, so it is
+  # one that moves and needs checking.
   msrv:
     runs-on: ubuntu-latest
     steps:

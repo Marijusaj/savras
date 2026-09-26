@@ -99,7 +99,9 @@ cheap model (`claude -p`, on your Claude subscription, never an API key) reads
 next to the sessions working in that repository, and picks the ones it
 concerns. Claude Code sessions are pinged through SendMessage, Codex sessions
 through `codex queue`. It never posts to a board. Runs until ctrl-c; the
-owner's to start — `R` in the panel starts it as a tab.
+owner's to start — `R` in the panel starts it as a tab, and the panel starts
+it again when it next opens, until you stop it. One relay per board: another
+one started on the same board stands by until the first stops.
 
     --repo <path>  relay only the board of the repository at <path>
     --model <m>    the model that decides (default haiku)
@@ -160,6 +162,7 @@ pub fn run(args: &[String]) -> Result<()> {
     let watch = Watch::start(boards.dir());
     let started = Utc::now();
     let serving = |repo: &String| options.repo.as_ref().is_none_or(|only| only == repo);
+    let mut held = Held::default();
 
     title(options.repo.as_deref());
     say(&format!(
@@ -179,6 +182,9 @@ pub fn run(args: &[String]) -> Result<()> {
 
     loop {
         for repo in boards.list().into_iter().filter(serving) {
+            if !held.hold(&boards, &repo) {
+                continue;
+            }
             let (messages, mark) = boards.unread(READER, &repo, WINDOW);
             // Marked before deciding, not after: a decision that fails — a
             // usage limit, a timeout — is said here and not retried forever.
@@ -198,6 +204,116 @@ pub fn run(args: &[String]) -> Result<()> {
             }
         }
         wait(&watch);
+    }
+}
+
+/// Where a board's relay keeps its lock, and the mark that says the panel
+/// should start it again. Not under `seen/`: cleaning a board removes that,
+/// and a lock file deleted under a running relay is a lock the next relay
+/// takes as well.
+fn relays_dir(boards: &Boards) -> std::path::PathBuf {
+    boards.dir().join("relays")
+}
+
+/// The boards whose relay this process is — one relay per board, however
+/// many panels are open and whichever of them started it.
+///
+/// Two relays on one board would ping every session twice. So a relay takes
+/// the board's lock before it reads anything, and a relay that finds the lock
+/// taken stands by and keeps asking: when the other one stops — its panel
+/// quit — this one carries on from the same place, since both keep their
+/// place under the same [`READER`].
+#[derive(Default)]
+struct Held {
+    locks: std::collections::HashMap<String, std::fs::File>,
+    waiting: HashSet<String>,
+}
+
+impl Held {
+    fn hold(&mut self, boards: &Boards, repo: &str) -> bool {
+        if self.locks.contains_key(repo) {
+            return true;
+        }
+        let name = board::topic_name(repo);
+        match lock(boards, repo) {
+            Ok(Some(file)) => {
+                if self.waiting.remove(repo) {
+                    say(&format!(
+                        "{name}: the other relay stopped — relaying it here"
+                    ));
+                }
+                self.locks.insert(repo.to_string(), file);
+                true
+            }
+            Ok(None) => {
+                if self.waiting.insert(repo.to_string()) {
+                    say(&format!(
+                        "{name}: another relay has this board — standing by until it stops"
+                    ));
+                }
+                false
+            }
+            Err(e) => {
+                say(&format!("{name}: {e:#}"));
+                false
+            }
+        }
+    }
+}
+
+/// The board's relay lock, if nobody else holds it. Released when the file
+/// is dropped, and by the system when the process ends however it ends.
+fn lock(boards: &Boards, repo: &str) -> Result<Option<std::fs::File>> {
+    let dir = relays_dir(boards);
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let path = dir.join(format!("{}.lock", board::encode(repo)));
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => {
+            Err(e).with_context(|| format!("locking {}", path.display()))
+        }
+    }
+}
+
+/// The boards the owner asked to be relayed with `R` and has not stopped,
+/// which the panel starts again when it opens.
+pub fn wanted(boards: &Boards) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(relays_dir(boards)) else {
+        return Vec::new();
+    };
+    let mut repos: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().extension().is_none_or(|x| x != "lock"))
+        .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+        .map(|repo| repo.trim().to_string())
+        .filter(|repo| !repo.is_empty())
+        .collect();
+    repos.sort();
+    repos
+}
+
+/// Say whether `repo`'s board should be relayed the next time a panel opens:
+/// yes when the owner starts it, no when they stop it.
+pub fn want(boards: &Boards, repo: &str, on: bool) -> Result<()> {
+    let dir = relays_dir(boards);
+    let path = dir.join(board::encode(repo));
+    if on {
+        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        std::fs::write(&path, repo).with_context(|| format!("writing {}", path.display()))
+    } else {
+        match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                Err(e).with_context(|| format!("removing {}", path.display()))
+            }
+            _ => Ok(()),
+        }
     }
 }
 
@@ -700,14 +816,30 @@ fn run_for(mut command: Command, limit: Duration) -> Result<String> {
     let stdout = reading.join().unwrap_or_default();
     let stderr = erring.join().unwrap_or_default();
     if !status.success() {
-        // `claude -p --output-format json` reports its errors on stdout.
-        let said = [stderr.trim(), stdout.trim()]
-            .into_iter()
-            .find(|s| !s.is_empty())
-            .unwrap_or("no output");
-        anyhow::bail!("{status}: {}", clip(said, 400));
+        anyhow::bail!("{status}: {}", clip(&why_it_failed(&stdout, &stderr), 400));
     }
     Ok(stdout)
+}
+
+/// The words a failed command gave for failing.
+///
+/// `claude -p --output-format json` reports its errors on stdout, inside the
+/// same JSON as a success — and that JSON opens with usage counters, so a
+/// clip of it from the front says `{"duration_api_ms":0,…` and never reaches
+/// "Not logged in". Its `result` is the reason.
+fn why_it_failed(stdout: &str, stderr: &str) -> String {
+    let result = serde_json::from_str::<Value>(stdout.trim())
+        .ok()
+        .and_then(|v| v["result"].as_str().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty());
+    result
+        .or_else(|| {
+            [stderr.trim(), stdout.trim()]
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "no output".to_string())
 }
 
 fn clip(s: &str, max: usize) -> String {
@@ -911,6 +1043,53 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("usage limit"));
+    }
+
+    #[test]
+    fn a_failure_says_claudes_reason_not_its_usage_counters() {
+        let stdout = format!(
+            r#"{{"duration_api_ms":0,"usage":{{"input_tokens":0,"pad":"{}"}},"is_error":true,"result":"Not logged in · Please run /login"}}"#,
+            "x".repeat(600)
+        );
+        assert_eq!(
+            why_it_failed(&stdout, ""),
+            "Not logged in · Please run /login"
+        );
+        assert_eq!(
+            why_it_failed("", "codex: no such thread\n"),
+            "codex: no such thread"
+        );
+        assert_eq!(why_it_failed("plain words", ""), "plain words");
+        assert_eq!(why_it_failed("", ""), "no output");
+    }
+
+    #[test]
+    fn one_relay_per_board_and_the_next_one_stands_by() {
+        let fixture = crate::testing::Fixture::new("relay-lock");
+        let boards = Boards::at(fixture.0.clone());
+        let mut first = Held::default();
+        let mut second = Held::default();
+        assert!(first.hold(&boards, "/code/web-app"));
+        assert!(first.hold(&boards, "/code/web-app"));
+        assert!(!second.hold(&boards, "/code/web-app"));
+        assert!(second.hold(&boards, "/code/other"));
+        drop(first);
+        assert!(second.hold(&boards, "/code/web-app"));
+    }
+
+    #[test]
+    fn a_wanted_relay_is_remembered_until_it_is_stopped() {
+        let fixture = crate::testing::Fixture::new("relay-wanted");
+        let boards = Boards::at(fixture.0.clone());
+        assert!(wanted(&boards).is_empty());
+        want(&boards, "/code/web-app", true).unwrap();
+        want(&boards, "/code/other", true).unwrap();
+        // A held lock sits beside the marks and is not one.
+        let _held = lock(&boards, "/code/web-app").unwrap();
+        assert_eq!(wanted(&boards), ["/code/other", "/code/web-app"]);
+        want(&boards, "/code/web-app", false).unwrap();
+        want(&boards, "/code/never", false).unwrap();
+        assert_eq!(wanted(&boards), ["/code/other"]);
     }
 
     #[test]

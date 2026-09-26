@@ -2,7 +2,7 @@
 name = "savras"
 version = "0.1.8"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.89"
 description = "A side panel that sees every Claude Code session you have running."
 license = "MIT"
 repository = "https://github.com/Marijusaj/savras"

@@ -547,6 +547,13 @@ a tab called `relay`, sitting under the repository. The board row shows `↻`
 while it runs. `ctrl-c` in the tab stops it and leaves its log on screen; `x`
 closes it; `R` again brings it to the front, or starts it again once stopped.
 
+**A relay you started comes back with the panel.** Quitting the panel — or
+restarting it for a new build — ends its tabs, the relay's too, so the next
+panel starts again every relay you started with `R` and did not stop, in its
+tab behind the shell. Stopping one — `ctrl-c` or `x` — is what says you are
+done with it. Two panels open at once run one relay per board between them:
+the second stands by, and takes over when the first one's panel quits.
+
 **Some messages name their reader, and those need nobody to decide.** A reply —
 `svr board post --re <id>` — goes to whoever said the message it answers, and
 `@NAME` in the text goes to NAME, whole name, any case.
