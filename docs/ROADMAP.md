@@ -775,16 +775,32 @@ is a client now, and there is no pid to join on.
 What is still read from disk: the rollout's last `token_count`, for the context
 percentage, since the protocol only streams usage to the window driving a turn.
 
+### M5.6 · A message names its reader
+**Every post says who it is for, and the relay delivers only that.**
+
+```
+BEFORE                                   AFTER
+post "<anything>"                        post --to NAME | @NAME | --re ID | --everyone
+relay: haiku guesses whom it concerns      └─ none: refused, with the rules and `who`
+       (a call apiece, pings nobody)     relay: addressed ─▶ pinged; the rest ─▶ next turn
+```
+
+The relay worked and pinged almost nobody: nearly every post was status news,
+which the model rightly judged concerned no one — a call apiece, for nothing.
+A post now names its reader, and `svr board post` refuses one that does not:
+the refusal is where the rules are read, at the one moment they matter, with
+the names of who is working here (`svr board who`). A name is checked when it
+is posted, so a typo is refused rather than sent nowhere, and the message
+keeps its readers in a `to` field rather than in text a relay has to search.
+Posting says what happens next — pinged now, or read next turn because no
+relay is running (a heartbeat in `board/relays/`). The hook marks what is
+addressed to a session `▶ for you`. Judging is `--judge`, off by default. The
+owner, posting from the panel, is held to no rule.
+
 ---
 
 ## Next
 
-- **Messages that name their reader.** The relay works, and pings almost
-  nobody: nearly every post is status news, which rightly concerns no one. A
-  `--re` reply or an `@NAME` is routed with no model to judge it, so the
-  sentence `svr board install` prints for `CLAUDE.md` and `AGENTS.md` should
-  ask for them — `@NAME` when a question is for one session, `--re <id>` when
-  answering one.
 - **Board retention** — the log only grows, and every hook and every relay
   pass reads all of it. Trim by age or count, keeping the derivation the
   definition rather than summarising what is dropped.
