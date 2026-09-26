@@ -728,6 +728,18 @@ Then, in the order they were done:
   a tab rather than a thread because what it did is a log worth reading, and
   something that spends the owner's usage should be somewhere they can see it
   and stop it.
+- **It keeps running, and says why when it cannot** (#31). A tab ends with
+  the panel, and every new build needs a panel restart — so the relay was
+  quietly gone most of the time. `R` now leaves a mark in `board/relays/`, the
+  next panel starts every marked relay behind the shell, and stopping one
+  (`ctrl-c`, `x`) removes its mark. A lock per board keeps two panels to one
+  relay: the second stands by and takes over. A failed `claude -p` says its
+  reason ("Not logged in") instead of the usage counters that open its JSON.
+- **The hook keeps its place under the session id** (#31). It was kept under
+  the session's name — `pid-N` before a background session is named, and new
+  on every rename — and each new name was handed the last thirty messages
+  again. Claude Code writes `session_id` to every hook's stdin; the first read
+  under it carries over the place kept under the name.
 
 ### M5.5 · Ask Codex
 **A Codex row says what Codex says, because Savras asks it.**
@@ -767,23 +779,27 @@ percentage, since the protocol only streams usage to the window driving a turn.
 
 ## Next
 
-Wire it up, which is the owner's half of M5: `svr board install` prints the
-`settings.json` hook and the sentence for `CLAUDE.md` and `AGENTS.md`, and
-neither is installed until you put it there.
+- **Messages that name their reader.** The relay works, and pings almost
+  nobody: nearly every post is status news, which rightly concerns no one. A
+  `--re` reply or an `@NAME` is routed with no model to judge it, so the
+  sentence `svr board install` prints for `CLAUDE.md` and `AGENTS.md` should
+  ask for them — `@NAME` when a question is for one session, `--re <id>` when
+  answering one.
+- **Board retention** — the log only grows, and every hook and every relay
+  pass reads all of it. Trim by age or count, keeping the derivation the
+  definition rather than summarising what is dropped.
 
 ---
 
 ## Later
 
-- **Kill** — end a session from the panel, with a confirmation.
 - **Notification protocols** — OSC 99 for kitty, and a signed helper if
   Terminal.app ever needs a real banner rather than a bell.
 - **Poller** — a background process for GitHub and GitLab: PR state, checks,
   reviews, deploys. Needed properly for M4's deploy column.
-- **Packaging** — Homebrew tap, Scoop, winget, deb/rpm, install script, via
-  `cargo-dist`.
+- **Packaging** — Scoop, winget, deb/rpm, via `cargo-dist`. Homebrew
+  (`marijusaj/tap`) ships from a tag already, and crates.io with it when the
+  release environment has its token.
 - **Scrollback** — read a finished session's output without leaving the panel.
-- **Board retention** — the log only grows. Trim by age or count, keeping the
-  derivation the definition rather than summarising what is dropped.
 - **Board over MCP** — a typed surface over the same code path, for clients
   where a tool call is cheaper than a shell.
