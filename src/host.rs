@@ -1246,6 +1246,7 @@ fn event_loop(
         app.error = Some(format!("the board: {e}"));
     }
     app.set_group_by(group_by);
+    restart_relays(&mut session, &mut app);
     // The shell Savras opened with stays as the first tab either way, so
     // whatever this lands on, ctrl-w takes you back to a prompt.
     open_at_startup(&mut session, &mut app, &open);
@@ -1258,6 +1259,9 @@ fn event_loop(
     // here, since a session that failed to start must say so rather than
     // silently never appearing.
     let (starting, started) = mpsc::channel::<Result<String>>();
+    // The relays running at the last look, to tell one that stops from one
+    // that was never started.
+    let mut relaying: Vec<String> = session.tabs.relays();
     // One ssh per machine, held open, streaming what is running over there.
     // The names are wanted after the watcher has taken the list: they are the
     // answers to "where should this tab open".
@@ -1355,7 +1359,10 @@ fn event_loop(
             };
             app.set_tabs(front, session.tabs.shorts(), named);
             app.set_open_boards(session.boards.repos());
-            app.set_relays(session.tabs.relays());
+            let relays = session.tabs.relays();
+            forget_stopped_relays(&app, &relaying, &relays);
+            relaying = relays.clone();
+            app.set_relays(relays);
             terminal
                 .draw(|frame| draw(frame, &mut app, &session, focus, dead, confirming.as_ref()))?;
             last_draw = Instant::now();
@@ -1523,6 +1530,14 @@ fn event_loop(
                         {
                             match relay_tab(&mut session, &repo) {
                                 Ok(()) => {
+                                    // Wanted until it is stopped, so the next
+                                    // panel starts it again.
+                                    let boards = crate::board::Boards::at(app.board_dir.clone());
+                                    if let Err(e) = crate::relay::want(&boards, &repo, true) {
+                                        app.error = Some(format!(
+                                            "the relay will not restart with the panel: {e:#}"
+                                        ));
+                                    }
                                     session.boards.hide();
                                     focus = Focus::Work;
                                     repaint(terminal)?;
@@ -1970,6 +1985,46 @@ fn new_tab(session: &mut Session, app: &App, focus: Focus) -> Result<()> {
         relay: None,
     });
     Ok(())
+}
+
+/// Start again the relays the owner started with `R` and never stopped.
+///
+/// A relay is a tab, and a tab ends with the panel — so without this, every
+/// panel restart (and each new build of `svr` needs one) quietly ended the
+/// relay, and the board was read by nobody until someone thought to press `R`
+/// again. They open behind the shell: the panel comes up where it always has.
+/// Two panels both do this, and the relay's own lock leaves one of them
+/// standing by.
+fn restart_relays(session: &mut Session, app: &mut App) {
+    let boards = crate::board::Boards::at(app.board_dir.clone());
+    for repo in crate::relay::wanted(&boards) {
+        if !boards.exists(&repo) {
+            // Its board was deleted: nothing to relay, now or later.
+            let _ = crate::relay::want(&boards, &repo, false);
+            continue;
+        }
+        if let Err(e) = relay_tab(session, &repo) {
+            app.error = Some(format!(
+                "could not restart the {} relay: {e:#}",
+                crate::board::topic_name(&repo)
+            ));
+        }
+    }
+    session.tabs.current = 0;
+}
+
+/// A relay that stopped while the panel was running was stopped by somebody
+/// — ctrl-c in its tab, or the tab closed — so it is no longer wanted when
+/// the next panel opens. A panel quitting stops them too, but never gets here.
+fn forget_stopped_relays(app: &App, before: &[String], now: &[String]) {
+    let stopped: Vec<&String> = before.iter().filter(|r| !now.contains(r)).collect();
+    if stopped.is_empty() {
+        return;
+    }
+    let boards = crate::board::Boards::at(app.board_dir.clone());
+    for repo in stopped {
+        let _ = crate::relay::want(&boards, repo, false);
+    }
 }
 
 /// Bring a repository's board relay to the front, starting it if it is not

@@ -391,6 +391,18 @@ impl Boards {
         (!id.is_empty()).then(|| id.to_string())
     }
 
+    /// Give `to` the place `from` has, when `to` has none of its own — a
+    /// reader changing the key it is kept under, without starting over.
+    pub fn carry_over(&self, repo: &str, from: &str, to: &str) -> Result<()> {
+        if self.cursor(to, repo).is_some() {
+            return Ok(());
+        }
+        match self.cursor(from, repo) {
+            Some(id) => self.mark_seen(to, repo, &id),
+            None => Ok(()),
+        }
+    }
+
     /// Record that `reader` has seen this board up to `id`.
     pub fn mark_seen(&self, reader: &str, repo: &str, id: &str) -> Result<()> {
         let dir = self.seen(repo);
@@ -491,7 +503,7 @@ fn no_board(repo: &str) -> String {
 /// Every byte that is not a letter, a digit, `.`, `-` or `_` becomes `%XX`, so
 /// the name holds no separator and decodes back to exactly the path — which is
 /// what lets the directory listing be the list of boards.
-fn encode(repo: &str) -> String {
+pub(crate) fn encode(repo: &str) -> String {
     let mut out = String::with_capacity(repo.len());
     for byte in repo.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_') {
@@ -606,9 +618,18 @@ pub fn flatten(s: &str) -> String {
 /// through to the pid — and the hook runs in a fresh `svr` each turn, so every
 /// turn invented a new reader, found no cursor, and poured the last thirty
 /// messages back into the session. Claude Code's session id does not move.
-fn reader_key(explicit: Option<&str>) -> Result<String> {
+///
+/// And a *name* moves too: a background session is `pid-N` until it is
+/// named, and renamed whenever the owner likes, and each new name found no
+/// place and was handed the last thirty messages again. `CLAUDE_SESSION_ID`
+/// is not in a hook's environment, but Claude Code writes the session id to
+/// every hook's stdin, and that is the key when there is one.
+fn reader_key(explicit: Option<&str>, session: Option<&str>) -> Result<String> {
     if let Some(name) = explicit {
         return claimed(name);
+    }
+    if let Some(id) = session.map(str::trim).filter(|id| !id.is_empty()) {
+        return Ok(format!("session-{id}"));
     }
     if let Ok(id) = std::env::var("CLAUDE_SESSION_ID") {
         if !id.trim().is_empty() {
@@ -616,6 +637,31 @@ fn reader_key(explicit: Option<&str>) -> Result<String> {
         }
     }
     whoami(None)
+}
+
+/// The session id Claude Code hands a hook on stdin, as JSON.
+///
+/// Never waits long: a hook run by hand at a prompt has a terminal for stdin
+/// and nothing coming, and a hook that hangs holds up the turn behind it.
+fn hook_session_id() -> Option<String> {
+    use std::io::{IsTerminal, Read};
+    if std::io::stdin().is_terminal() {
+        return None;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut raw = String::new();
+        let _ = std::io::stdin().take(1 << 20).read_to_string(&mut raw);
+        let _ = tx.send(raw);
+    });
+    let raw = rx.recv_timeout(std::time::Duration::from_secs(2)).ok()?;
+    session_id_in(&raw)
+}
+
+fn session_id_in(raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let id = value.get("session_id")?.as_str()?.trim();
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 /// The session name behind `$CLAUDE_JOB_DIR`.
@@ -1001,7 +1047,19 @@ fn read_command(args: &[String], only_new: bool) -> Result<()> {
         }
         return Ok(());
     } else if only_new {
-        let reader = reader_key(as_name.as_deref())?;
+        let session = if hook && as_name.is_none() {
+            hook_session_id()
+        } else {
+            None
+        };
+        let reader = reader_key(as_name.as_deref(), session.as_deref())?;
+        if session.is_some() {
+            // The place this session kept before it was known by its id —
+            // under its name — is where it carries on from, not the window.
+            if let Ok(name) = whoami(None) {
+                boards.carry_over(&repo, &name, &reader)?;
+            }
+        }
         let (new, mark) = boards.unread(&reader, &repo, limit);
         // The cursor moves whether or not anything was shown: what has gone
         // past is past, and a hook that fails to advance replays the same
@@ -1199,6 +1257,52 @@ mod tests {
         boards.post("AGENT", SAVRAS, None, "hello").unwrap();
         assert_eq!(boards.list(), [SAVRAS]);
         assert_eq!(boards.count(SAVRAS), 1);
+    }
+
+    #[test]
+    fn a_hook_keeps_its_place_under_the_session_id_it_is_handed() {
+        let hook =
+            r#"{"session_id":"5864b9aa-1","hook_event_name":"UserPromptSubmit","prompt":"hi"}"#;
+        assert_eq!(session_id_in(hook).as_deref(), Some("5864b9aa-1"));
+        assert_eq!(session_id_in(r#"{"session_id":"  "}"#), None);
+        assert_eq!(session_id_in("not json"), None);
+        assert_eq!(session_id_in(""), None);
+
+        assert_eq!(
+            reader_key(None, Some("5864b9aa-1")).unwrap(),
+            "session-5864b9aa-1"
+        );
+        // Asked for by name, the name wins: `--as` is a person reading.
+        assert_eq!(
+            reader_key(Some("LEAD"), Some("5864b9aa-1")).unwrap(),
+            "LEAD"
+        );
+    }
+
+    #[test]
+    fn a_renamed_session_carries_on_from_its_place_rather_than_the_window() {
+        let s = Scratch::new("carry");
+        let boards = s.boards();
+        boards.create(&Owner::at_the_panel(), SAVRAS).unwrap();
+        for text in ["one", "two", "three"] {
+            boards.post("A", SAVRAS, None, text).unwrap();
+        }
+        let seen = boards.unread("SAVRAS 14", SAVRAS, WINDOW).1.unwrap();
+        boards.mark_seen("SAVRAS 14", SAVRAS, &seen).unwrap();
+
+        boards.carry_over(SAVRAS, "SAVRAS 14", "session-x").unwrap();
+        assert!(boards.unread("session-x", SAVRAS, WINDOW).0.is_empty());
+
+        // A place of its own is never overwritten by an older one.
+        boards.post("A", SAVRAS, None, "four").unwrap();
+        let four = boards.unread("session-x", SAVRAS, WINDOW).1.unwrap();
+        boards.mark_seen("session-x", SAVRAS, &four).unwrap();
+        boards.carry_over(SAVRAS, "SAVRAS 14", "session-x").unwrap();
+        assert!(boards.unread("session-x", SAVRAS, WINDOW).0.is_empty());
+
+        // Nothing to carry: a new reader starts from the window, as before.
+        boards.carry_over(SAVRAS, "pid-1", "session-y").unwrap();
+        assert_eq!(boards.unread("session-y", SAVRAS, WINDOW).0.len(), 4);
     }
 
     #[test]
