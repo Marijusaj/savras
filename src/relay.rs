@@ -465,11 +465,17 @@ fn named<'a>(
         if c.job.name == message.from {
             continue;
         }
-        let why = if message
-            .to
-            .iter()
-            .any(|n| n.eq_ignore_ascii_case(&c.job.name))
-        {
+        // By the session behind the name, so a rename after posting still
+        // arrives; by the name only for a message that carries no ids.
+        let addressed = if message.to_ids.is_empty() {
+            message
+                .to
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(&c.job.name))
+        } else {
+            message.to_ids.iter().any(|id| id == &c.job.session_id)
+        };
+        let why = if addressed {
             "addressed to them"
         } else if answers.is_some_and(|parent| parent.from == c.job.name) {
             "answers their message"
@@ -916,6 +922,7 @@ mod tests {
             topic: "/code/web-app".into(),
             re: None,
             to: Vec::new(),
+            to_ids: Vec::new(),
             text: text.into(),
         }
     }
@@ -1093,6 +1100,27 @@ mod tests {
         let plan = super::plan(&said, &[], &c, true);
         assert_eq!(plan.judge.len(), 1);
         assert!(plan.unaddressed.is_empty());
+    }
+
+    #[test]
+    fn a_message_reaches_its_session_after_the_owner_renames_it() {
+        let jobs = vec![
+            job("LEAD", "/code/web-app", Client::Claude),
+            job("REVIEWER", "/code/web-app", Client::Claude),
+        ];
+        // Addressed to HELPER, whose session the owner has since renamed.
+        let mut to_helper = message("1", "LEAD", "who holds main.rs?");
+        to_helper.to = vec!["HELPER".into()];
+        to_helper.to_ids = vec!["REVIEWER-id".into()];
+        let said = [to_helper];
+        let c = candidates(&jobs, "/code/web-app", &said);
+        let plan = plan(&said, &[], &c, false);
+        let to: Vec<_> = plan
+            .deliver
+            .iter()
+            .map(|p| p.to.job.name.as_str())
+            .collect();
+        assert_eq!(to, ["REVIEWER"]);
     }
 
     #[test]

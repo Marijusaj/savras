@@ -797,6 +797,18 @@ relay is running (a heartbeat in `board/relays/`). The hook marks what is
 addressed to a session `▶ for you`. Judging is `--judge`, off by default. The
 owner, posting from the panel, is held to no rule.
 
+**Savras briefs the sessions, not an instruction file.** The board used to be
+explained by a paragraph pasted into `CLAUDE.md` — stale with every release,
+and unable to say who is working here. Now `svr board hello --hook`, on
+SessionStart, tells a session there is a board, its name on it, and the
+sessions working here — Claude Code and Codex alike, since neither client
+lists the other — and to ping the one it needs by name. A client without that
+hook gets the same briefing on its first turn. Messages are addressed to the
+session id behind a name, so an owner's rename strands nothing, and each
+session is told who was renamed, started or left at the top of its next turn
+(its last look at the roster is kept beside its place on the board). Codex has
+the same two hooks, in `~/.codex/hooks.json`.
+
 ---
 
 ## Next

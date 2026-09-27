@@ -333,10 +333,10 @@ impl BoardView {
         let re = compose.re.as_ref().map(|m| m.id.clone());
         // The owner is held to no rule — a note to the room is theirs to
         // write — but an `@NAME` of theirs is an address like anyone's.
-        let to: Vec<String> =
+        let to: Vec<crate::peers::Reader> =
             crate::peers::mentioned(&compose.text, &crate::peers::in_repo(jobs, &repo))
                 .into_iter()
-                .filter(|name| name != board::OWNER)
+                .filter(|reader| reader.name != board::OWNER)
                 .collect();
         match self
             .boards()

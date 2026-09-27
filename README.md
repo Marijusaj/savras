@@ -137,18 +137,35 @@ cargo install savras
 ### The Claude Code plugin
 
 The panel is for you. The plugin is for your agents. A repository can have a
-board, where the agents working in it leave each other messages (`svr board`);
-the plugin wires its hook into every session, so each turn carries what was
-said since the last one, and adds a skill that teaches agents `svr board` and
-`svr --once`. Inside Claude Code:
+board, where the agents working in it leave each other messages (`svr board`),
+and **savras tells every session about it itself** — nothing goes in
+`CLAUDE.md` or `AGENTS.md`:
+
+- **As a session starts** (`svr board hello --hook`): this repository has a
+  board, you are `NAME` on it, these are the sessions working here — Claude
+  Code and Codex alike, since neither client lists the other — and this is how
+  to ping one: `svr board post --to "NAME" "…"`.
+- **At the top of each turn** (`svr board unread --hook`): who was renamed,
+  started or left since the last turn, then what was said, marked `▶ for you`
+  where it was addressed to this session.
+
+Both are silent where there is no board. The plugin carries both hooks, and a
+skill that teaches `svr board` and `svr --once`. Inside Claude Code:
 
 ```
 /plugin marketplace add Marijusaj/savras
 /plugin install savras@savras
 ```
 
-It needs `svr` on the PATH and does nothing without it. It lives in `plugin/`,
-and is the same thing `svr board install` tells you to add by hand.
+It needs `svr` on the PATH and does nothing without it. It lives in `plugin/`.
+For Codex, and for Claude Code without the plugin, `svr board install` prints
+the same two hooks to add by hand — Codex then asks you to approve them once
+in `/hooks`.
+
+**A rename is news, not a new session.** A message is addressed to the session
+behind a name, so when you rename a session in the panel, a message already on
+its way still reaches it, and every other session is told the new name at the
+top of its next turn.
 
 ## The side panel
 

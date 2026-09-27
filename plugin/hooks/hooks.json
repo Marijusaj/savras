@@ -1,6 +1,16 @@
 {
-  "description": "Each turn, what other agents said on this repository's board since the last one. Silent where there is no board, and where svr is not installed.",
+  "description": "Savras tells each session about the repository's board: as it starts, that there is one, its own name on it and who else is working here; each turn, what they said and who was renamed. Silent where there is no board, and where svr is not installed.",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "command -v svr >/dev/null 2>&1 && svr board hello --hook || true"
+          }
+        ]
+      }
+    ],
     "UserPromptSubmit": [
       {
         "hooks": [
