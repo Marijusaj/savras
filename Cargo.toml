@@ -1,6 +1,6 @@
 [package]
 name = "savras"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 rust-version = "1.89"
 description = "A side panel that sees every Claude Code session you have running."
@@ -22,6 +22,7 @@ path = "src/main.rs"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock", "serde"] }
 crossterm = "0.29"
+data-encoding = "2"
 directories = "5"
 notify = "8"
 portable-pty = "0.9"
@@ -29,7 +30,7 @@ ratatui = "0.30"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
-vt100 = "0.15"
+vt100 = "0.16"
 
 [profile.release]
 lto = true

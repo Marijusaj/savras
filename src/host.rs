@@ -444,7 +444,7 @@ impl Confirm {
 /// This is a whole unit so it can be *replaced*: opening a session from the
 /// panel is dropping one of these and spawning the next.
 struct Work {
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<vt100::Parser<Heard>>>,
     /// Whether the program in the pane asked for focus reporting itself. vt100
     /// does not track mode 1004, so the read thread watches for it.
     wants_focus: Arc<AtomicBool>,
@@ -482,7 +482,12 @@ impl Work {
         // The child holds its own handle; ours would keep the pty open past its exit.
         drop(pty.slave);
 
-        let parser = Arc::new(Mutex::new(vt100::Parser::new(rows, cols, 2000)));
+        let parser = Arc::new(Mutex::new(vt100::Parser::new_with_callbacks(
+            rows,
+            cols,
+            2000,
+            Heard::default(),
+        )));
         let writer = pty.master.take_writer().context("writing to the pty")?;
         let wants_focus = Arc::new(AtomicBool::new(false));
         let output = read_thread(
@@ -521,7 +526,11 @@ impl Work {
             pixel_width: 0,
             pixel_height: 0,
         })?;
-        self.parser.lock().unwrap().set_size(rows, cols);
+        self.parser
+            .lock()
+            .unwrap()
+            .screen_mut()
+            .set_size(rows, cols);
         Ok(())
     }
 
@@ -538,6 +547,72 @@ impl Work {
     fn bracketed_paste(&self) -> bool {
         self.parser.lock().unwrap().screen().bracketed_paste()
     }
+
+    /// What the child last asked to put on the clipboard and nobody has
+    /// passed on yet, as OSC 52 carried it: selection, then base64.
+    fn take_copied(&self) -> Option<(Vec<u8>, Vec<u8>)> {
+        self.parser.lock().unwrap().callbacks_mut().copied.take()
+    }
+}
+
+/// What a program in a pane says *to the terminal* rather than draws on it,
+/// which vt100 hands to callbacks instead of keeping on the screen.
+#[derive(Default)]
+struct Heard {
+    /// The window title it set, which names the Claude session in it.
+    title: String,
+    /// The latest OSC 52 copy, until the event loop passes it on. Only the
+    /// latest: a clipboard holds one thing.
+    copied: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+impl vt100::Callbacks for Heard {
+    fn set_window_title(&mut self, _: &mut vt100::Screen, title: &[u8]) {
+        self.title = String::from_utf8_lossy(title).into_owned();
+    }
+
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
+        self.copied = Some((ty.to_vec(), data.to_vec()));
+    }
+}
+
+/// Put what a pane copied on the clipboard of the person at the keyboard.
+///
+/// Our parser is the only terminal the child can see, so its OSC 52 stops
+/// here unless it is sent on — and it matters most exactly where the child
+/// has no other way: in a container, over SSH, on Linux. It is sent on as
+/// OSC 52 for the terminal to act on, and on a Mac also given to `pbcopy`,
+/// because Terminal.app ignores OSC 52. Not over SSH: there `pbcopy` would
+/// fill the remote machine's clipboard, and OSC 52 already reaches yours.
+fn pass_on_copy(ty: &[u8], data: &[u8]) -> std::io::Result<()> {
+    let mut out = std::io::stdout();
+    out.write_all(&osc52(ty, data))?;
+    out.flush()?;
+    if cfg!(target_os = "macos") && std::env::var_os("SSH_CONNECTION").is_none() {
+        if let Ok(text) = data_encoding::BASE64.decode(data) {
+            let _ = pbcopy(&text);
+        }
+    }
+    Ok(())
+}
+
+/// The OSC 52 sequence that sets the selection `ty` to base64 `data`.
+fn osc52(ty: &[u8], data: &[u8]) -> Vec<u8> {
+    let ty: &[u8] = if ty.is_empty() { b"c" } else { ty };
+    [b"\x1b]52;", ty, b";", data, b"\x07"].concat()
+}
+
+fn pbcopy(text: &[u8]) -> std::io::Result<()> {
+    let mut child = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text)?;
+    }
+    child.wait()?;
+    Ok(())
 }
 
 impl Drop for Work {
@@ -657,8 +732,8 @@ impl Pane {
             .parser
             .lock()
             .unwrap()
-            .screen()
-            .title()
+            .callbacks()
+            .title
             .trim()
             .to_string()
     }
@@ -1327,6 +1402,15 @@ fn event_loop(
             let mut out = std::io::stdout();
             out.write_all(if paste { PASTE_ON } else { PASTE_OFF }.as_bytes())?;
             out.flush()?;
+        }
+
+        // A copy the child asked for — Claude's "c to copy" on a sign-in link
+        // too long to select by hand. Only the front pane's: a copy follows a
+        // key, and keys only reach the front.
+        if !showing_board {
+            if let Some((ty, data)) = session.tabs.work().take_copied() {
+                pass_on_copy(&ty, &data)?;
+            }
         }
 
         // Whether the tab in front has finished. Asked of the front tab each
@@ -2806,7 +2890,7 @@ fn draw_screen(frame: &mut Frame, area: Rect, screen: &vt100::Screen, focused: b
             };
 
             let contents = cell.contents();
-            target.set_symbol(if contents.is_empty() { " " } else { &contents });
+            target.set_symbol(if contents.is_empty() { " " } else { contents });
 
             let mut style = Style::default()
                 .fg(convert(cell.fgcolor()))
@@ -3033,7 +3117,7 @@ fn default_shell() -> String {
 /// redraws promptly rather than waiting for the next tick.
 fn read_thread(
     mut reader: Box<dyn Read + Send>,
-    parser: Arc<Mutex<vt100::Parser>>,
+    parser: Arc<Mutex<vt100::Parser<Heard>>>,
     wants_focus: Arc<AtomicBool>,
 ) -> Receiver<()> {
     let (tx, rx) = mpsc::channel();
@@ -4200,6 +4284,33 @@ mod tests {
         let off = mouse_sequence(M::None, E::Default);
         assert!(!off.contains('h'), "nothing should be enabled: {off:?}");
         assert!(off.contains("\x1b[?1006l"), "{off:?}");
+    }
+
+    #[test]
+    fn a_childs_copy_is_caught_and_its_title_kept() {
+        let mut parser = vt100::Parser::new_with_callbacks(24, 80, 0, Heard::default());
+        // Claude Code names its session in the title, BEL- or ST-terminated.
+        parser.process(b"\x1b]0;\xe2\x9c\xb3 ROADMAP\x07");
+        assert_eq!(parser.callbacks().title, "✳ ROADMAP");
+        parser.process(b"\x1b]2;SANDRA MEET\x1b\\");
+        assert_eq!(parser.callbacks().title, "SANDRA MEET");
+
+        // "c to copy": OSC 52, base64 of the link.
+        parser.process(b"\x1b]52;c;aHR0cHM6Ly9jbGF1ZGUuY29t\x07");
+        let (ty, data) = parser.callbacks_mut().copied.take().unwrap();
+        assert_eq!(ty, b"c");
+        assert_eq!(
+            data_encoding::BASE64.decode(&data).unwrap(),
+            b"https://claude.com"
+        );
+        assert!(parser.callbacks().copied.is_none(), "passed on once");
+        assert_eq!(parser.screen().contents().trim(), "", "nothing drawn");
+    }
+
+    #[test]
+    fn a_copy_is_passed_on_as_osc_52() {
+        assert_eq!(osc52(b"c", b"aGk="), b"\x1b]52;c;aGk=\x07");
+        assert_eq!(osc52(b"", b"aGk="), b"\x1b]52;c;aGk=\x07");
     }
 
     #[test]
