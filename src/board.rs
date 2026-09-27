@@ -41,6 +41,20 @@
 //! truncates it, which an appending writer survives: its next line lands at the
 //! new end.
 //!
+//! # Kept to two files, never rewritten
+//!
+//! Every hook and every relay pass reads a whole board, so a board cannot only
+//! grow. It is not trimmed — trimming is a rewrite, and a rewrite is what the
+//! paragraph above rules out. It is *rotated*: once the live file passes
+//! [`ROTATE_AT`], the post that crossed it makes it the board's one older file
+//! (`.jsonl.old`, dropping the one before) and puts an empty live file in its
+//! place. The older file is a hard link to the same inode, so a writer that
+//! opened the board just before is appending to the older file, not to nothing;
+//! and the live file is replaced by a rename, so it never goes missing and no
+//! post is refused as "no board" mid-rotation. A board is both files read
+//! together, so what anyone reads is bounded at twice the limit, and a reader
+//! loses its place only when it has not looked for a whole rotation.
+//!
 //! Savras still writes nothing to `~/.claude/` and nothing into a repository.
 //! The boards are its own files, beside `machines` in its own config directory.
 
@@ -67,6 +81,11 @@ pub const LIMIT: usize = 2000;
 
 /// How many messages a bare `read` shows, and the most a hook will inject.
 pub const WINDOW: usize = 30;
+
+/// The size a board's live file is rotated at. A board is at most twice this —
+/// a few hundred messages — which every hook turn reads in well under a
+/// millisecond, and which is far more than any reader is ever shown.
+pub const ROTATE_AT: u64 = 128 * 1024;
 
 /// The name a post from the panel carries.
 ///
@@ -232,6 +251,62 @@ impl Boards {
             .join(format!("{}.jsonl", encode(repo)))
     }
 
+    /// The board's older half: what the live file held when it was last
+    /// rotated. Not a `.jsonl` name, so it is never listed as a board of its own.
+    fn older(&self, repo: &str) -> PathBuf {
+        self.dir
+            .join("repos")
+            .join(format!("{}.jsonl.old", encode(repo)))
+    }
+
+    fn lock_file(&self, repo: &str) -> PathBuf {
+        self.dir
+            .join("repos")
+            .join(format!("{}.jsonl.lock", encode(repo)))
+    }
+
+    /// Held while a board's files are swapped round — by rotation, cleaning
+    /// and deleting, never by posting, which stays a single append.
+    fn lock(&self, repo: &str) -> Result<fs::File> {
+        let path = self.lock_file(repo);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("opening the board lock at {}", path.display()))?;
+        file.lock()
+            .with_context(|| format!("locking {}", path.display()))?;
+        Ok(file)
+    }
+
+    /// Make the live file the older one and start an empty live file, if it
+    /// has passed [`ROTATE_AT`]. See the module note.
+    fn rotate(&self, repo: &str) -> Result<()> {
+        let _held = self.lock(repo)?;
+        let live = self.file(repo);
+        // Checked again under the lock: another poster may have rotated it.
+        let meta = fs::metadata(&live)?;
+        if meta.len() <= ROTATE_AT {
+            return Ok(());
+        }
+        let older = self.older(repo);
+        match fs::remove_file(&older) {
+            Err(e) if e.kind() != ErrorKind::NotFound => return Err(e.into()),
+            _ => {}
+        }
+        fs::hard_link(&live, &older)?;
+        let fresh = self.dir.join("repos").join(format!(
+            "{}.jsonl.new-{}",
+            encode(repo),
+            std::process::id()
+        ));
+        fs::File::create(&fresh)?;
+        fs::set_permissions(&fresh, meta.permissions())?;
+        fs::rename(&fresh, &live)?;
+        Ok(())
+    }
+
     /// Where the readers' places on one board are kept: a small file per
     /// reader, holding the id it has seen up to. A cursor is a fact about a
     /// reader, which is why it is not a flag written back onto the message.
@@ -300,7 +375,14 @@ impl Boards {
     pub fn clean(&self, _owner: &Owner, repo: &str) -> Result<usize> {
         let path = self.file(repo);
         anyhow::ensure!(path.is_file(), "{} has no board to clean", topic_name(repo));
+        let _held = self.lock(repo)?;
         let gone = self.count(repo);
+        match fs::remove_file(self.older(repo)) {
+            Err(e) if e.kind() != ErrorKind::NotFound => {
+                return Err(e).context("emptying the board's older file")
+            }
+            _ => {}
+        }
         OpenOptions::new()
             .write(true)
             .open(&path)
@@ -315,8 +397,14 @@ impl Boards {
     /// go quiet until the owner creates it again. `false` when there was none.
     pub fn delete(&self, _owner: &Owner, repo: &str) -> Result<bool> {
         let path = self.file(repo);
+        if !path.is_file() {
+            return Ok(false);
+        }
+        let _held = self.lock(repo)?;
+        let _ = fs::remove_file(self.older(repo));
         match fs::remove_file(&path) {
             Ok(()) => {
+                let _ = fs::remove_file(self.lock_file(repo));
                 let _ = fs::remove_dir_all(self.seen(repo));
                 Ok(true)
             }
@@ -401,6 +489,11 @@ impl Boards {
         // orders it against every other writer, so no lock is needed.
         file.write_all(line.as_bytes())
             .context("writing to the board")?;
+        // The message is written; a rotation that fails is tried again by the
+        // next post, and costs nothing but a board a little larger meanwhile.
+        if file.metadata().is_ok_and(|m| m.len() > ROTATE_AT) {
+            let _ = self.rotate(repo);
+        }
         Ok(message)
     }
 
@@ -408,10 +501,27 @@ impl Boards {
     ///
     /// A line that does not parse is skipped, not fatal: several processes
     /// write a board, and one bad line must not silence the rest.
+    ///
+    /// The older file first, then the live one. Read mid-rotation, both can be
+    /// the same file, so a message is kept once, by id.
     fn all(&self, repo: &str) -> Vec<Message> {
-        fs::read_to_string(self.file(repo))
-            .map(|text| parse(&text))
-            .unwrap_or_default()
+        let read = |path: PathBuf| {
+            fs::read_to_string(path)
+                .map(|text| parse(&text))
+                .unwrap_or_default()
+        };
+        let mut messages = read(self.older(repo));
+        if messages.is_empty() {
+            return read(self.file(repo));
+        }
+        let mut ids: std::collections::HashSet<String> =
+            messages.iter().map(|m| m.id.clone()).collect();
+        messages.extend(
+            read(self.file(repo))
+                .into_iter()
+                .filter(|m| ids.insert(m.id.clone())),
+        );
+        messages
     }
 
     /// The last `limit` messages on a board, oldest first. Moves no cursor:
@@ -1830,6 +1940,121 @@ mod tests {
 
         assert!(boards.create(&owner, SAVRAS).unwrap());
         assert_eq!(boards.count(SAVRAS), 0, "a new board, not the old one");
+    }
+
+    /// Post until the live file has been rotated `times` times, returning
+    /// every message posted, oldest first.
+    fn post_through_rotations(boards: &Boards, repo: &str, times: usize) -> Vec<Message> {
+        let text = "x".repeat(LIMIT);
+        let mut posted = Vec::new();
+        let mut rotations = 0;
+        let mut last = 0;
+        while rotations < times {
+            posted.push(boards.post("A", repo, None, &text).unwrap());
+            let len = fs::metadata(boards.file(repo)).unwrap().len();
+            if len < last {
+                rotations += 1;
+            }
+            last = len;
+        }
+        posted
+    }
+
+    #[test]
+    fn a_board_is_rotated_rather_than_left_to_grow() {
+        let s = Scratch::new("rotate");
+        let boards = s.boards();
+        let owner = Owner::at_the_panel();
+        boards.create(&owner, SAVRAS).unwrap();
+
+        let posted = post_through_rotations(&boards, SAVRAS, 3);
+        assert!(fs::metadata(boards.file(SAVRAS)).unwrap().len() <= ROTATE_AT);
+        assert!(fs::metadata(boards.older(SAVRAS)).unwrap().len() <= ROTATE_AT + LIMIT as u64 * 2);
+        assert_eq!(boards.list(), [SAVRAS], "the older file is not a board");
+
+        // What is kept is the newest, in order, each once.
+        let kept = boards.read(SAVRAS, usize::MAX);
+        assert!(kept.len() < posted.len(), "the oldest were dropped");
+        let newest: Vec<_> = posted[posted.len() - kept.len()..]
+            .iter()
+            .map(|m| &m.id)
+            .collect();
+        assert_eq!(kept.iter().map(|m| &m.id).collect::<Vec<_>>(), newest);
+
+        // Right after a rotation the live file is nearly empty, and a reader
+        // is still shown a full window from the older one.
+        assert_eq!(boards.read(SAVRAS, WINDOW).len(), WINDOW);
+    }
+
+    #[test]
+    fn a_reader_keeps_its_place_across_a_rotation() {
+        let s = Scratch::new("rotate-place");
+        let boards = s.boards();
+        let owner = Owner::at_the_panel();
+        boards.create(&owner, SAVRAS).unwrap();
+        let seen = boards.post("A", SAVRAS, None, "read this").unwrap();
+        boards.mark_seen("B", SAVRAS, &seen.id).unwrap();
+
+        let posted = post_through_rotations(&boards, SAVRAS, 1);
+        let (new, _) = boards.unread("B", SAVRAS, usize::MAX);
+        assert_eq!(new.len(), posted.len(), "nothing replayed, nothing missed");
+    }
+
+    #[test]
+    fn posts_racing_a_rotation_are_all_kept() {
+        let s = Scratch::new("rotate-race");
+        let boards = s.boards();
+        boards.create(&Owner::at_the_panel(), SAVRAS).unwrap();
+        // About 210 KiB from four writers: one rotation, so nothing is old
+        // enough to drop, and every message must still be on the board.
+        let text = "x".repeat(LIMIT);
+        std::thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    let boards = s.boards();
+                    for _ in 0..25 {
+                        boards.post("A", SAVRAS, None, &text).unwrap();
+                    }
+                });
+            }
+        });
+        assert!(boards.older(SAVRAS).exists(), "it did rotate");
+        assert_eq!(boards.count(SAVRAS), 100);
+    }
+
+    #[test]
+    fn a_board_read_mid_rotation_shows_each_message_once() {
+        let s = Scratch::new("rotate-mid");
+        let boards = s.boards();
+        let owner = Owner::at_the_panel();
+        boards.create(&owner, SAVRAS).unwrap();
+        boards.post("A", SAVRAS, None, "one").unwrap();
+        boards.post("A", SAVRAS, None, "two").unwrap();
+        // Linked but not yet replaced: both names are the same file.
+        fs::hard_link(boards.file(SAVRAS), boards.older(SAVRAS)).unwrap();
+        assert_eq!(boards.count(SAVRAS), 2);
+    }
+
+    #[test]
+    fn cleaning_or_deleting_a_rotated_board_takes_its_older_file_too() {
+        let s = Scratch::new("rotate-clean");
+        let boards = s.boards();
+        let owner = Owner::at_the_panel();
+        boards.create(&owner, SAVRAS).unwrap();
+        let posted = post_through_rotations(&boards, SAVRAS, 1);
+
+        assert_eq!(boards.clean(&owner, SAVRAS).unwrap(), posted.len());
+        assert_eq!(boards.count(SAVRAS), 0);
+        assert!(!boards.older(SAVRAS).exists());
+
+        post_through_rotations(&boards, SAVRAS, 1);
+        assert!(boards.delete(&owner, SAVRAS).unwrap());
+        assert!(!boards.older(SAVRAS).exists());
+        assert!(!boards.lock_file(SAVRAS).exists());
+        assert!(
+            fs::read_dir(s.0.join("repos")).unwrap().next().is_none(),
+            "nothing left behind"
+        );
     }
 
     #[test]
