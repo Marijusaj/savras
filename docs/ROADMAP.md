@@ -811,11 +811,37 @@ the same two hooks, in `~/.codex/hooks.json`.
 
 ---
 
+### M5.7 · A board is kept to two files
+**The board stops growing: it is rotated, never rewritten.**
+
+```
+BEFORE                                  AFTER
+post ─▶ <repo>.jsonl (grows forever)    post ─▶ <repo>.jsonl ─ past 128 KiB ─┐ (flock)
+read ◀─ all of it, every turn                    <repo>.jsonl.old ◀─ link ──┘ old .old dropped
+                                                 <repo>.jsonl     ◀─ empty file renamed in
+                                        read ◀─ .old + live, once per id (≤ 256 KiB)
+```
+
+Every hook turn and every relay pass read a whole board, and a board only
+grew. Trimming it would be a rewrite, and the board's one storage rule is that
+nothing is rewritten — an appending writer cannot be caught mid-rewrite, so
+posting needs no lock. So a board is *rotated*: the post that takes the live
+file past 128 KiB makes it the one older file, dropping the one before, and
+renames an empty file into its place. The older file is a hard link to the
+same inode, so a writer that opened the board a moment before appends to the
+older file rather than to nothing, and the live file never goes missing, so no
+post is refused mid-rotation. Rotation, cleaning and deleting take a lock
+beside the board; posting still does not. Nothing is summarised: what is
+dropped is the oldest half, whole. A reader loses its place — and gets the
+last 30, as a new reader does — only when it has not looked for a whole
+rotation, a few hundred messages; a `--re` to a message that old is shown
+without its parent.
+
+---
+
 ## Next
 
-- **Board retention** — the log only grows, and every hook and every relay
-  pass reads all of it. Trim by age or count, keeping the derivation the
-  definition rather than summarising what is dropped.
+- **Scrollback** — read a finished session's output without leaving the panel.
 
 ---
 
@@ -828,6 +854,5 @@ the same two hooks, in `~/.codex/hooks.json`.
 - **Packaging** — Scoop, winget, deb/rpm, via `cargo-dist`. Homebrew
   (`marijusaj/tap`) ships from a tag already, and crates.io with it when the
   release environment has its token.
-- **Scrollback** — read a finished session's output without leaving the panel.
 - **Board over MCP** — a typed surface over the same code path, for clients
   where a tool call is cheaper than a shell.
