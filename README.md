@@ -115,6 +115,14 @@ brew install marijusaj/tap/savras
 symlink, so a panel that is running keeps its binary. `claude` has to be on your
 PATH; tmux comes with the formula.
 
+On Linux, each release carries a binary for x86_64 and aarch64 (glibc 2.35 or
+newer), with a checksum and a build attestation:
+
+```sh
+mise use -g github:Marijusaj/savras     # or unpack the tarball onto your PATH
+gh attestation verify savras-*.tar.gz --repo Marijusaj/savras
+```
+
 From source:
 
 ```sh
