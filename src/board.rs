@@ -1293,9 +1293,12 @@ fn delivery(message: &Message, answers: Option<&str>, relay: bool) -> String {
     };
     let mut out = match whom {
         Some(whom) if relay => format!("the relay pings {whom} now"),
+        // Said to the poster, which is usually an agent that can do better
+        // than wait: a Claude Code session reaches another with SendMessage.
         Some(whom) => format!(
             "no relay is running for this board, so {whom} reads it on their next \
-             turn — `R` in the panel starts one"
+             turn — `R` in the panel starts one. If it cannot wait and you are a \
+             Claude Code session, SendMessage {whom} directly as well"
         ),
         None if owner => String::new(),
         None if yourself => "it answers your own message, so nobody is pinged: each \
@@ -1879,7 +1882,8 @@ mod tests {
         assert_eq!(
             delivery(&m, Some("SAVRAS 13"), false),
             "no relay is running for this board, so SAVRAS 13 reads it on their next \
-             turn — `R` in the panel starts one"
+             turn — `R` in the panel starts one. If it cannot wait and you are a \
+             Claude Code session, SendMessage SAVRAS 13 directly as well"
         );
         // Answering yourself pings nobody, whatever runs.
         assert!(delivery(&m, Some("LEAD"), true).starts_with("it answers your own message"));

@@ -455,6 +455,8 @@ struct Work {
     origin: Origin,
     /// Set once the child is reaped; `try_wait` must not be asked twice.
     exited: Option<u32>,
+    /// The signal that ended it, as the system names it, if one did.
+    signal: Option<String>,
 }
 
 impl Work {
@@ -505,6 +507,7 @@ impl Work {
             child,
             origin,
             exited: None,
+            signal: None,
         })
     }
 
@@ -514,9 +517,16 @@ impl Work {
         if self.exited.is_none() {
             if let Ok(Some(status)) = self.child.try_wait() {
                 self.exited = Some(status.exit_code());
+                self.signal = status.signal().map(str::to_string);
             }
         }
         self.exited
+    }
+
+    /// Whether it ended because somebody pressed ctrl-c in it — the one way
+    /// to stop a program in a pane on purpose, short of closing the tab.
+    fn interrupted(&mut self) -> bool {
+        self.exit_code().is_some() && self.signal.as_deref().is_some_and(is_interrupt)
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> Result<()> {
@@ -1072,6 +1082,19 @@ impl Tabs {
             .collect()
     }
 
+    /// The repositories whose relay tab ended without anybody stopping it —
+    /// killed by the system short of memory, or failed — so still wanted.
+    fn crashed_relays(&mut self) -> Vec<String> {
+        self.open
+            .iter_mut()
+            .filter(|tab| tab.relay.is_some())
+            .filter_map(|tab| {
+                let crashed = tab.work.exit_code().is_some() && !tab.work.interrupted();
+                crashed.then(|| tab.relay.clone()).flatten()
+            })
+            .collect()
+    }
+
     fn push(&mut self, tab: Pane) {
         self.open.push(tab);
         self.current = self.open.len() - 1;
@@ -1337,6 +1360,7 @@ fn event_loop(
     // The relays running at the last look, to tell one that stops from one
     // that was never started.
     let mut relaying: Vec<String> = session.tabs.relays();
+    let mut revivals = Revivals::default();
     // One ssh per machine, held open, streaming what is running over there.
     // The names are wanted after the watcher has taken the list: they are the
     // answers to "where should this tab open".
@@ -1443,10 +1467,16 @@ fn event_loop(
             };
             app.set_tabs(front, session.tabs.shorts(), named);
             app.set_open_boards(session.boards.repos());
+            // A crashed relay is still wanted — only one you stopped is
+            // forgotten — and is started again once its wait is up.
             let relays = session.tabs.relays();
-            forget_stopped_relays(&app, &relaying, &relays);
-            relaying = relays.clone();
+            let crashed = session.tabs.crashed_relays();
+            let wanted: Vec<String> = relays.iter().chain(&crashed).cloned().collect();
+            forget_stopped_relays(&app, &relaying, &wanted);
+            relaying = wanted;
+            revive_relays(&mut session, &mut app, &mut revivals, &crashed);
             app.set_relays(relays);
+            app.set_relays_down(crashed);
             terminal
                 .draw(|frame| draw(frame, &mut app, &session, focus, dead, confirming.as_ref()))?;
             last_draw = Instant::now();
@@ -2109,6 +2139,118 @@ fn forget_stopped_relays(app: &App, before: &[String], now: &[String]) {
     for repo in stopped {
         let _ = crate::relay::want(&boards, repo, false);
     }
+}
+
+/// A relay that died nobody stopping it, per board: how many times it has
+/// been started again, when the next is due, and when it last started.
+///
+/// A relay's own loop survives a failed `claude` call, so one that dies was
+/// killed — on an 8 GB Mac that swaps, by the system reclaiming memory — or
+/// cannot start at all. Either way the board promised its sessions a ping, so
+/// it is started again; but after a wait that doubles, so a relay that dies
+/// at once, or keeps meeting a usage limit, backs off rather than spinning.
+#[derive(Default)]
+struct Revivals(HashMap<String, Revival>);
+
+struct Revival {
+    tries: u32,
+    due: Option<Instant>,
+    since: Instant,
+}
+
+/// A relay that has run this long before dying starts its back-off over.
+const STEADY: Duration = Duration::from_secs(600);
+
+/// How long before the nth restart: 30s, doubling, never over ten minutes.
+fn revival_delay(tries: u32) -> Duration {
+    (Duration::from_secs(30) * 2u32.pow(tries.min(5))).min(Duration::from_secs(600))
+}
+
+/// Whether a signal, as `strsignal` names it, is SIGINT — ctrl-c. macOS says
+/// "Interrupt: 2", glibc "Interrupt".
+fn is_interrupt(signal: &str) -> bool {
+    signal.starts_with("Interrupt")
+}
+
+/// Why a program ended, in the words shown to the owner.
+fn how_it_ended(work: &mut Work) -> String {
+    match (work.exit_code(), work.signal.as_deref()) {
+        (_, Some(signal)) => signal.to_string(),
+        (Some(code), None) => format!("exit {code}"),
+        (None, None) => "running".to_string(),
+    }
+}
+
+/// Start again, in their own tabs, the relays that died with nobody stopping
+/// them — each when its wait is up. In place, so the tab you are in does not
+/// move under you, and the dead relay's last screen stays until then.
+fn revive_relays(
+    session: &mut Session,
+    app: &mut App,
+    revivals: &mut Revivals,
+    crashed: &[String],
+) {
+    // A tab that is gone was closed by you: nothing to remember for it.
+    revivals
+        .0
+        .retain(|repo, _| session.tabs.relay_at(repo).is_some());
+    let boards = crate::board::Boards::at(app.board_dir.clone());
+    let now = Instant::now();
+    for repo in crashed {
+        let name = crate::board::topic_name(repo);
+        if !boards.exists(repo) {
+            let _ = crate::relay::want(&boards, repo, false);
+            continue;
+        }
+        let Some(at) = session.tabs.relay_at(repo) else {
+            continue;
+        };
+        let revival = revivals.0.entry(repo.clone()).or_insert(Revival {
+            tries: 0,
+            due: None,
+            since: now,
+        });
+        match revival.due {
+            None => {
+                if revival.since.elapsed() >= STEADY {
+                    revival.tries = 0;
+                }
+                revival.due = Some(now + revival_delay(revival.tries));
+                say_relay_down(app, &name, &mut session.tabs.open[at].work, revival, now);
+            }
+            Some(due) if now >= due => {
+                let Some((command, cwd)) = session.tabs.open[at].reopen.clone() else {
+                    continue;
+                };
+                let (cols, rows) = session.work_size();
+                match Work::spawn(&command, Some(&cwd), cols, rows, Origin::Opened) {
+                    Ok(work) => session.tabs.open[at].work = work,
+                    Err(e) => {
+                        app.error = Some(format!("could not restart the {name} relay: {e:#}"))
+                    }
+                }
+                revival.tries += 1;
+                revival.due = None;
+                revival.since = now;
+            }
+            // Said again on every pass while it is down, not once: the
+            // panel's refresh clears the footer every two seconds, and a
+            // relay being down is a state, not news.
+            Some(_) => say_relay_down(app, &name, &mut session.tabs.open[at].work, revival, now),
+        }
+    }
+}
+
+fn say_relay_down(app: &mut App, name: &str, work: &mut Work, revival: &Revival, now: Instant) {
+    let left = revival
+        .due
+        .map_or(0, |due| due.saturating_duration_since(now).as_secs());
+    // What matters first, since the panel is 44 columns and cuts the rest:
+    // which relay, and when it is back. Why it stopped is for whoever reads on.
+    app.error = Some(format!(
+        "{name} relay down, back in {left}s ({}) — nobody is pinged meanwhile",
+        how_it_ended(work)
+    ));
 }
 
 /// Bring a repository's board relay to the front, starting it if it is not
@@ -3822,6 +3964,113 @@ mod tests {
         assert_eq!(session.tabs.shells(), 1);
         // The session panes are untouched, dead or alive.
         assert_eq!(session.tabs.shorts(), ["aaa", "bbb"]);
+    }
+
+    /// A pane running `script`, waited on until its program has ended.
+    fn ended(script: &str) -> Work {
+        let mut work = Work::spawn(
+            &["sh".into(), "-c".into(), script.into()],
+            None,
+            80,
+            24,
+            Origin::Opened,
+        )
+        .unwrap();
+        for _ in 0..500 {
+            if work.exit_code().is_some() {
+                return work;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("{script} did not end");
+    }
+
+    #[test]
+    fn ctrl_c_is_told_apart_from_being_killed_or_failing() {
+        let mut stopped = ended("kill -INT $$; sleep 5");
+        assert!(stopped.interrupted(), "{:?}", stopped.signal);
+
+        // What the system does to a process when memory runs out.
+        let mut killed = ended("kill -KILL $$; sleep 5");
+        assert!(!killed.interrupted());
+        assert!(
+            how_it_ended(&mut killed).starts_with("Killed"),
+            "{:?}",
+            killed.signal
+        );
+
+        let mut failed = ended("exit 3");
+        assert!(!failed.interrupted());
+        assert_eq!(how_it_ended(&mut failed), "exit 3");
+    }
+
+    fn relay_pane(repo: &str, script: &str) -> Pane {
+        let mut relay = pane(None);
+        relay.work = ended(script);
+        relay.relay = Some(repo.into());
+        relay.reopen = Some((
+            vec!["sh".into(), "-c".into(), "sleep 30".into()],
+            PathBuf::from("/"),
+        ));
+        relay
+    }
+
+    #[test]
+    fn a_relay_killed_is_down_and_one_stopped_with_ctrl_c_is_not() {
+        let mut tabs = three_tabs();
+        tabs.push(relay_pane("/code/killed", "kill -KILL $$; sleep 5"));
+        tabs.push(relay_pane("/code/stopped", "kill -INT $$; sleep 5"));
+        assert!(tabs.relays().is_empty(), "neither is running");
+        assert_eq!(tabs.crashed_relays(), ["/code/killed"]);
+    }
+
+    #[test]
+    fn a_crashed_relay_comes_back_in_its_own_tab_after_its_wait() {
+        let dir = std::env::temp_dir().join(format!("savras-revive-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let boards = crate::board::Boards::at(dir.clone());
+        let owner = crate::board::Owner::at_the_panel();
+        boards.create(&owner, "/code/web-app").unwrap();
+        let mut app = App::new(PathBuf::from("/nonexistent"));
+        app.board_dir = dir.clone();
+
+        let mut tabs = three_tabs();
+        tabs.push(relay_pane("/code/web-app", "kill -KILL $$; sleep 5"));
+        tabs.push(relay_pane("/code/deleted", "kill -KILL $$; sleep 5"));
+        let mut session = session_with(tabs);
+        session.tabs.current = 1;
+        let mut revivals = Revivals::default();
+
+        // First sight: the wait starts, and the owner is told why.
+        let crashed = session.tabs.crashed_relays();
+        revive_relays(&mut session, &mut app, &mut revivals, &crashed);
+        let said = app.error.clone().unwrap_or_default();
+        assert!(
+            said.starts_with("web-app relay down, back in 30s (Killed"),
+            "{said}"
+        );
+        assert_eq!(
+            session.tabs.crashed_relays(),
+            ["/code/web-app", "/code/deleted"]
+        );
+
+        // Its wait is up: started again in place, the tab you are in unmoved.
+        revivals.0.get_mut("/code/web-app").unwrap().due = Some(Instant::now());
+        revive_relays(&mut session, &mut app, &mut revivals, &crashed);
+        assert_eq!(session.tabs.relays(), ["/code/web-app"]);
+        assert_eq!(session.tabs.current, 1);
+        assert_eq!(revivals.0["/code/web-app"].tries, 1);
+
+        // A relay whose board was deleted is not started again, or wanted.
+        assert!(!revivals.0.contains_key("/code/deleted"));
+        assert_eq!(session.tabs.crashed_relays(), ["/code/deleted"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_relay_that_keeps_dying_waits_longer_each_time() {
+        let waits: Vec<u64> = (0..7).map(|n| revival_delay(n).as_secs()).collect();
+        assert_eq!(waits, [30, 60, 120, 240, 480, 600, 600]);
     }
 
     #[test]

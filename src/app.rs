@@ -153,6 +153,8 @@ pub struct App {
     open_boards: Vec<String>,
     /// Which boards a relay tab is relaying right now, by repository.
     relays: Vec<String>,
+    /// Which boards' relays died unstopped and are waiting to come back.
+    relays_down: Vec<String>,
     /// Which repository a directory belongs to, worked out once per directory.
     /// See [`App::board_for`].
     topics: HashMap<PathBuf, String>,
@@ -436,6 +438,7 @@ impl App {
             board_rows: Vec::new(),
             open_boards: Vec::new(),
             relays: Vec::new(),
+            relays_down: Vec::new(),
             topics: HashMap::new(),
             should_quit: false,
         };
@@ -493,6 +496,18 @@ impl App {
     /// Whether a relay is running for this repository's board.
     pub fn relayed(&self, repo: &str) -> bool {
         self.relays.iter().any(|r| r == repo)
+    }
+
+    /// Tell the panel which boards' relays died with nobody stopping them,
+    /// and are waiting to be started again.
+    pub fn set_relays_down(&mut self, down: Vec<String>) {
+        self.relays_down = down;
+    }
+
+    /// Whether this board's relay is down and coming back, rather than
+    /// running or stopped on purpose.
+    pub fn relay_down(&self, repo: &str) -> bool {
+        self.relays_down.iter().any(|r| r == repo)
     }
 
     /// What the nth pane of your own is called.

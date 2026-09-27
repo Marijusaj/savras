@@ -224,7 +224,13 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
                 Some(board) => ListItem::new(board_line(
                     board,
                     app.board_tab(&board.repo),
-                    app.relayed(&board.repo),
+                    if app.relayed(&board.repo) {
+                        Relay::Running
+                    } else if app.relay_down(&board.repo) {
+                        Relay::Down
+                    } else {
+                        Relay::None
+                    },
                     name_width,
                     area.width,
                 )),
@@ -256,16 +262,25 @@ fn draw_rows(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_stateful_widget(list, area, &mut app.list_state);
 }
 
+/// Whether a board's relay is running, down and coming back, or not wanted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Relay {
+    None,
+    Running,
+    Down,
+}
+
 /// A repository's board, first under its heading.
 ///
 /// Marked like any tab — filled in front, hollow behind — because it is one,
 /// and with its own glyph when it is not open, so a board never reads as a
 /// session. The count is flush right, where a session's age sits. A `↻` after
-/// the name says a relay is running for it — `R` — and spending your usage.
+/// the name says a relay is running for it — `R` — and spending your usage;
+/// a red one, that it died and is coming back, so nobody is pinged meanwhile.
 fn board_line(
     board: &BoardRow,
     tab: Tab,
-    relayed: bool,
+    relayed: Relay,
     name_width: u16,
     total_width: u16,
 ) -> Line<'static> {
@@ -279,7 +294,11 @@ fn board_line(
         Tab::Behind => Span::styled("▷ ", Style::default().fg(Color::Indexed(245))),
         Tab::None => Span::styled("≡ ", Style::default().fg(Color::Blue)),
     };
-    let relay = if relayed { " ↻" } else { "" };
+    let (relay, relay_color) = match relayed {
+        Relay::Running => (" ↻", Color::Green),
+        Relay::Down => (" ↻", Color::Red),
+        Relay::None => ("", Color::Green),
+    };
     let name = pad(
         "board",
         (name_width as usize)
@@ -292,7 +311,7 @@ fn board_line(
     Line::from(vec![
         mark,
         Span::styled(name, Style::default().fg(Color::Blue)),
-        Span::styled(relay, Style::default().fg(Color::Green)),
+        Span::styled(relay, Style::default().fg(relay_color)),
         Span::raw(" ".repeat(gap)),
         Span::styled(count, Style::default().fg(Color::DarkGray)),
     ])
