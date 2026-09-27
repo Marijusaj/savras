@@ -12,6 +12,7 @@ mod focus;
 mod host;
 mod job;
 mod panel;
+mod peers;
 mod ping;
 mod relay;
 mod remote;

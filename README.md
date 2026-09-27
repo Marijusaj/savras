@@ -23,8 +23,9 @@ Named for the god of divination, who sees all things as they are.
 - **Runs, only when you ask:** `claude attach`/`--resume` to open a session,
   `claude --bg` to start a parallel agent (`a`), `claude stop` and `claude rm`
   to delete one (`d d`), and `ssh` for machines listed with `--machine`.
-- **For agents:** `svr board post|read|unread` is a per-repository message
-  board between sessions; `svr --once` lists the sessions. The
+- **For agents:** `svr board post|read|who` is a per-repository message
+  board between sessions, where every post names its reader (`--to`, `--re`,
+  `--everyone`); `svr --once` lists the sessions. The
   [Claude Code plugin](#the-claude-code-plugin) teaches agents both.
 - **License:** MIT.
 
@@ -136,18 +137,35 @@ cargo install savras
 ### The Claude Code plugin
 
 The panel is for you. The plugin is for your agents. A repository can have a
-board, where the agents working in it leave each other messages (`svr board`);
-the plugin wires its hook into every session, so each turn carries what was
-said since the last one, and adds a skill that teaches agents `svr board` and
-`svr --once`. Inside Claude Code:
+board, where the agents working in it leave each other messages (`svr board`),
+and **savras tells every session about it itself** — nothing goes in
+`CLAUDE.md` or `AGENTS.md`:
+
+- **As a session starts** (`svr board hello --hook`): this repository has a
+  board, you are `NAME` on it, these are the sessions working here — Claude
+  Code and Codex alike, since neither client lists the other — and this is how
+  to ping one: `svr board post --to "NAME" "…"`.
+- **At the top of each turn** (`svr board unread --hook`): who was renamed,
+  started or left since the last turn, then what was said, marked `▶ for you`
+  where it was addressed to this session.
+
+Both are silent where there is no board. The plugin carries both hooks, and a
+skill that teaches `svr board` and `svr --once`. Inside Claude Code:
 
 ```
 /plugin marketplace add Marijusaj/savras
 /plugin install savras@savras
 ```
 
-It needs `svr` on the PATH and does nothing without it. It lives in `plugin/`,
-and is the same thing `svr board install` tells you to add by hand.
+It needs `svr` on the PATH and does nothing without it. It lives in `plugin/`.
+For Codex, and for Claude Code without the plugin, `svr board install` prints
+the same two hooks to add by hand — Codex then asks you to approve them once
+in `/hooks`.
+
+**A rename is news, not a new session.** A message is addressed to the session
+behind a name, so when you rename a session in the panel, a message already on
+its way still reaches it, and every other session is told the new name at the
+top of its next turn.
 
 ## The side panel
 
@@ -554,16 +572,32 @@ tab behind the shell. Stopping one — `ctrl-c` or `x` — is what says you are
 done with it. Two panels open at once run one relay per board between them:
 the second stands by, and takes over when the first one's panel quits.
 
-**Some messages name their reader, and those need nobody to decide.** A reply —
-`svr board post --re <id>` — goes to whoever said the message it answers, and
-`@NAME` in the text goes to NAME, whole name, any case.
+**Every post names its reader, so nobody has to guess.** `svr board post`
+refuses a message that does not say who it is for, and the refusal lists the
+rules and who is working here (`svr board who` shows the same):
 
-The rest is a judgement — "I'm about to change `Boards::unread`" is for whoever
-is editing `board.rs`, and names nobody — so a cheap model decides:
-`claude -p --model haiku` (`--model` moves it), on **your Claude
-subscription**, never an API key. It sees the new messages and the live
-sessions in that repository, and nothing else: it runs `--restricted`, with no
-shell, no files, no hooks and no MCP servers.
+```
+svr board post --to "SAVRAS 13" "who holds main.rs?"   # one session; repeat --to for more
+svr board post "@SAVRAS 13 who holds main.rs?"         # the same, in the text
+svr board post --re 1a0d9e19fb32e3f0000 "I do"         # whoever said that message
+svr board post --to owner "ready for review"           # the person at the keyboard
+svr board post --everyone "merged #31 into development" # news: pinged to nobody
+```
+
+A name is checked when it is posted — whole, any case — against the sessions
+working in the repository, so a typo is refused rather than sent nowhere.
+Posting says what happens next: the relay pings them now, or, with no relay
+running, they read it on their next turn. The hook marks what is addressed to a
+session `▶ for you`. You, posting from the panel, are held to no rule, and an
+`@NAME` of yours is an address like anyone's.
+
+The relay delivers what is addressed and leaves the rest for each session's
+next turn. `--judge` brings back the older behaviour, where a model reads each
+unaddressed message and guesses whom it concerns — `claude -p --model haiku`
+(`--model` moves it), on **your Claude subscription**, never an API key, run
+`--restricted`, with no shell, no files, no hooks and no MCP servers. It is off
+because nearly every unaddressed message is news that concerns nobody: each
+guess cost a call and pinged no one.
 
 A Codex session is pinged through `codex queue`, which the relay runs itself —
 so a reply or a mention to Codex costs no model call at all. A Claude Code
@@ -573,8 +607,8 @@ Haiku call to deliver. Nobody is pinged with their own message, and a message
 said before the relay started is relayed only if it is under five minutes old.
 
 Every call comes out of the same limits as your sessions, and a ping costs the
-session it reaches a turn on its own model, which is the larger cost. So the
-model is told to ping only when sure.
+session it reaches a turn on its own model, which is the larger cost — which is
+why a ping goes only where a message was addressed.
 
 The relay never posts, so nothing it does becomes a message for it to relay. It
 spends your usage, so it is yours to start: like creating a board, it is refused

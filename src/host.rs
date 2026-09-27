@@ -2615,12 +2615,14 @@ fn board_tab_key(bytes: &[u8], boards: &mut BoardTabs, app: &mut App) -> Action 
             Err(e) => Some(format!("could not create the board: {e}")),
         },
         [b'\r'] | [b'\n'] => match &view.compose {
-            Some(compose) if !compose.text.trim().is_empty() => Some(match view.send() {
-                Ok(message) => {
-                    format!("posted to {}", crate::board::topic_name(&message.topic))
-                }
-                Err(e) => format!("could not post: {e}"),
-            }),
+            Some(compose) if !compose.text.trim().is_empty() => {
+                Some(match view.send(&app.snapshot.jobs) {
+                    Ok(message) => {
+                        format!("posted to {}", crate::board::topic_name(&message.topic))
+                    }
+                    Err(e) => format!("could not post: {e}"),
+                })
+            }
             _ => None,
         },
         [0x7f] | [0x08] => {
