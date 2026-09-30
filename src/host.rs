@@ -1328,7 +1328,11 @@ pub fn run(setup: Setup) -> Result<()> {
     let mut terminal = crate::setup_terminal()?;
     // Ask the terminal to say when it gains and loses focus, so the panel can
     // tell "you are looking at that session" from "you are in another app".
-    let _ = std::io::stdout().write_all(focus::ENABLE.as_bytes());
+    // Under tmux they would only be about the panel's own pane, and which pane
+    // has the keyboard is read off tmux instead.
+    if mux.is_none() {
+        let _ = std::io::stdout().write_all(focus::ENABLE.as_bytes());
+    }
     let result = event_loop(&mut terminal, session, open, group_by, machines);
     // The tmux was started for this panel, and ends with it.
     if let Some(mux) = mux {
@@ -1385,6 +1389,10 @@ impl Session {
 struct BoardTabs {
     open: Vec<crate::app::BoardView>,
     front: Option<usize>,
+    /// Under tmux, each open board's pane: `svr board-tab`, a board drawn by a
+    /// Savras of its own, so it takes its turn beside the panel exactly as a
+    /// session does. See [`board_tab`].
+    panes: HashMap<String, Work>,
 }
 
 impl BoardTabs {
@@ -1426,9 +1434,33 @@ impl BoardTabs {
         self.front().and_then(|view| view.repo.clone())
     }
 
+    /// The pane showing a repository's board, started if it is not running.
+    fn pane(&mut self, repo: &str, jobs_dir: &Path) -> Result<String> {
+        let running = self
+            .panes
+            .get_mut(repo)
+            .is_some_and(|work| work.exit_code().is_none());
+        if !running {
+            let exe = std::env::current_exe().context("finding the svr binary")?;
+            let command = vec![
+                exe.to_string_lossy().into_owned(),
+                "board-tab".to_string(),
+                repo.to_string(),
+                jobs_dir.to_string_lossy().into_owned(),
+            ];
+            let work = Work::spawn(&command, Some(Path::new(repo)), 80, 24, Origin::Opened)?;
+            self.panes.insert(repo.to_string(), work);
+        }
+        self.panes
+            .get(repo)
+            .and_then(|work| work.pane().map(str::to_string))
+            .context("the board has no pane")
+    }
+
     /// Close a repository's board tab. The words half-written in it go with
     /// it, as a closed terminal tab's screen does.
     fn close(&mut self, repo: &str) -> bool {
+        self.panes.remove(repo);
         let Some(at) = self.position(repo) else {
             return false;
         };
@@ -1455,6 +1487,71 @@ impl BoardTabs {
             view.reload();
         }
     }
+}
+
+/// `svr board-tab <repo> <jobs-dir>`: one repository's board, as a tab of its
+/// own. Run by the panel under tmux, in a pane it swaps in beside itself, so a
+/// board is flipped to like a session rather than drawn over the window.
+///
+/// The same view and the same keys as a board drawn in the panel's own
+/// window; what it posts is signed by the owner, as there.
+pub fn board_tab(repo: String, jobs_dir: PathBuf) -> Result<()> {
+    let mut app = App::new(jobs_dir);
+    let mut boards = BoardTabs::default();
+    boards.show(&app.board_dir, &repo);
+    let mut terminal = crate::setup_terminal()?;
+    // A paste is words, not keystrokes: tmux wraps it only when asked.
+    let _ = std::io::stdout().write_all(PASTE_ON.as_bytes());
+    let input = stdin_thread();
+    let mut last = Instant::now();
+    let mut dirty = true;
+    let result = (|| -> Result<()> {
+        loop {
+            if dirty {
+                terminal.draw(|frame| {
+                    let area = frame.area();
+                    if let Some(view) = boards.front() {
+                        ui::draw_board_tab(frame, area, view, true);
+                    }
+                    // What the last key did — posted, or why not — where the
+                    // panel would have said it.
+                    if let Some(said) = &app.error {
+                        let bar = Rect {
+                            y: area.y + area.height.saturating_sub(1),
+                            height: 1.min(area.height),
+                            ..area
+                        };
+                        frame.render_widget(
+                            Paragraph::new(truncate_to(said, bar.width as usize))
+                                .style(Style::default().fg(Color::Indexed(179))),
+                            bar,
+                        );
+                    }
+                })?;
+                dirty = false;
+            }
+            match input.recv_timeout(REDRAW) {
+                Ok(bytes) => {
+                    app.error = None;
+                    if let Action::Repaint = board_tab_key(&bytes, &mut boards, &mut app) {
+                        repaint(&mut terminal)?;
+                    }
+                    dirty = true;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+            // What the agents say should not wait for a key to be seen.
+            if last.elapsed() >= REFRESH {
+                boards.reload();
+                last = Instant::now();
+                dirty = true;
+            }
+        }
+    })();
+    let _ = std::io::stdout().write_all(PASTE_OFF.as_bytes());
+    crate::restore_terminal(&mut terminal)?;
+    result
 }
 
 /// Clear the screen and force a full redraw — without asking the terminal
@@ -1602,29 +1699,32 @@ fn event_loop(
         }
 
         // A click on the other pane moves the keyboard without a key.
-        if let Some(mux) = crate::mux::get() {
-            if !showing_board {
-                if let Some(to_panel) = mux.moved() {
-                    focus = if to_panel { Focus::Panel } else { Focus::Work };
-                    dirty = true;
-                }
-            }
+        if let Some(to_panel) = crate::mux::get().and_then(|mux| mux.moved()) {
+            focus = if to_panel { Focus::Panel } else { Focus::Work };
+            dirty = true;
         }
 
-        // Under tmux, the layout is tmux's: the tab in front goes in the slot
-        // beside the panel, a board zooms the panel over the whole window,
-        // and the keyboard goes where `focus` says. Only changes cost a call.
-        if let (Some(mux), Some(front)) = (crate::mux::get(), session.tabs.work().pane()) {
+        // Under tmux, the layout is tmux's: the tab in front — a board is a
+        // tab like any other — goes in the slot beside the panel, and the
+        // keyboard goes where `focus` says. Only changes cost a call.
+        if let Some(mux) = crate::mux::get() {
+            let front = match session.boards.front_repo() {
+                Some(repo) => match session.boards.pane(&repo, &session.jobs_dir) {
+                    Ok(pane) => Some(pane),
+                    Err(e) => {
+                        app.error = Some(format!("could not open the board: {e:#}"));
+                        session.boards.hide();
+                        None
+                    }
+                },
+                None => session.tabs.work().pane().map(str::to_string),
+            };
             let panel_active =
                 focus == Focus::Panel || matches!(confirming, Some(Confirm::Where(_)));
-            if let Err(e) = mux.arrange(
-                front,
-                showing_board,
-                panel_active,
-                session.side,
-                session.width,
-            ) {
-                app.error = Some(format!("tmux: {e:#}"));
+            if let Some(front) = front {
+                if let Err(e) = mux.arrange(&front, panel_active, session.side, session.width) {
+                    app.error = Some(format!("tmux: {e:#}"));
+                }
             }
         }
 
@@ -1675,7 +1775,7 @@ fn event_loop(
                     Some(_) => match crate::mux::unwrap(&bytes) {
                         Some((key, _)) => key,
                         None => {
-                            if !showing_board && focus::event(&bytes).is_none() {
+                            if focus::event(&bytes).is_none() {
                                 focus = Focus::Panel;
                             }
                             bytes
@@ -1735,8 +1835,10 @@ fn event_loop(
                     )?
                 };
                 // Any key answers the question, so the prompt never outlives
-                // the keystroke that followed it.
-                if was_confirming.is_some() {
+                // the keystroke that followed it. A read with no key in it —
+                // tmux saying the panel has the focus, which it does because
+                // the question moved it there — answers nothing.
+                if was_confirming.is_some() && !bytes.is_empty() {
                     confirming = None;
                 }
                 match action {
@@ -2998,9 +3100,9 @@ fn draw(
         (Focus::Panel, None) => Hint::Focused,
         (Focus::Work, None) => Hint::Background,
     };
-    // Under tmux the panel has a pane of its own and fills it; only a board,
-    // which zooms that pane over the window, is drawn beside it.
-    if crate::mux::get().is_some() && session.boards.front().is_none() {
+    // Under tmux the panel has a pane of its own and fills it; a board is a
+    // pane of its own too.
+    if crate::mux::get().is_some() {
         ui::draw_in(frame, area, app, hint);
         return;
     }

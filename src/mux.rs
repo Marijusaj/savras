@@ -109,7 +109,6 @@ struct Seen {
 #[derive(Debug, Clone, PartialEq)]
 struct Arranged {
     front: String,
-    zoom: bool,
     panel_active: bool,
     at: Instant,
 }
@@ -237,70 +236,65 @@ impl Mux {
         let _ = self.tmux(&["set-option", "-p", "-t", pane, &format!("@{key}"), value]);
     }
 
-    /// Make the layout this: `front` in the slot beside the panel, the panel
-    /// zoomed over the whole window or not, and the keyboard in the panel or
-    /// in the slot.
+    /// Make the layout this: `front` in the slot beside the panel, and the
+    /// keyboard in the panel or in the slot.
     ///
     /// Only what differs is changed, so calling it every time round the loop
-    /// costs nothing once the layout is right.
-    pub fn arrange(
-        &self,
-        front: &str,
-        zoom: bool,
-        panel_active: bool,
-        side: Side,
-        width: u16,
-    ) -> Result<()> {
-        if self
-            .arranged
-            .lock()
-            .unwrap()
+    /// costs nothing once the layout is right — and what does change is one
+    /// tmux call, since flipping through tabs is done a press at a time and
+    /// each press waits for it.
+    pub fn arrange(&self, front: &str, panel_active: bool, side: Side, width: u16) -> Result<()> {
+        let mut arranged = self.arranged.lock().unwrap();
+        if arranged
             .as_ref()
-            .is_some_and(|a| a.front == front && a.zoom == zoom && a.panel_active == panel_active)
+            .is_some_and(|a| a.front == front && a.panel_active == panel_active)
         {
             return Ok(());
         }
-        let seen = self.seen()?;
-        if seen.slot.as_deref() != Some(front) {
-            match &seen.slot {
+        // Where the slot is, from the last arrangement when there was one —
+        // nothing else moves panes — and from tmux when something did.
+        let slot = match arranged.as_ref() {
+            Some(a) => Some(a.front.clone()),
+            None => self.seen()?.slot,
+        };
+        let mut commands: Vec<Vec<String>> = Vec::new();
+        if slot.as_deref() != Some(front) {
+            match slot {
                 // The panes trade places; the one leaving goes to the window
                 // the arriving one came from.
-                Some(slot) => {
-                    self.tmux(&["swap-pane", "-d", "-s", front, "-t", slot])?;
-                }
+                Some(slot) => commands.push(words(&["swap-pane", "-d", "-s", front, "-t", &slot])),
                 // Nothing beside the panel — the tab that was there closed —
                 // so the pane is brought in beside it.
                 None => {
-                    let mut args = vec!["join-pane", "-d", "-h", "-s", front, "-t", &self.panel];
+                    let mut join =
+                        words(&["join-pane", "-d", "-h", "-s", front, "-t", &self.panel]);
                     if side == Side::Right {
-                        args.insert(3, "-b");
+                        join.insert(3, "-b".into());
                     }
-                    self.tmux(&args)?;
-                    self.tmux(&["resize-pane", "-t", &self.panel, "-x", &width.to_string()])?;
+                    commands.push(join);
+                    commands.push(words(&[
+                        "resize-pane",
+                        "-t",
+                        &self.panel,
+                        "-x",
+                        &width.to_string(),
+                    ]));
                 }
             }
-            self.forget();
         }
-        let seen = self.seen()?;
-        if seen.zoomed != zoom {
-            self.tmux(&["resize-pane", "-Z", "-t", &self.panel])?;
-            self.forget();
-        }
-        let active = self.active()?;
-        let wanted = if panel_active || zoom {
+        let wanted = if panel_active {
             self.panel.as_str()
         } else {
             front
         };
-        if active.as_deref() != Some(wanted) {
-            self.tmux(&["select-pane", "-t", wanted])?;
-        }
-        *self.arranged.lock().unwrap() = Some(Arranged {
+        commands.push(words(&["select-pane", "-t", wanted]));
+        self.tmux(&commands.join(&[";".to_string()][..]))?;
+        *arranged = Some(Arranged {
             front: front.to_string(),
-            zoom,
             panel_active,
             at: Instant::now(),
         });
+        drop(arranged);
         self.forget_seen();
         Ok(())
     }
@@ -317,7 +311,7 @@ impl Mux {
         let seen = self.seen().ok()?;
         let mut arranged = self.arranged.lock().unwrap();
         let a = arranged.as_mut()?;
-        if a.zoom || seen.at.is_none_or(|at| at <= a.at) {
+        if seen.at.is_none_or(|at| at <= a.at) {
             return None;
         }
         let wanted = if a.panel_active {
@@ -335,21 +329,6 @@ impl Mux {
         }
         a.panel_active = to_panel;
         Some(to_panel)
-    }
-
-    /// Which pane in the panel's window has the keyboard.
-    fn active(&self) -> Result<Option<String>> {
-        let out = self.tmux(&[
-            "list-panes",
-            "-t",
-            &self.panel,
-            "-F",
-            "#{pane_active} #{pane_id}",
-        ])?;
-        Ok(out
-            .lines()
-            .find_map(|line| line.strip_prefix("1 "))
-            .map(str::to_string))
     }
 
     /// Make the panel this wide.
@@ -595,6 +574,10 @@ fn send_hex(pane: &str, bytes: &[u8]) -> Vec<String> {
     ];
     args.extend(bytes.iter().map(|b| format!("{b:02x}")));
     args
+}
+
+fn words(args: &[&str]) -> Vec<String> {
+    args.iter().map(|a| a.to_string()).collect()
 }
 
 fn sh_join(args: &[String]) -> String {

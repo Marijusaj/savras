@@ -186,11 +186,14 @@ fn main() -> Result<()> {
     // agent runs from a shell, and it must not be parsed as though somebody
     // asked for a terminal UI.
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    // Run by the panel's tmux on ctrl-v, not by anyone typing it.
-    if let [command, pane] = argv.as_slice() {
-        if command == "paste-image" {
-            return mux::paste_image(pane);
+    // Run by the panel's tmux, not by anyone typing them: ctrl-v, and a
+    // board's tab.
+    match argv.as_slice() {
+        [command, pane] if command == "paste-image" => return mux::paste_image(pane),
+        [command, repo, jobs] if command == "board-tab" => {
+            return host::board_tab(repo.clone(), PathBuf::from(jobs));
         }
+        _ => {}
     }
     match board::dispatch(&argv) {
         Ok(true) => return Ok(()),
