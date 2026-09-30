@@ -156,8 +156,18 @@ pub struct App {
     /// Which repository a directory belongs to, worked out once per directory.
     /// See [`App::board_for`].
     topics: HashMap<PathBuf, String>,
+    /// How old each repository on the panel is: the oldest session it has
+    /// held since it came on. Kept rather than worked out afresh, because
+    /// afresh a repository re-dated itself to whatever it still held — delete
+    /// its first session and it sank below every repository opened since.
+    /// See [`App::date_repos`].
+    repo_ages: HashMap<String, RepoAge>,
     pub should_quit: bool,
 }
+
+/// How a repository sorts: dated sessions first, then undated ones, then
+/// panes alone — and the dated ones oldest first.
+type RepoAge = (u8, Option<chrono::DateTime<chrono::Utc>>);
 
 /// A repository's board, as the panel shows it.
 ///
@@ -437,6 +447,7 @@ impl App {
             open_boards: Vec::new(),
             relays: Vec::new(),
             topics: HashMap::new(),
+            repo_ages: HashMap::new(),
             should_quit: false,
         };
         app.refresh();
@@ -757,6 +768,7 @@ impl App {
     }
 
     fn rebuild_rows(&mut self) {
+        self.date_repos();
         self.rows.clear();
         self.nested.clear();
         self.board_rows.clear();
@@ -890,34 +902,52 @@ impl App {
         self.shells.get(i)?.cwd.as_deref().map(job::repo_of)
     }
 
-    /// The repositories in play, the one whose work started first at the top.
+    /// How old each repository in play is, remembered across refreshes.
     ///
-    /// A repository is as old as its oldest session, so a repository you have
-    /// been in all morning stays where you last saw it however its sessions
-    /// come and go. A session whose start time could not be read dates its
-    /// repository no better than not at all, and a repository holding nothing
-    /// but panes of your own has no session to date it by: both sort after
-    /// the dated ones, by name.
-    fn repos_in_order(&self) -> Vec<String> {
-        /// Dated sessions first, then undated ones, then panes alone.
-        type Age = (u8, Option<chrono::DateTime<chrono::Utc>>);
-        let mut repos: Vec<(Age, String)> = Vec::new();
+    /// A repository is as old as the oldest session it has held since it came
+    /// on the panel — not the oldest it still holds. Close or delete sessions
+    /// down to the newest one, or to a pane of your own, and it keeps its
+    /// place: the place is where you last saw it, which is what you reach for.
+    /// Only a repository that leaves the panel altogether is forgotten, and
+    /// dated afresh if it comes back.
+    ///
+    /// Done on every rebuild, whichever way the rows are grouped, so a
+    /// session deleted while grouped by status still dates its repository
+    /// when you switch.
+    fn date_repos(&mut self) {
+        let mut now: HashMap<String, RepoAge> = HashMap::new();
         let sessions = self.snapshot.jobs.iter().map(|job| {
             let (undated, at) = job::started(job);
             ((u8::from(undated), at), job.repo())
         });
         let shells = (0..self.shells.len()).filter_map(|i| Some(((2, None), self.shell_repo(i)?)));
-        for (age, repo) in sessions.chain(shells) {
-            match repos.iter_mut().find(|(_, name)| name == &repo) {
-                // The oldest session in the repository is what it sorts by:
-                // the repository has been in play since that one started.
-                Some((oldest, _)) if age < *oldest => *oldest = age,
-                Some(_) => {}
-                None => repos.push((age, repo)),
+        for (age, repo) in sessions.chain(shells).collect::<Vec<_>>() {
+            now.entry(repo)
+                .and_modify(|oldest| *oldest = (*oldest).min(age))
+                .or_insert(age);
+        }
+        for (repo, age) in now.iter_mut() {
+            if let Some(&had) = self.repo_ages.get(repo) {
+                *age = (*age).min(had);
             }
         }
-        repos.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        repos.into_iter().map(|(_, name)| name).collect()
+        self.repo_ages = now;
+    }
+
+    /// The repositories in play, the one whose work started first at the top.
+    ///
+    /// A session whose start time could not be read dates its repository no
+    /// better than not at all, and a repository holding nothing but panes of
+    /// your own has no session to date it by: both sort after the dated ones,
+    /// by name. See [`App::date_repos`] for what dates one.
+    fn repos_in_order(&self) -> Vec<String> {
+        let mut repos: Vec<(&RepoAge, &String)> = self
+            .repo_ages
+            .iter()
+            .map(|(repo, age)| (age, repo))
+            .collect();
+        repos.sort();
+        repos.into_iter().map(|(_, name)| name.clone()).collect()
     }
 
     /// Group by repository or by status, and say which it is now.
@@ -1498,6 +1528,34 @@ mod tests {
             app.rows[..3],
             [Row::Shell(0), Row::Shell(1), Row::Shell(2)]
         ));
+    }
+
+    #[test]
+    fn a_repository_keeps_its_place_when_its_oldest_session_is_deleted() {
+        // beta (RUN 08:00, FIN 10:00) · gamma (ASK 09:00) · alpha (OLD 11:00)
+        let f = across_repos();
+        let mut app = App::new(f.0.clone());
+        app.set_group_by(GroupBy::Repo);
+        assert_eq!(app.groups, ["beta", "gamma", "alpha"]);
+
+        // Down to FIN, beta holds nothing older than gamma's 09:00 — and
+        // still sits where it was, because that is where you last saw it.
+        std::fs::remove_dir_all(f.0.join("aaa")).unwrap();
+        app.refresh();
+        assert_eq!(app.groups, ["beta", "gamma", "alpha"]);
+
+        // Gone altogether, it is forgotten; back, it is dated afresh.
+        std::fs::remove_dir_all(f.0.join("ccc")).unwrap();
+        app.refresh();
+        assert_eq!(app.groups, ["gamma", "alpha"]);
+        std::fs::create_dir_all(f.0.join("eee")).unwrap();
+        std::fs::write(
+            f.0.join("eee/state.json"),
+            r#"{"state":"working","name":"NEW","cwd":"/tmp/savras-test-repos/beta","createdAt":"2026-09-22T12:00:00Z"}"#,
+        )
+        .unwrap();
+        app.refresh();
+        assert_eq!(app.groups, ["gamma", "alpha", "beta"]);
     }
 
     #[test]
