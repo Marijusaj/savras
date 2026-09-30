@@ -2448,10 +2448,13 @@ fn relay_tab(session: &mut Session, repo: &str) -> Result<()> {
         session.tabs.close(at);
     }
     let exe = std::env::current_exe().context("finding the svr binary to run the relay")?;
+    // Judging: a message that names its reader is pinged by the post that
+    // made it, so guessing whom the others concern is all a relay is for.
     let command = vec![
         exe.to_string_lossy().to_string(),
         "board".to_string(),
         "relay".to_string(),
+        "--judge".to_string(),
         "--repo".to_string(),
         repo.to_string(),
     ];
@@ -3041,7 +3044,15 @@ fn board_tab_key(bytes: &[u8], boards: &mut BoardTabs, app: &mut App) -> Action 
             Some(compose) if !compose.text.trim().is_empty() => {
                 Some(match view.send(&app.snapshot.jobs) {
                     Ok(message) => {
-                        format!("posted to {}", crate::board::topic_name(&message.topic))
+                        let posted =
+                            format!("posted to {}", crate::board::topic_name(&message.topic));
+                        // An @NAME of yours is pinged like anyone's post.
+                        let boards = crate::board::Boards::at(app.board_dir.clone());
+                        match crate::relay::deliver_later(&boards, &message) {
+                            Ok(true) => format!("{posted} — pinging"),
+                            Ok(false) => posted,
+                            Err(e) => format!("{posted}, but could not ping: {e:#}"),
+                        }
                     }
                     Err(e) => format!("could not post: {e}"),
                 })
