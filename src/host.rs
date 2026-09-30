@@ -1940,13 +1940,13 @@ fn open_short(session: &mut Session, app: &mut App, short: &str) -> Result<bool>
     };
     let short = short.to_string();
 
-    // A Codex session never asked anything has no rollout, and `codex
-    // resume` would only say so and exit. Asked of Codex, now: the row may be
-    // a refresh old. Whether some other window has it open is Codex's to
+    // A Codex session never asked anything and no longer loaded has no
+    // rollout, and `codex resume` would only say so and exit. Asked of Codex,
+    // now: the row may be a refresh old. Whether some other window has it open is Codex's to
     // settle when the tab attaches — every window is a client of one daemon.
     if matches!(job.client, Client::Codex)
         && job.machine.is_none()
-        && !crate::codex::saved(&app.codex_dir, &job.session_id)
+        && !crate::codex::resumable(&app.codex_dir, &job.session_id)
     {
         app.error = Some(format!(
             "{} was never asked anything, so there is nothing to resume",
