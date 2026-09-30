@@ -192,19 +192,31 @@ svr solo           # just the panel, no working pane, for its own tab
 Both of those are also keys, so you can settle it by looking rather than by
 guessing at a number: with the panel focused, **`<` and `>` move the divider**
 four columns at a time and **`[` and `]` put the panel on the left or the
-right**. The pane beside it is a real pseudo-terminal, so it is told about the
-new size and the program inside repaints itself against it. The panel will not
+right**. You can also drag the divider with the mouse. The panel will not
 narrow past 12 columns or grow until the pane stops being usable.
 
-No tmux, no configuration, nothing else to install. Savras hosts the working
-pane itself: it opens a pseudo-terminal, runs your command in it, and draws its
-screen beside the panel. Keystrokes are forwarded to the child as raw bytes
-rather than decoded and re-encoded, so arrow keys, Ctrl chords, paste and
-full-screen TUIs behave exactly as they would in a normal terminal.
+**tmux draws the panes; Savras is the panel.** `svr` starts a tmux of its own
+— on its own socket, with its own config, so a tmux you already use is never
+touched — and runs as one pane of it, with your work in a real tmux pane
+beside it. tmux is kept invisible: no status bar, no prefix key to learn, just
+a divider. It comes with the Homebrew formula.
 
-Savras does not implement a terminal emulator. [`portable-pty`][pty] provides
-the pseudo-terminal (ConPTY on Windows) and [`vt100`][vt100] interprets the
-output; Savras is the layout and the glue.
+That is what makes the terminal behave like a terminal. **Drag to select** and
+the selection stays inside the pane you dragged in, a URL that wraps comes out
+as one line, and it lands on your clipboard (through `pbcopy` on a Mac, since
+Terminal.app ignores the clipboard escape). Links, scrolling, bracketed paste
+and focus all work as they do in any tmux, because tmux is doing them.
+
+**`ctrl-v` pastes an image, on any machine.** In a session here, Claude Code
+and Codex read the clipboard themselves. In a tab on another machine they
+cannot — the clipboard is on this one — so Savras copies the image over the
+ssh connection it already holds and pastes its path there, which both of them
+take as an image.
+
+`svr --host` draws the panes in Savras itself instead, the way it used to:
+[`portable-pty`][pty] for the pseudo-terminal and [`vt100`][vt100] to read it.
+It needs no tmux, and it is what runs if tmux is not installed, but selecting
+and copying in it cover both panes, and links are plain text.
 
 `ctrl-g` moves the keyboard to the panel and back; with the panel focused,
 `enter` opens the selected session in the working pane and `esc` hands the
@@ -216,12 +228,8 @@ attaching leaves the session running either way.
 
 If an opened session exits — resuming one that is already open elsewhere will do
 that — its last screen stays on display so you can read why, with `enter` to try
-again and `q` to quit. Only leaving the shell you *started* with closes Savras. Everything else goes
-straight to your work, including the mouse: Savras follows the child in and out
-of mouse reporting and mirrors it to the real terminal, so scrolling reaches
-Claude Code instead of dragging the terminal's own scrollback across both panes.
-With the panel on the left, mouse coordinates are shifted into the working
-pane's own frame.
+again and `q` to close the tab. Only leaving the shell you *started* with closes
+Savras, and the tmux it started goes with it.
 
 [pty]: https://crates.io/crates/portable-pty
 [vt100]: https://crates.io/crates/vt100
@@ -779,27 +787,14 @@ terminal that cannot parse a sequence may print it across the panel instead of
 swallowing it — so there the sound and the bell are the whole story. They are
 enough: the bell puts a badge on the tab, which is what you look for anyway.
 
-### tmux, if you want it
-
-```sh
-svr --tmux
-```
-
-Hosting the pane means the session dies with Savras. `--tmux` builds the same
-layout in tmux instead, so the session survives a crash or a dropped SSH
-connection, and you can detach and reattach. The tmux is kept invisible: no
-status bar, no prefix keys to learn, just a divider. Savras writes its own tmux
-config and applies it only to the server it starts, so an existing tmux setup is
-left alone. Run it from inside tmux and it adds the column to the window in
-front of you. `--dry-run` prints the tmux commands instead of running them.
-
 ## Usage
 
 ```
 svr                    the side panel, with the top session beside it
 svr -- claude          ... with Claude Code beside it
 svr --side left        put the panel on the left instead of the right
-svr --tmux             use tmux, so the session survives a crash
+svr --host             draw the panes in Savras rather than tmux
+svr --dry-run          print the tmux command instead of running it
 svr solo               just the panel, with no working pane
 svr --ping <when>      ping on needs (the default), done, or off
 svr --no-sound         notify without a sound

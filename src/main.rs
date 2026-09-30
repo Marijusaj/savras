@@ -11,7 +11,7 @@ mod codex;
 mod focus;
 mod host;
 mod job;
-mod panel;
+mod mux;
 mod peers;
 mod ping;
 mod relay;
@@ -59,8 +59,8 @@ commands:
 options:
   --side <left|right> which side the panel sits on (default right)
   --width <cols>      width of the panel column (default 44)
-  --tmux              build the layout with tmux instead of hosting it directly
-  --dry-run           print the tmux layout instead of building it
+  --host              draw the panes in Savras itself instead of in tmux
+  --dry-run           print the tmux command instead of running it
   --ping <when>       ping on needs (default), done, or off
   --no-sound          notify without a sound
   --quiet <seconds>   silence after a ping, news held until it ends (default 20)
@@ -152,7 +152,9 @@ enum Mode {
         width: u16,
         command: Vec<String>,
         dry_run: bool,
-        tmux: bool,
+        /// Host the panes in Savras itself rather than in tmux: `--host`, or
+        /// the fallback when tmux is not installed.
+        host: bool,
         side: Side,
     },
 }
@@ -184,6 +186,12 @@ fn main() -> Result<()> {
     // agent runs from a shell, and it must not be parsed as though somebody
     // asked for a terminal UI.
     let argv: Vec<String> = std::env::args().skip(1).collect();
+    // Run by the panel's tmux on ctrl-v, not by anyone typing it.
+    if let [command, pane] = argv.as_slice() {
+        if command == "paste-image" {
+            return mux::paste_image(pane);
+        }
+    }
     match board::dispatch(&argv) {
         Ok(true) => return Ok(()),
         Ok(false) => {}
@@ -228,12 +236,25 @@ fn main() -> Result<()> {
         width,
         command,
         dry_run,
-        tmux,
+        host,
         side,
     } = options.mode
     {
-        if tmux || dry_run {
-            return panel::run(width, side, command, dry_run);
+        // tmux owns the terminal unless you asked otherwise: Savras starts a
+        // tmux of its own and runs again inside it, as the panel. The one it
+        // starts lands in `host::run` below, and drives that tmux.
+        if !host && !mux::inside() {
+            if dry_run {
+                println!("{}", mux::launch_line(&argv)?);
+                return Ok(());
+            }
+            if mux::available() {
+                return mux::launch(&argv);
+            }
+            eprintln!(
+                "svr: tmux is not installed, so Savras is hosting the panes itself.\n\
+                 Selecting, copying and links work properly with tmux: brew install tmux"
+            );
         }
         return host::run(host::Setup {
             width,
@@ -373,13 +394,13 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
         group_by: app::GroupBy::Repo,
     };
     let mut open: Option<host::Open> = None;
-    let mut width = panel::DEFAULT_WIDTH;
+    let mut width = host::DEFAULT_WIDTH;
     let mut command = Vec::new();
     // The side panel is the point of the tool, so it is what you get by
     // default; `solo` is the older behaviour of a panel with nothing beside it.
     let mut is_panel = true;
     let mut dry_run = false;
-    let mut tmux = false;
+    let mut hosted = false;
     let mut side = Side::Right;
 
     let mut args = args.into_iter().peekable();
@@ -469,7 +490,10 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
                     .with_context(|| format!("--ping must be needs, done or off, not {raw}"))?;
             }
             "--dry-run" => dry_run = true,
-            "--tmux" => tmux = true,
+            // The default now; still accepted, so scripts that asked for it
+            // keep working.
+            "--tmux" => {}
+            "--host" => hosted = true,
             "--side" => {
                 let raw = args.next().context("--side needs left or right")?;
                 side = match raw.as_str() {
@@ -522,7 +546,7 @@ fn parse(args: Vec<String>) -> Result<Option<Options>> {
             width,
             command,
             dry_run,
-            tmux,
+            host: hosted,
             side,
         };
     } else if !command.is_empty() {
@@ -838,7 +862,7 @@ mod tests {
         let options = parse_ok(&["--", "claude", "--once", "--width", "9"]);
         match options.mode {
             Mode::Panel { width, command, .. } => {
-                assert_eq!(width, panel::DEFAULT_WIDTH);
+                assert_eq!(width, host::DEFAULT_WIDTH);
                 assert_eq!(command, ["claude", "--once", "--width", "9"]);
             }
             _ => panic!("expected panel mode"),
@@ -846,15 +870,17 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_hosts_the_pane_itself_unless_tmux_is_asked_for() {
-        // The default needs no tmux installed; --tmux opts into it for the
-        // detach and reattach that hosting cannot give.
-        match parse_ok(&["panel"]).mode {
-            Mode::Panel { tmux, .. } => assert!(!tmux),
-            _ => panic!("expected panel mode"),
+    fn tmux_hosts_the_panes_unless_savras_is_asked_to() {
+        // tmux draws the panes by default; --host keeps Savras drawing them,
+        // and --tmux, which used to opt in, is still accepted.
+        for args in [&["panel"][..], &["panel", "--tmux"]] {
+            match parse_ok(args).mode {
+                Mode::Panel { host, .. } => assert!(!host),
+                _ => panic!("expected panel mode"),
+            }
         }
-        match parse_ok(&["panel", "--tmux"]).mode {
-            Mode::Panel { tmux, .. } => assert!(tmux),
+        match parse_ok(&["panel", "--host"]).mode {
+            Mode::Panel { host, .. } => assert!(host),
             _ => panic!("expected panel mode"),
         }
     }
