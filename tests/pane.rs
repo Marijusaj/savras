@@ -412,6 +412,9 @@ impl Pane {
             .unwrap();
 
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_svr"));
+        // These read what Savras draws of the pane, so Savras must be the one
+        // drawing it: the panes it hosts itself, not tmux's.
+        command.arg("--host");
         // Nothing but this fixture: not the machines the developer watches.
         command.arg("--no-sound");
         if machines.is_empty() {
