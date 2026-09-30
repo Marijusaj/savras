@@ -94,13 +94,14 @@ pub fn load(dir: &Path) -> Vec<Job> {
         .collect()
 }
 
-/// Whether a session has anything saved to resume. A thread opened and never
-/// asked anything has no rollout, and `codex resume` would only say "No saved
-/// session found" and exit.
-pub fn saved(dir: &Path, id: &str) -> bool {
+/// Whether `codex resume` can open a session. One the daemon has loaded can
+/// be, asked anything or not — a window just opened in it. Past that it takes
+/// a rollout: a thread opened, never asked and let go has none, and `codex
+/// resume` would only say "No saved session found" and exit.
+pub fn resumable(dir: &Path, id: &str) -> bool {
     Daemon::connect(dir)
         .and_then(|mut daemon| daemon.read(id))
-        .is_ok_and(|thread| thread.path.is_some_and(|path| path.exists()))
+        .is_ok_and(|thread| thread.is_loaded() || thread.path.is_some_and(|path| path.exists()))
 }
 
 /// Delete a session, by asking Codex to. Codex stops it if it is running and
@@ -176,6 +177,14 @@ struct Thread {
 }
 
 impl Thread {
+    /// Held by the daemon now, whatever it is doing.
+    fn is_loaded(&self) -> bool {
+        matches!(
+            self.status["type"].as_str(),
+            Some("active" | "idle" | "systemError")
+        )
+    }
+
     /// A session you would come back to: not a sub-agent, not a one-shot
     /// `codex exec`, not a thread Codex never keeps.
     fn is_a_session(&self) -> bool {
@@ -714,7 +723,7 @@ pub mod tests {
     #[test]
     fn no_daemon_is_no_rows_and_no_error() {
         assert!(load(Path::new("/nonexistent/savras/codex")).is_empty());
-        assert!(!saved(Path::new("/nonexistent/savras/codex"), ID));
+        assert!(!resumable(Path::new("/nonexistent/savras/codex"), ID));
         assert!(delete(Path::new("/nonexistent/savras/codex"), ID).is_err());
     }
 
@@ -746,18 +755,32 @@ pub mod tests {
     }
 
     #[test]
-    fn saved_is_whether_codex_wrote_it_down_and_delete_asks_codex() {
+    fn resumable_is_loaded_or_written_down_and_delete_asks_codex() {
         let codex = FakeCodex::start("saved", &[ID, OTHER], Vec::new());
-        assert!(!saved(&codex.dir, ID), "no such thread");
+        assert!(!resumable(&codex.dir, ID), "no such thread");
 
         let rollout = codex.dir.join("rollout.jsonl");
         std::fs::write(&rollout, "").unwrap();
         let mut asked = thread(ID, "EMAIL", json!({ "type": "idle" }), 5);
         asked["path"] = json!(rollout);
+        let mut closed = asked.clone();
+        closed["status"] = json!({ "type": "notLoaded" });
         let never = thread(OTHER, "NEW", json!({ "type": "idle" }), 5);
-        let codex = FakeCodex::start("saved2", &[ID, OTHER], vec![asked, never]);
-        assert!(saved(&codex.dir, ID));
-        assert!(!saved(&codex.dir, OTHER), "opened, never asked: no rollout");
+        let codex = FakeCodex::start("saved2", &[ID, OTHER], vec![asked, never.clone()]);
+        assert!(resumable(&codex.dir, ID));
+        assert!(
+            resumable(&codex.dir, OTHER),
+            "opened, never asked, still open: codex resume attaches to it"
+        );
+
+        let mut gone = never;
+        gone["status"] = json!({ "type": "notLoaded" });
+        let codex = FakeCodex::start("saved3", &[], vec![closed, gone]);
+        assert!(resumable(&codex.dir, ID), "closed, but written down");
+        assert!(
+            !resumable(&codex.dir, OTHER),
+            "closed and never asked: nothing to resume"
+        );
 
         delete(&codex.dir, ID).unwrap();
         assert_eq!(*codex.deleted.lock().unwrap(), [ID]);
