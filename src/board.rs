@@ -1096,8 +1096,8 @@ The owner's, refused under an agent:
     svr board clean --yes [--repo <path>] remove every message, keep the board
     svr board delete --yes [--repo <path>] remove the board itself
 
-    svr board relay [--dry-run]           ping the session each new message is
-                                          addressed to, the moment it is posted
+    svr board relay --judge [--dry-run]   guess whom each unaddressed message
+                                          concerns, and ping them (a call apiece)
 
     svr board install                     how to wire it into every session
     svr board path                        where the boards are kept
@@ -1138,6 +1138,7 @@ fn run(args: &[String]) -> Result<()> {
         "who" => who_command(),
         "hello" => hello_command(rest),
         "relay" => crate::relay::run(rest),
+        "deliver" => crate::relay::deliver(rest),
         "create" | "clean" | "delete" => owner_command(command, rest),
         "install" => {
             print!("{}", install_text());
@@ -1169,7 +1170,7 @@ a post names who it is for — the board's rules:
     --everyone     news for every session here: nobody is pinged, each
                    session reads it on its next turn
 Ask one session, not the room: a message addressed to a session is pinged to
-it at once when a relay runs, and the rest wait for their reader's next turn.";
+it as it is posted, and the rest wait for their reader's next turn.";
 
 fn post_command(args: &[String]) -> Result<()> {
     let mut re = None;
@@ -1256,21 +1257,24 @@ fn post_command(args: &[String]) -> Result<()> {
         message.from,
         message.id
     );
-    println!(
-        "{}",
-        delivery(
-            &message,
-            answers.as_deref(),
-            crate::relay::alive(&boards, &repo)
-        )
-    );
+    // The ping is sent from here, in the background, whoever posted — not
+    // by a relay that has to be running. A delivery that cannot even start
+    // leaves the message where every message is: on the board.
+    let delivering = match crate::relay::deliver_later(&boards, &message) {
+        Ok(started) => started,
+        Err(e) => {
+            eprintln!("svr: could not start pinging: {e:#}");
+            false
+        }
+    };
+    println!("{}", delivery(&message, answers.as_deref(), delivering));
     Ok(())
 }
 
 /// What happens next to a message just posted, so the poster knows whether
 /// it was heard or will be. `answers` is who said the message it answers,
 /// when that is still on the board.
-fn delivery(message: &Message, answers: Option<&str>, relay: bool) -> String {
+fn delivery(message: &Message, answers: Option<&str>, pinging: bool) -> String {
     let sessions: Vec<&str> = message
         .to
         .iter()
@@ -1292,10 +1296,13 @@ fn delivery(message: &Message, answers: Option<&str>, relay: bool) -> String {
         (true, false) => None,
     };
     let mut out = match whom {
-        Some(whom) if relay => format!("the relay pings {whom} now"),
+        Some(whom) if pinging => format!(
+            "{whom} is being pinged now, in the background — how it went is in \
+             deliveries.log beside the boards (svr board path)"
+        ),
         Some(whom) => format!(
-            "no relay is running for this board, so {whom} reads it on their next \
-             turn — `R` in the panel starts one"
+            "{whom} was not pinged, so reads it on their next turn. If it cannot \
+             wait and you are a Claude Code session, SendMessage {whom} directly"
         ),
         None if owner => String::new(),
         None if yourself => "it answers your own message, so nobody is pinged: each \
@@ -1861,10 +1868,11 @@ mod tests {
     fn a_post_tells_its_poster_what_happens_next() {
         let mut m = msg("1", "LEAD", SAVRAS, "who holds main.rs?");
         m.to = vec!["HELPER".into()];
-        assert_eq!(delivery(&m, None, true), "the relay pings HELPER now");
-        assert!(
-            delivery(&m, None, false).starts_with("no relay is running for this board, so HELPER")
-        );
+        assert!(delivery(&m, None, true).starts_with("HELPER is being pinged now"));
+        // Could not even start: said, with what to do instead.
+        let unsent = delivery(&m, None, false);
+        assert!(unsent.starts_with("HELPER was not pinged"), "{unsent}");
+        assert!(unsent.contains("SendMessage HELPER directly"), "{unsent}");
         m.to = vec!["owner".into()];
         assert_eq!(
             delivery(&m, None, false),
@@ -1872,15 +1880,9 @@ mod tests {
         );
         m.to.clear();
         m.re = Some("0".into());
-        assert_eq!(
-            delivery(&m, None, true),
-            "the relay pings whoever said the message it answers now"
-        );
-        assert_eq!(
-            delivery(&m, Some("SAVRAS 13"), false),
-            "no relay is running for this board, so SAVRAS 13 reads it on their next \
-             turn — `R` in the panel starts one"
-        );
+        assert!(delivery(&m, None, true)
+            .starts_with("whoever said the message it answers is being pinged now"));
+        assert!(delivery(&m, Some("SAVRAS 13"), true).starts_with("SAVRAS 13 is being pinged now"));
         // Answering yourself pings nobody, whatever runs.
         assert!(delivery(&m, Some("LEAD"), true).starts_with("it answers your own message"));
         m.re = None;

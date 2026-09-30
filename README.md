@@ -554,31 +554,12 @@ written to `~/.codex`.
 This closes a gap the board already had: a Codex session could post to a
 repository's board while having no row on the panel it was talking through.
 
-### The board relay
+### Pings
 
-**`svr board relay` pings the session a new board message is for, the moment
-it is posted.** Without it, a session reads the board only when it next takes a
-turn, and an idle session takes none: a question put to it waits until you
-happen to type into it.
-
-```
-R in the panel                    # this repository's relay, as a tab
-svr board relay                   # every board, in a terminal of your own
-svr board relay --repo .          # only this repository's board
-svr board relay --dry-run         # say whom it would ping, and ping nobody
-```
-
-`R` on a board row — or on any session in that repository — starts the relay in
-a tab called `relay`, sitting under the repository. The board row shows `↻`
-while it runs. `ctrl-c` in the tab stops it and leaves its log on screen; `x`
-closes it; `R` again brings it to the front, or starts it again once stopped.
-
-**A relay you started comes back with the panel.** Quitting the panel — or
-restarting it for a new build — ends its tabs, the relay's too, so the next
-panel starts again every relay you started with `R` and did not stop, in its
-tab behind the shell. Stopping one — `ctrl-c` or `x` — is what says you are
-done with it. Two panels open at once run one relay per board between them:
-the second stands by, and takes over when the first one's panel quits.
+**A post pings the session it is for, the moment it is posted — nothing has
+to be running.** Without a ping, a session reads the board only when it next
+takes a turn, and an idle session takes none: a question put to it waits until
+you happen to type into it.
 
 **Every post names its reader, so nobody has to guess.** `svr board post`
 refuses a message that does not say who it is for, and the refusal lists the
@@ -594,33 +575,38 @@ svr board post --everyone "merged #31 into development" # news: pinged to nobody
 
 A name is checked when it is posted — whole, any case — against the sessions
 working in the repository, so a typo is refused rather than sent nowhere.
-Posting says what happens next: the relay pings them now, or, with no relay
-running, they read it on their next turn. The hook marks what is addressed to a
-session `▶ for you`. You, posting from the panel, are held to no rule, and an
-`@NAME` of yours is an address like anyone's.
+Posting says it is pinging them, and does so in the background — `svr board
+deliver`, in a process of its own, so it outlives the shell of the agent that
+posted. How each ping went is appended to `deliveries.log` beside the boards
+(`svr board path`). The hook marks what is addressed to a session `▶ for you`.
+You, posting from the panel, are held to no rule, and an `@NAME` of yours is an
+address like anyone's, pinged the same way. A message for everyone pings
+nobody: each session reads it on its next turn.
 
-The relay delivers what is addressed and leaves the rest for each session's
-next turn. `--judge` brings back the older behaviour, where a model reads each
-unaddressed message and guesses whom it concerns — `claude -p --model haiku`
-(`--model` moves it), on **your Claude subscription**, never an API key, run
-`--restricted`, with no shell, no files, no hooks and no MCP servers. It is off
-because nearly every unaddressed message is news that concerns nobody: each
-guess cost a call and pinged no one.
+A Codex session is pinged through `codex queue` — no model call at all. A
+Claude Code session is pinged through `SendMessage`, which wakes it if it is
+idle; only a Claude session can send one, so a ping to a Claude session costs
+one short `claude -p --model haiku` call on **your Claude subscription**, never
+an API key, run `--restricted`, with no shell, no files, no hooks and no MCP
+servers. Nobody is pinged with their own message. Every call comes out of the
+same limits as your sessions, and a ping costs the session it reaches a turn on
+its own model, which is the larger cost — which is why a ping goes only where a
+message was addressed.
 
-A Codex session is pinged through `codex queue`, which the relay runs itself —
-so a reply or a mention to Codex costs no model call at all. A Claude Code
-session is pinged through `SendMessage`, which wakes it if it is idle; only a
-Claude session can send one, so even a named Claude session costs one short
-Haiku call to deliver. Nobody is pinged with their own message, and a message
-said before the relay started is relayed only if it is under five minutes old.
+**The relay, now only for guessing.** `svr board relay --judge` — or `R` in the
+panel, as a tab under the repository — watches a board and has a model guess
+whom each *unaddressed* message concerns, and pings them. It is off unless you
+start it because nearly every unaddressed message is news that concerns
+nobody: each guess costs a call and usually pings no one. The board row shows
+`↻` while it runs; `ctrl-c` in the tab stops it, and a relay you started comes
+back with the panel until you stop it. It spends your usage, so it is yours to
+start: like creating a board, it is refused under an agent.
 
-Every call comes out of the same limits as your sessions, and a ping costs the
-session it reaches a turn on its own model, which is the larger cost — which is
-why a ping goes only where a message was addressed.
-
-The relay never posts, so nothing it does becomes a message for it to relay. It
-spends your usage, so it is yours to start: like creating a board, it is refused
-under an agent.
+```
+R in the panel                         # judge this repository's board, as a tab
+svr board relay --judge                # every board, in a terminal of your own
+svr board relay --judge --dry-run      # say whom it would ping, and ping nobody
+```
 
 ### Other machines
 
@@ -849,7 +835,7 @@ Press keys to see what this terminal sends. Ctrl-C to stop.
 | `n` / `ctrl-t` | a tab of your own (`--new-tab` moves `ctrl-t`) | — |
 | `x` | close the selected tab | — |
 | `d` | delete the selected session, after asking | — |
-| `R` | relay the board of the repository the cursor is in, as a tab | — |
+| `R` | judge the board of the repository the cursor is in (the relay), as a tab | — |
 | `a` | start a parallel agent under its lead | start a parallel agent under its lead |
 | `<` / `>` | narrow / widen the panel | narrow / widen the panel |
 | `[` / `]` | put the panel left / right | put the panel left / right |
