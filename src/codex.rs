@@ -242,7 +242,7 @@ fn row(thread: Thread) -> Job {
     };
     Job {
         short,
-        name: flatten(&name, 32),
+        name: row_name(&name),
         color: None,
         status: match run {
             Run::Working => Status::Working,
@@ -487,6 +487,13 @@ fn short(id: &str) -> &str {
 
 fn str_at<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(Value::as_str)
+}
+
+/// A session's name as its row carries it: one line, cut to fit. The pane
+/// title Codex sets carries the name whole, so joining the two cuts it the
+/// same way — see `host::job_named`.
+pub fn row_name(name: &str) -> String {
+    flatten(name, 32)
 }
 
 /// One line, for a row: Codex's words come with newlines and markdown in

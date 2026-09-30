@@ -907,6 +907,14 @@ impl Pane {
 /// title that is anything else, like the launcher's `2 awaiting input · claude`
 /// or a login shell's host and directory, matches no session and joins nothing.
 ///
+/// Codex writes its thread's name too, but followed by the project it is
+/// in: `⠋ FUNCT | arctern`. Matched whole, that named nothing, so a renamed
+/// Codex session showed twice — the pane as a bare `codex` tab, and the
+/// daemon's row beside it. For a Codex session the name before the last
+/// ` | ` is matched instead, and the project after it has to be one of the
+/// directories the session is standing in, which is what keeps a Claude
+/// session called `FUNCT` from being taken for it.
+///
 /// Two sessions with one name is no answer at all: joining the pane to either
 /// would be a guess, and a wrong guess sends `enter` to the other one. So an
 /// ambiguous title leaves the pane a shell, which is what it was before.
@@ -917,7 +925,23 @@ fn job_named(title: &str, known: &[Job]) -> Option<String> {
     if name.is_empty() {
         return None;
     }
-    let mut named = known.iter().filter(|job| job.name == name);
+    let codex = name
+        .rsplit_once(" | ")
+        .map(|(name, project)| (crate::codex::row_name(name), project.trim()));
+    let in_project = |job: &Job, project: &str| {
+        job.cwd
+            .ancestors()
+            .any(|dir| dir.file_name().is_some_and(|dir| dir == project))
+    };
+    let mut named = known.iter().filter(|job| match job.client {
+        crate::job::Client::Claude => job.name == name,
+        crate::job::Client::Codex => {
+            job.name == name
+                || codex
+                    .as_ref()
+                    .is_some_and(|(name, project)| job.name == *name && in_project(job, project))
+        }
+    });
     let job = named.next()?;
     named.next().is_none().then(|| job.short.clone())
 }
@@ -4653,6 +4677,58 @@ mod tests {
         let off = mouse_sequence(M::None, E::Default);
         assert!(!off.contains('h'), "nothing should be enabled: {off:?}");
         assert!(off.contains("\x1b[?1006l"), "{off:?}");
+    }
+
+    #[test]
+    fn a_codex_title_names_its_session_and_its_project() {
+        // Claude Code titles a pane `✳ NAME`; Codex, `⠋ NAME | project`.
+        let f = Fixture::new("codex-title")
+            .job("aaa", r#"{"state":"working","name":"FUNCT"}"#)
+            .job("bbb", r#"{"state":"working","name":"ROADMAP"}"#);
+        let app = App::new(f.0.clone());
+        let claude = |short: &str| {
+            app.snapshot
+                .jobs
+                .iter()
+                .find(|job| job.short == short)
+                .unwrap()
+                .clone()
+        };
+        let mut codex = claude("aaa");
+        codex.short = "ccc".into();
+        codex.client = crate::job::Client::Codex;
+        codex.cwd = "/work/arctern/src".into();
+        let known = [codex.clone(), claude("bbb")];
+
+        assert_eq!(
+            job_named(".: FUNCT | arctern", &known).as_deref(),
+            Some("ccc")
+        );
+        assert_eq!(job_named("FUNCT | arctern", &known).as_deref(), Some("ccc"));
+        assert_eq!(
+            job_named("FUNCT", &known).as_deref(),
+            Some("ccc"),
+            "a bare name"
+        );
+        assert_eq!(job_named("✳ ROADMAP", &known).as_deref(), Some("bbb"));
+        assert_eq!(job_named("FUNCT | savras", &known), None, "another project");
+        assert_eq!(
+            job_named("ROADMAP | arctern", &known),
+            None,
+            "a Claude session"
+        );
+
+        // A Claude session called FUNCT too: Codex's title still names only
+        // Codex's session, and a bare FUNCT names neither, as any clash does.
+        let known = [codex.clone(), claude("aaa")];
+        assert_eq!(job_named("FUNCT | arctern", &known).as_deref(), Some("ccc"));
+        assert_eq!(job_named("FUNCT", &known), None);
+
+        // Codex names its row cut to 32; the title has the name whole.
+        let long = "A NAME FAR TOO LONG FOR ANY ROW IN A PANEL";
+        codex.name = crate::codex::row_name(long);
+        let title = format!("{long} | arctern");
+        assert_eq!(job_named(&title, &[codex]).as_deref(), Some("ccc"));
     }
 
     #[test]
